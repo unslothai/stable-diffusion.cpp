@@ -1,0 +1,369 @@
+# SPDX-License-Identifier: MIT
+# Copyright 2026-present the Unsloth AI Inc. team.
+
+name: Unsloth SD prebuilt (CPU/Apple)
+
+# Build and publish OUR OWN stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
+# the platforms where the native engine is the FASTER choice: CPU (Linux/WSL/Windows)
+# and Apple (Metal). GPU hosts use diffusers/torch, so no CUDA/ROCm/Vulkan here.
+#
+# Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 5-way
+# CPU/Apple matrix:
+#   resolve      -- pick the leejet release tag (supply-chain aged), stamp a source
+#                   tarball from that tag, decide if our release already exists.
+#   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
+#   build-windows-- Windows x64 (MSVC + Ninja).
+#   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
+#                   draft->publish. If ANY build leg fails, assemble is skipped and
+#                   nothing is published (the Studio needs the full asset set).
+#
+# Asset names match the Studio installer's resolve_release_asset (leejet-compatible).
+
+on:
+  schedule:
+    - cron: '17 20 * * *'      # ~1pm PT-ish; daily
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'leejet release tag (master-<n>-<sha>) or "latest"'
+        default: 'latest'
+        required: true
+        type: string
+      min_age_hours:
+        description: 'For "latest": only build a release public for >= this many hours (blank = 6)'
+        default: ''
+        required: false
+        type: string
+      publish:
+        description: 'Publish to GitHub Releases (false = build artifacts only)'
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sd-prebuilt-${{ github.event.inputs.tag || 'scheduled' }}
+  cancel-in-progress: false
+
+env:
+  UNSLOTH_SD_MIN_RELEASE_AGE_HOURS: "6"
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.r.outputs.commit }}
+      exists: ${{ steps.r.outputs.exists }}
+      source_artifact: ${{ steps.r.outputs.source_artifact }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout mirror (for tooling; upstream remote added below)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - id: r
+        run: |
+          set -euo pipefail
+          REQ='${{ github.event.inputs.tag || 'latest' }}'
+          AGE_H='${{ github.event.inputs.min_age_hours }}'
+          [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_SD_MIN_RELEASE_AGE_HOURS:-6}"
+
+          if [ "$REQ" = "latest" ]; then
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            TAG="$(gh api 'repos/leejet/stable-diffusion.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+            [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "no leejet release older than ${AGE_H}h" >&2; exit 1; }
+            echo "selected leejet $TAG (aged >= ${AGE_H}h)"
+          else
+            TAG="$REQ"
+          fi
+          printf '%s' "$TAG" | grep -qE '^master-[0-9]+-[0-9a-f]+$' \
+            || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
+
+          # Does OUR published release already exist? (drafts don't count.)
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
+
+          # Fetch leejet's source AT THAT TAG and tar it (no .git); the build legs
+          # extract this identical tree. Our own scripts come from the tooling checkout.
+          git remote add upstream https://github.com/leejet/stable-diffusion.cpp.git || true
+          git fetch -q --depth 1 upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout -q --detach "refs/tags/${TAG}"
+          # ggml is a REQUIRED submodule; the server frontend + libwebp/libwebm are not
+          # (we build with SD_SERVER_BUILD_FRONTEND / SD_WEBP / SD_WEBM off), so fetch only
+          # ggml to keep the source tarball small and the build self-contained.
+          git submodule update --init --recursive --depth 1 ggml
+          COMMIT="$(git rev-parse HEAD)"
+          SRC_ARTIFACT="sd-source-${TAG}"
+          if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tar --exclude-vcs --exclude=.github -czf "${RUNNER_TEMP}/sd-source-${TAG}.tar.gz" .
+            echo "stamped source for ${TAG} (${COMMIT})"
+          else
+            echo "release ${TAG} already published; skipping source prep"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "exists=$EXISTS"
+            echo "source_artifact=$SRC_ARTIFACT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload source artifact
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.r.outputs.source_artifact }}
+          path: ${{ runner.temp }}/sd-source-${{ steps.r.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-unix:
+    name: ${{ matrix.label }}
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Darwin-macOS-arm64
+            runner: macos-14
+            arch: arm64
+            defines: "-DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
+            gate: "true"
+          - label: Darwin-macOS-x86_64
+            runner: macos-15-intel
+            arch: x86_64
+            defines: "-DSD_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+            gate: "true"
+          - label: Linux-Ubuntu-22.04-x86_64
+            runner: ubuntu-22.04
+            arch: x86_64
+            defines: ""
+            gate: "false"
+          - label: Linux-Ubuntu-24.04-aarch64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            defines: ""
+            gate: "false"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Build sd-cli + sd-server
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            ${{ matrix.defines }}
+          if [ "$(uname -s)" = "Darwin" ]; then J="$(sysctl -n hw.logicalcpu)"; else J="$(nproc)"; fi
+          cmake --build build --config Release -j "$J" --target sd-cli sd-server
+
+      - name: macOS load gate
+        if: ${{ matrix.gate == 'true' }}
+        run: |
+          set -eux
+          # deploy target is the trailing number in defines
+          DT="$(echo '${{ matrix.defines }}' | sed -E 's/.*CMAKE_OSX_DEPLOYMENT_TARGET=([0-9.]+).*/\1/')"
+          bash tooling/scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.arch }}" "$DT"
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: ${{ matrix.label }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: leejet/stable-diffusion.cpp
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip
+          if-no-files-found: error
+
+  build-windows:
+    name: win-cpu-x64
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: windows-2022
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build sd-cli + sd-server
+        shell: pwsh
+        working-directory: src
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSD_BUILD_EXAMPLES=ON `
+            -DSD_SERVER_BUILD_FRONTEND=OFF `
+            -DSD_WEBP=OFF -DSD_WEBM=OFF `
+            -DGGML_NATIVE=OFF
+          cmake --build build --config Release -j 3 --target sd-cli sd-server
+
+      - name: Package bundle
+        shell: pwsh
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: win-cpu-x64
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: leejet/stable-diffusion.cpp
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64.zip
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble + publish
+    needs: [resolve, build-unix, build-windows]
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: sd-*-bin-*
+          merge-multiple: true
+
+      - name: Fingerprint gate (every bundle carries the Unsloth mark)
+        run: |
+          set -euo pipefail
+          MARK='Compiled by the Unsloth team'
+          shopt -s nullglob
+          tmp="$(mktemp -d)"; fail=0; checked=0
+          for z in dist/sd-*-bin-*.zip; do
+            rm -rf "$tmp/x"; mkdir -p "$tmp/x"
+            unzip -qo "$z" -d "$tmp/x"
+            if grep -arq "$MARK" "$tmp/x"; then checked=$((checked+1)); else echo "ERROR: $(basename "$z") missing fingerprint" >&2; fail=1; fi
+          done
+          rm -rf "$tmp"
+          [ "$checked" -gt 0 ] || { echo "ERROR: no bundles to verify" >&2; exit 1; }
+          [ "$fail" = 0 ] || exit 1
+          echo "fingerprint verified in $checked bundles"
+
+      - name: Generate manifest + sha256 index
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/assemble_metadata.py \
+            --tag '${{ needs.resolve.outputs.tag }}' \
+            --source-repo 'leejet/stable-diffusion.cpp' \
+            --commit '${{ needs.resolve.outputs.commit }}' \
+            --dist dist --out dist \
+            --publish-repo "$GITHUB_REPOSITORY"
+          ls -la dist
+
+      - name: Coverage gate (all 5 CPU/Apple assets present)
+        run: |
+          set -eu
+          TAG='${{ needs.resolve.outputs.tag }}'
+          fail=0
+          for f in \
+            "sd-${TAG}-bin-Darwin-macOS-arm64.zip" \
+            "sd-${TAG}-bin-Darwin-macOS-x86_64.zip" \
+            "sd-${TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip" \
+            "sd-${TAG}-bin-Linux-Ubuntu-24.04-aarch64.zip" \
+            "sd-${TAG}-bin-win-cpu-x64.zip"; do
+            [ -s "dist/$f" ] || { echo "ERROR: missing $f" >&2; fail=1; }
+          done
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish a partial release" >&2; exit 1; }
+
+      - name: Upload full set (artifact fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsloth-sd-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub release
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          REPO="$GITHUB_REPOSITORY"
+          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server) for upstream [${TAG}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${TAG}). GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh release delete "$TAG" --repo "$REPO" --yes
+          fi
+          gh release create "$TAG" --repo "$REPO" --draft \
+            --title "stable-diffusion.cpp prebuilt $TAG" \
+            --notes "$NOTES" \
+            dist/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false
