@@ -469,6 +469,13 @@ ArgOptions SDContextParams::get_options() {
          (int)',',
          &params_backend},
         {"",
+         "--split-mode",
+         "weight distribution for modules assigned multiple devices (--backend \"diffusion=cuda0&cuda1\"): "
+         "layer (whole transformer blocks per device, default) or row (matmul rows split across devices, CUDA only). "
+         "Accepts a single mode or per-module assignments, e.g. row or diffusion=row,te=layer",
+         (int)',',
+         &split_mode},
+        {"",
          "--rpc-servers",
          "comma-separated list of RPC servers to connect to for offloading, in the format host:port, e.g. localhost:50052,192.168.1.3:50052",
          (int)',',
@@ -663,6 +670,18 @@ ArgOptions SDContextParams::get_options() {
          "but it usually offers faster inference speed and, in some cases, lower memory usage. "
          "The at_runtime mode, on the other hand, is exactly the opposite.",
          on_lora_apply_mode_arg},
+        {"",
+         "--list-devices",
+         "list available ggml backend devices (one 'name<TAB>description' per line) and exit; "
+         "the names are the device names accepted by --backend and --params-backend",
+         [](int /*argc*/, const char** /*argv*/, int /*index*/) {
+             size_t device_list_size = sd_list_devices(nullptr, 0);
+             std::vector<char> devices(device_list_size + 1);
+             sd_list_devices(devices.data(), devices.size());
+             fputs(devices.data(), stdout);
+             std::exit(0);
+             return 0;
+         }},
     };
 
     return options;
@@ -710,7 +729,18 @@ bool SDContextParams::resolve(SDMode mode) {
 }
 
 bool SDContextParams::validate(SDMode mode) {
-    if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
+    if (mode == CONVERT) {
+        const bool has_convert_input = model_path.length() != 0 ||
+                                       clip_l_path.length() != 0 ||
+                                       clip_g_path.length() != 0 ||
+                                       t5xxl_path.length() != 0 ||
+                                       diffusion_model_path.length() != 0 ||
+                                       vae_path.length() != 0;
+        if (!has_convert_input) {
+            LOG_ERROR("error: convert mode needs at least one model input path\n");
+            return false;
+        }
+    } else if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
         LOG_ERROR("error: the following arguments are required: model_path/diffusion_model\n");
         return false;
     }
@@ -807,6 +837,7 @@ std::string SDContextParams::to_string() const {
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
+        << "  split_mode: \"" << split_mode << "\",\n"
         << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
         << "  control_net_cpu: " << (control_net_cpu ? "true" : "false") << ",\n"
         << "  clip_on_cpu: " << (clip_on_cpu ? "true" : "false") << ",\n"
@@ -887,6 +918,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.eager_load                      = eager_load;
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
+    sd_ctx_params.split_mode                      = split_mode.c_str();
     sd_ctx_params.rpc_servers                     = rpc_servers.c_str();
     return sd_ctx_params;
 }
@@ -996,6 +1028,10 @@ ArgOptions SDGenerationParams::get_options() {
          "--batch-count",
          "batch count",
          &batch_count},
+        {"",
+         "--qwen-image-layers",
+         "number of Qwen Image Layered layers; latent/output count is layers + 1 (default: 3)",
+         &qwen_image_layers},
         {"",
          "--video-frames",
          "video frames (default: 1)",
@@ -1816,6 +1852,7 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("width", width);
     load_if_exists("height", height);
     load_if_exists("batch_count", batch_count);
+    load_if_exists("qwen_image_layers", qwen_image_layers);
     load_if_exists("video_frames", video_frames);
     load_if_exists("fps", fps);
     load_if_exists("upscale_repeats", upscale_repeats);
@@ -2240,6 +2277,11 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
+    if (qwen_image_layers < 0) {
+        LOG_ERROR("error: qwen_image_layers must be non-negative");
+        return false;
+    }
+
     if (sample_params.sample_steps <= 0) {
         LOG_ERROR("error: the sample_steps must be greater than 0\n");
         return false;
@@ -2406,6 +2448,7 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.strength              = strength;
     params.seed                  = seed;
     params.batch_count           = batch_count;
+    params.qwen_image_layers     = qwen_image_layers;
     params.control_image         = control_image.get();
     params.control_strength      = control_strength;
     params.pm_params             = pm_params;
@@ -2531,6 +2574,7 @@ std::string SDGenerationParams::to_string() const {
         << "  width: " << width << ",\n"
         << "  height: " << height << ",\n"
         << "  batch_count: " << batch_count << ",\n"
+        << "  qwen_image_layers: " << qwen_image_layers << ",\n"
         << "  init_image_path: \"" << init_image_path << "\",\n"
         << "  end_image_path: \"" << end_image_path << "\",\n"
         << "  mask_image_path: \"" << mask_image_path << "\",\n"

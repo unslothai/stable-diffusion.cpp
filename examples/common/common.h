@@ -151,6 +151,7 @@ struct SDContextParams {
     bool eager_load             = false;
     std::string backend;
     std::string params_backend;
+    std::string split_mode;
     std::string rpc_servers;
     std::string effective_backend;
     std::string effective_params_backend;
@@ -197,6 +198,7 @@ struct SDGenerationParams {
     int width                  = -1;
     int height                 = -1;
     int batch_count            = 1;
+    int qwen_image_layers      = 3;
     int64_t seed               = 42;
     float strength             = 0.75f;
     float control_strength     = 0.9f;

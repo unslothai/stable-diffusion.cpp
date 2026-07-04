@@ -391,7 +391,7 @@ __STATIC_INLINE__ uint8_t* ggml_tensor_to_sd_image(ggml_tensor* input, uint8_t* 
     int64_t width    = input->ne[0];
     int64_t height   = input->ne[1];
     int64_t channels = input->ne[2];
-    GGML_ASSERT(channels == 3 && input->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
     if (image_data == nullptr) {
         image_data = (uint8_t*)malloc(width * height * channels);
     }
@@ -1038,6 +1038,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
 }
 
 __STATIC_INLINE__ ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
+                                                ggml_backend_t backend,
                                                 ggml_tensor* x,
                                                 int lp0,
                                                 int rp0,
@@ -1063,7 +1064,17 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
     }
 
     if (lp0 != 0 || rp0 != 0 || lp1 != 0 || rp1 != 0 || lp2 != 0 || rp2 != 0 || lp3 != 0 || rp3 != 0) {
-        x = ggml_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+        ggml_tensor* padded = ggml_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+        if (backend == nullptr || ggml_backend_supports_op(backend, padded)) {
+            x = padded;
+        } else {
+            // Some backends (e.g. Metal) only implement right-padding for
+            // GGML_OP_PAD (see #850): pad right by lp+rp instead, then roll
+            // the padding around to the left. shift < ne always holds because
+            // ne grew by lp+rp.
+            x = ggml_pad_ext(ctx, x, 0, lp0 + rp0, 0, lp1 + rp1, 0, lp2 + rp2, 0, lp3 + rp3);
+            x = ggml_roll(ctx, x, lp0, lp1, lp2, lp3);
+        }
     }
     return x;
 }
@@ -1076,7 +1087,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_pad(ggml_context* ctx,
                                             int p3          = 0,
                                             bool circular_x = false,
                                             bool circular_y = false) {
-    return ggml_ext_pad_ext(ctx, x, 0, p0, 0, p1, 0, p2, 0, p3, circular_x, circular_y);
+    return ggml_ext_pad_ext(ctx, nullptr, x, 0, p0, 0, p1, 0, p2, 0, p3, circular_x, circular_y);
 }
 
 // w: [OC，IC, KH, KW]
@@ -1105,7 +1116,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
     }
 
     if ((p0 != 0 || p1 != 0) && (circular_x || circular_y)) {
-        x  = ggml_ext_pad_ext(ctx, x, p0, p0, p1, p1, 0, 0, 0, 0, circular_x, circular_y);
+        x  = ggml_ext_pad_ext(ctx, nullptr, x, p0, p0, p1, p1, 0, 0, 0, 0, circular_x, circular_y);
         p0 = 0;
         p1 = 0;
     }
@@ -1130,6 +1141,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
 // b: [OC,]
 // result: [N*OC, OD, OH, OW]
 __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
+                                                ggml_backend_t backend,
                                                 ggml_tensor* x,
                                                 ggml_tensor* w,
                                                 ggml_tensor* b,
@@ -1159,7 +1171,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         x          = ggml_cont(ctx, ggml_permute(ctx, x, 0, 1, 3, 2));
         x          = ggml_reshape_4d(ctx, x, im2col->ne[1], im2col->ne[2], OD, OC * N);
     } else {
-        x = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
+        // ggml_conv_3d decomposes into GGML_OP_IM2COL_3D, which some backends
+        // (e.g. Metal, see #850) do not implement. Fall back to
+        // GGML_OP_CONV_3D on those backends.
+        bool im2col_3d_supported = true;
+        if (backend != nullptr) {
+            ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
+            im2col_3d_supported = ggml_backend_supports_op(backend, im2col);
+        }
+        if (im2col_3d_supported) {
+            x = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
+        } else {
+            int64_t OC = w->ne[3] / IC;
+            int64_t N  = x->ne[3] / IC;
+            x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
+        }
     }
 
     if (b != nullptr) {
@@ -1362,6 +1388,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        if (!ggml_backend_supports_op(backend, out)) {
+            return nullptr;
+        }
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         if (kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
@@ -1379,9 +1408,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         if (can_use_flash_attn) {
             kqv = build_kqv(q, k, v, mask);
-            if (!ggml_backend_supports_op(backend, kqv)) {
-                kqv = nullptr;
-            } else {
+            if (kqv != nullptr) {
                 kqv = ggml_view_4d(ctx,
                                    kqv,
                                    d_head,
@@ -1719,6 +1746,11 @@ protected:
     bool stream_layers_enabled            = false;
     size_t observed_max_effective_budget_ = 0;
 
+    std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
+    ggml_backend_sched_t sched             = nullptr;    // owned, multi-device only
+    ggml_backend_t cpu_fallback_backend    = nullptr;    // owned, sched requires a trailing CPU backend
+    bool multi_device_eval_callback_warned = false;
+
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
     std::weak_ptr<RunnerWeightManager> weight_manager;
     std::unordered_set<const ggml_tensor*> kept_compute_param_tensor_set;
@@ -1986,7 +2018,121 @@ protected:
         return true;
     }
 
+    // Pass explicit buffer types: synthesized defaults can make CUDA devices
+    // report supporting each other's buffers and skip a required copy.
+    bool ensure_sched(ggml_cgraph* gf) {
+        if (sched != nullptr) {
+            return true;
+        }
+        std::vector<ggml_backend_t> backends;
+        backends.reserve(extra_runtime_backends.size() + 2);
+        backends.push_back(runtime_backend);
+        for (ggml_backend_t backend : extra_runtime_backends) {
+            backends.push_back(backend);
+        }
+        if (cpu_fallback_backend == nullptr && !sd_backend_is_cpu(runtime_backend)) {
+            cpu_fallback_backend = sd_backend_cpu_init();
+        }
+        if (cpu_fallback_backend != nullptr) {
+            backends.push_back(cpu_fallback_backend);
+        }
+
+        std::vector<ggml_backend_buffer_type_t> bufts;
+        bufts.reserve(backends.size());
+        ggml_backend_dev_t main_dev = ggml_backend_get_device(runtime_backend);
+        for (ggml_backend_t backend : backends) {
+            ggml_backend_buffer_type_t buft = nullptr;
+            if (backend == cpu_fallback_backend && main_dev != nullptr) {
+                buft = ggml_backend_dev_host_buffer_type(main_dev);
+            }
+            if (buft == nullptr) {
+                buft = ggml_backend_get_default_buffer_type(backend);
+            }
+            bufts.push_back(buft);
+        }
+
+        size_t graph_size = MAX_GRAPH_SIZE;
+        if (gf != nullptr) {
+            graph_size = std::max<size_t>(graph_size, (size_t)ggml_graph_n_nodes(gf));
+        }
+        sched = ggml_backend_sched_new(backends.data(),
+                                       bufts.data(),
+                                       (int)backends.size(),
+                                       graph_size,
+                                       /*parallel=*/false,
+                                       /*op_offload=*/false);
+        if (sched == nullptr) {
+            LOG_ERROR("%s: failed to create backend sched", get_desc().c_str());
+            return false;
+        }
+        return true;
+    }
+
+    ggml_backend_t backend_for_weight(const ggml_tensor* tensor) const {
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return nullptr;
+        }
+        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            ggml_backend_buffer_is_host(tensor->buffer)) {
+            return nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+        if (dev == nullptr) {
+            return nullptr;
+        }
+        if (ggml_backend_get_device(runtime_backend) == dev) {
+            return runtime_backend;
+        }
+        for (ggml_backend_t backend : extra_runtime_backends) {
+            if (ggml_backend_get_device(backend) == dev) {
+                return backend;
+            }
+        }
+        return nullptr;
+    }
+
+    // Weightless ops have no scheduler anchor, so pin them to the most recent
+    // weight device. Views must stay unpinned or cross-device copies can be
+    // skipped for their consumers.
+    void pin_multi_device_nodes(ggml_cgraph* gf) {
+        if (sched == nullptr || gf == nullptr) {
+            return;
+        }
+        ggml_backend_t current = runtime_backend;
+        const int n_nodes      = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                ggml_backend_t weight_backend = backend_for_weight(node->src[s]);
+                if (weight_backend != nullptr) {
+                    current = weight_backend;
+                }
+            }
+            if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+                continue;
+            }
+            if (ggml_backend_supports_op(current, node)) {
+                ggml_backend_sched_set_tensor_backend(sched, node, current);
+            }
+        }
+    }
+
+    bool is_multi_device() const {
+        return !extra_runtime_backends.empty();
+    }
+
     bool alloc_compute_buffer(ggml_cgraph* gf) {
+        if (is_multi_device()) {
+            // The sched replaces the gallocr. Do NOT ggml_backend_sched_reserve
+            // the graph here: reserve runs split_graph, which rewires the
+            // graph's src pointers to sched-internal copy tensors, and the
+            // later ggml_backend_sched_alloc_graph would split the already
+            // rewired graph, silently corrupting every cross-backend input. A
+            // graph must be split at most once; the alloc in execute_graph
+            // performs the real allocation.
+            return ensure_sched(gf);
+        }
         if (compute_allocr != nullptr) {
             return true;
         }
@@ -2202,12 +2348,14 @@ protected:
                plan.valid &&
                max_graph_vram_bytes > 0 &&
                plan.segments.size() > 1 &&
-               !sd_backend_is_cpu(runtime_backend);
+               !sd_backend_is_cpu(runtime_backend) &&
+               !is_multi_device();
     }
 
     bool can_attempt_graph_cut_segmented_compute() const {
         return max_graph_vram_bytes > 0 &&
-               !sd_backend_is_cpu(runtime_backend);
+               !sd_backend_is_cpu(runtime_backend) &&
+               !is_multi_device();
     }
 
     bool resolve_graph_cut_plan(ggml_cgraph* gf,
@@ -2463,7 +2611,14 @@ protected:
         };
         ComputeBufferGuard compute_buffer_guard(this, free_compute_buffer);
 
-        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+        if (is_multi_device()) {
+            ggml_backend_sched_reset(sched);
+            pin_multi_device_nodes(gf);  // reset clears the pins; re-apply before alloc
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                LOG_ERROR("%s sched alloc compute graph failed", get_desc().c_str());
+                return std::nullopt;
+            }
+        } else if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             return std::nullopt;
         }
@@ -2472,8 +2627,27 @@ protected:
         if (sd_backend_is_cpu(runtime_backend)) {
             sd_backend_cpu_set_n_threads(runtime_backend, n_threads);
         }
+        if (cpu_fallback_backend != nullptr) {
+            sd_backend_cpu_set_n_threads(cpu_fallback_backend, n_threads);
+        }
 
-        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        ggml_status status;
+        if (is_multi_device()) {
+            if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
+                LOG_WARN("%s: eval callback is not supported with multiple runtime backends; ignoring",
+                         get_desc().c_str());
+                multi_device_eval_callback_warned = true;
+            }
+            status = ggml_backend_sched_graph_compute(sched, gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_synchronize(sched);
+            }
+        } else {
+            status = sd_backend_graph_compute_with_eval_callback(runtime_backend,
+                                                                 gf,
+                                                                 sd_get_backend_eval_callback(),
+                                                                 sd_get_backend_eval_callback_data());
+        }
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return std::nullopt;
@@ -2650,6 +2824,10 @@ public:
         free_params_ctx();
         free_compute_ctx();
         free_cache_ctx_and_buffer();
+        if (cpu_fallback_backend != nullptr) {
+            ggml_backend_free(cpu_fallback_backend);
+            cpu_fallback_backend = nullptr;
+        }
     }
 
     virtual GGMLRunnerContext get_context() {
@@ -2690,10 +2868,20 @@ public:
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
         }
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
     }
 
     // do copy after alloc graph
     void set_backend_tensor_data(ggml_tensor* tensor, const void* data) {
+        if (is_multi_device()) {
+            // The sched only assigns a backend (and thus a buffer) to tensors
+            // that participate in the graph; flag standalone data tensors as
+            // inputs so they get one.
+            ggml_set_input(tensor);
+        }
         backend_tensor_data_map[tensor] = data;
     }
 
@@ -2829,7 +3017,30 @@ public:
     }
 
     void set_stream_layers_enabled(bool enabled) {
+        if (enabled && is_multi_device()) {
+            LOG_WARN("%s: --stream-layers is not supported with multiple runtime backends; ignoring",
+                     get_desc().c_str());
+            return;
+        }
         stream_layers_enabled = enabled;
+    }
+
+    void set_runtime_backends(const std::vector<ggml_backend_t>& backends) {
+        extra_runtime_backends.clear();
+        for (ggml_backend_t backend : backends) {
+            if (backend == nullptr || backend == runtime_backend) {
+                continue;
+            }
+            if (std::find(extra_runtime_backends.begin(), extra_runtime_backends.end(), backend) ==
+                extra_runtime_backends.end()) {
+                extra_runtime_backends.push_back(backend);
+            }
+        }
+        if (is_multi_device() && stream_layers_enabled) {
+            LOG_WARN("%s: --stream-layers is not supported with multiple runtime backends; ignoring",
+                     get_desc().c_str());
+            stream_layers_enabled = false;
+        }
     }
 };
 
@@ -3365,7 +3576,7 @@ public:
                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
             }
         }
-        return ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
+        return ggml_ext_conv_3d(ctx->ggml_ctx, ctx->backend, x, w, b, in_channels,
                                 std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                 std::get<2>(padding), std::get<1>(padding), std::get<0>(padding),
                                 std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),

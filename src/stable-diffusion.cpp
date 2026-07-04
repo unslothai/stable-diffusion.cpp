@@ -2,11 +2,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <set>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/ggml_extend.hpp"
 #include "core/ggml_graph_cut.h"
+#include "core/layer_split_partition.h"
 
 #include "core/rng.hpp"
 #include "core/rng_mt19937.hpp"
@@ -29,6 +32,7 @@
 #include "model/diffusion/krea2.hpp"
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/ltxv.hpp"
+#include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/mmdit.hpp"
 #include "model/diffusion/model.hpp"
 #include "model/diffusion/pid.hpp"
@@ -83,6 +87,7 @@ const char* model_version_to_str[] = {
     "Wan 2.2 I2V",
     "Wan 2.2 TI2V",
     "Qwen Image",
+    "Qwen Image Layered",
     "Anima",
     "Flux.2",
     "Flux.2 klein",
@@ -93,6 +98,7 @@ const char* model_version_to_str[] = {
     "Ovis Image",
     "Ernie Image",
     "Lens",
+    "MiniT2I",
     "Longcat-Image",
     "PiD",
     "Ideogram 4",
@@ -167,6 +173,13 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
 
 /*=============================================== StableDiffusionGGML ================================================*/
 
+template <typename T, typename = void>
+struct has_set_runtime_backends : std::false_type {};
+template <typename T>
+struct has_set_runtime_backends<T,
+                                std::void_t<decltype(std::declval<T&>().set_runtime_backends(
+                                    std::declval<const std::vector<ggml_backend_t>&>()))>> : std::true_type {};
+
 static_assert(std::atomic<sd_cancel_mode_t>::is_always_lock_free,
               "sd_cancel_mode_t must be lock-free");
 
@@ -205,6 +218,7 @@ public:
     bool eager_load    = false;
     std::string backend_spec;
     std::string params_backend_spec;
+    std::string split_mode_spec;
 
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
@@ -272,23 +286,245 @@ public:
         if (model_manager == nullptr) {
             return true;
         }
+        ModelManager::ResidencyMode residency_mode =
+            backend_manager.params_backend_is_disk(module) ? ModelManager::ResidencyMode::Disk : ModelManager::ResidencyMode::ParamBackend;
+
+        std::vector<ggml_backend_t> module_backends = backend_manager.runtime_backends(module);
+        if (module_backends.size() > 1) {
+            if constexpr (has_set_runtime_backends<T>::value) {
+                if (module == SDBackendModule::DIFFUSION || module == SDBackendModule::TE) {
+                    if (backend_manager.split_mode(module) == SDSplitMode::ROW) {
+                        return register_row_split_runner_params(desc,
+                                                                model,
+                                                                module,
+                                                                module_backends,
+                                                                std::move(group_tensors),
+                                                                residency_mode,
+                                                                params_mem_size);
+                    }
+                    return register_layer_split_runner_params(desc,
+                                                              model,
+                                                              module,
+                                                              module_backends,
+                                                              std::move(group_tensors),
+                                                              residency_mode,
+                                                              params_mem_size);
+                }
+            }
+            LOG_WARN("%s module does not support multiple runtime backends; using %s",
+                     sd_backend_module_name(module),
+                     sd::layer_split_backend_device_display_name(module_backends[0]).c_str());
+        }
         return model_manager->register_param_tensors(desc,
                                                      std::move(group_tensors),
-                                                     backend_manager.params_backend_is_disk(module) ? ModelManager::ResidencyMode::Disk : ModelManager::ResidencyMode::ParamBackend,
+                                                     residency_mode,
                                                      backend_for(module),
                                                      params_backend_for(module),
                                                      params_mem_size);
+    }
+
+    template <typename T>
+    bool register_row_split_runner_params(const std::string& desc,
+                                          const std::shared_ptr<T>& model,
+                                          SDBackendModule module,
+                                          const std::vector<ggml_backend_t>& module_backends,
+                                          std::map<std::string, ggml_tensor*> group_tensors,
+                                          ModelManager::ResidencyMode residency_mode,
+                                          size_t* params_mem_size) {
+        ggml_backend_t main_backend = module_backends[0];
+
+        auto fall_back_to_layer_split = [&](const char* reason) {
+            LOG_WARN("%s: row split unavailable (%s); falling back to layer split", desc.c_str(), reason);
+            return register_layer_split_runner_params(desc,
+                                                      model,
+                                                      module,
+                                                      module_backends,
+                                                      std::move(group_tensors),
+                                                      residency_mode,
+                                                      params_mem_size);
+        };
+
+        ggml_backend_dev_t main_dev = ggml_backend_get_device(main_backend);
+        ggml_backend_reg_t reg      = main_dev != nullptr ? ggml_backend_dev_backend_reg(main_dev) : nullptr;
+        if (reg == nullptr) {
+            return fall_back_to_layer_split("no backend registry");
+        }
+        const size_t reg_dev_count = ggml_backend_reg_dev_count(reg);
+        std::vector<float> tensor_split(reg_dev_count, 0.0f);
+        constexpr int64_t compute_headroom_bytes = 2ll * 1024 * 1024 * 1024;
+        for (ggml_backend_t backend : module_backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            int reg_index          = -1;
+            for (size_t i = 0; i < reg_dev_count; i++) {
+                if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                    reg_index = (int)i;
+                    break;
+                }
+            }
+            if (reg_index < 0) {
+                return fall_back_to_layer_split("devices span different backend registries");
+            }
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            int64_t usable_bytes    = std::max<int64_t>((int64_t)free_bytes - compute_headroom_bytes,
+                                                     (int64_t)free_bytes / 8);
+            tensor_split[reg_index] = usable_bytes > 0 ? (float)((double)usable_bytes / (1024.0 * 1024.0)) : 1.0f;
+        }
+
+        ggml_backend_buffer_type_t split_buft = backend_manager.split_buffer_type(main_backend, tensor_split);
+        if (split_buft == nullptr) {
+            return fall_back_to_layer_split("backend has no split buffer type");
+        }
+        model_manager->set_split_buffer_type(main_backend, split_buft);
+
+        std::map<std::string, ggml_tensor*> split_tensors;
+        if constexpr (std::is_base_of_v<Conditioner, T>) {
+            model->get_layer_split_param_tensors(split_tensors);
+        } else {
+            split_tensors = group_tensors;
+        }
+
+        std::map<std::string, ggml_tensor*> row_split_map;
+        std::map<std::string, ggml_tensor*> regular_map;
+        size_t row_split_bytes = 0;
+        for (const auto& kv : group_tensors) {
+            if (split_tensors.count(kv.first) != 0 &&
+                sd::layer_split_tensor_block_index(kv.first) >= 0 &&
+                ModelManager::tensor_shape_supports_split_buffer(kv.second)) {
+                row_split_map[kv.first] = kv.second;
+                row_split_bytes += ggml_nbytes(kv.second);
+            } else {
+                regular_map[kv.first] = kv.second;
+            }
+        }
+        if (row_split_map.empty()) {
+            return fall_back_to_layer_split("no row-splittable transformer block weights found");
+        }
+
+        LOG_INFO("%s row split: %zu tensors (%.1f MB) split across %zu devices (main %s)",
+                 desc.c_str(),
+                 row_split_map.size(),
+                 row_split_bytes / (1024.f * 1024.f),
+                 module_backends.size(),
+                 sd::layer_split_backend_device_display_name(main_backend).c_str());
+
+        if (!model_manager->register_param_tensors(desc,
+                                                   std::move(row_split_map),
+                                                   residency_mode,
+                                                   main_backend,
+                                                   params_backend_for(module),
+                                                   params_mem_size,
+                                                   /*allow_split_buffer=*/true)) {
+            return false;
+        }
+        return model_manager->register_param_tensors(desc,
+                                                     std::move(regular_map),
+                                                     residency_mode,
+                                                     main_backend,
+                                                     params_backend_for(module),
+                                                     params_mem_size);
+    }
+
+    // Register each layer-split partition with its compute backend; the
+    // ModelManager handles allocation, staging, and LoRA by backend.
+    template <typename T>
+    bool register_layer_split_runner_params(const std::string& desc,
+                                            const std::shared_ptr<T>& model,
+                                            SDBackendModule module,
+                                            const std::vector<ggml_backend_t>& module_backends,
+                                            std::map<std::string, ggml_tensor*> group_tensors,
+                                            ModelManager::ResidencyMode residency_mode,
+                                            size_t* params_mem_size) {
+        bool has_cpu_device = false;
+        for (ggml_backend_t backend : module_backends) {
+            has_cpu_device = has_cpu_device || sd_backend_is_cpu(backend);
+        }
+        if (has_cpu_device) {
+            // The scheduler reserves the CPU slot for its fallback backend, and
+            // CPU weight participation is what --params-backend <module>=cpu is
+            // for; a CPU device in a split list is almost certainly a mistake.
+            LOG_WARN(
+                "%s: layer split across a CPU device is not supported; using %s "
+                "(use --params-backend %s=cpu to keep weights in RAM)",
+                desc.c_str(),
+                sd::layer_split_backend_device_display_name(module_backends[0]).c_str(),
+                sd_backend_module_name(module));
+            return model_manager->register_param_tensors(desc,
+                                                         std::move(group_tensors),
+                                                         residency_mode,
+                                                         module_backends[0],
+                                                         params_backend_for(module),
+                                                         params_mem_size);
+        }
+
+        std::map<std::string, ggml_tensor*> split_tensors;
+        if constexpr (std::is_base_of_v<Conditioner, T>) {
+            model->get_layer_split_param_tensors(split_tensors);
+        } else {
+            split_tensors = group_tensors;
+        }
+
+        auto partitions = sd::partition_layer_split_tensors(desc, group_tensors, split_tensors, module_backends);
+        bool is_split   = false;
+        for (size_t i = 1; i < partitions.size(); i++) {
+            if (!partitions[i].empty()) {
+                is_split = true;
+                break;
+            }
+        }
+        if (!is_split) {
+            return model_manager->register_param_tensors(desc,
+                                                         std::move(group_tensors),
+                                                         residency_mode,
+                                                         module_backends[0],
+                                                         params_backend_for(module),
+                                                         params_mem_size);
+        }
+
+        model->set_runtime_backends(module_backends);
+        const bool params_follow_runtime = backend_manager.params_backend_follows_runtime(module) ||
+                                           backend_manager.params_backend_is_disk(module);
+        for (size_t i = 0; i < module_backends.size(); i++) {
+            if (partitions[i].empty()) {
+                continue;
+            }
+            ggml_backend_t partition_params_backend =
+                params_follow_runtime ? module_backends[i] : params_backend_for(module);
+            if (partition_params_backend == nullptr) {
+                return false;
+            }
+            if (!model_manager->register_param_tensors(desc,
+                                                       std::move(partitions[i]),
+                                                       residency_mode,
+                                                       module_backends[i],
+                                                       partition_params_backend,
+                                                       params_mem_size)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool init_backend() {
         std::string error;
         if (!backend_manager.init(backend_spec.c_str(),
                                   params_backend_spec.c_str(),
+                                  split_mode_spec.c_str(),
                                   &error)) {
             LOG_ERROR("backend config failed: %s", error.c_str());
             return false;
         }
         return ensure_backend_pair(SDBackendModule::DIFFUSION);
+    }
+
+    bool row_split_active() {
+        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE}) {
+            if (backend_manager.split_mode(module) == SDSplitMode::ROW &&
+                backend_manager.runtime_backends(module).size() > 1) {
+                return true;
+            }
+        }
+        return false;
     }
 
     std::shared_ptr<RNG> get_rng(rng_type_t rng_type) {
@@ -349,6 +585,7 @@ public:
         eager_load          = sd_ctx_params->eager_load;
         backend_spec        = SAFE_STR(sd_ctx_params->backend);
         params_backend_spec = SAFE_STR(sd_ctx_params->params_backend);
+        split_mode_spec     = SAFE_STR(sd_ctx_params->split_mode);
         max_vram_assignment.reset(0.f);
         {
             std::string error;
@@ -577,12 +814,17 @@ public:
             // Avoid full-model LoRA merge buffers on constrained setups.
             const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
             const bool streaming_constrained = stream_layers || params_offloaded;
-            if (have_quantized_weight || streaming_constrained) {
+            if (have_quantized_weight || streaming_constrained || row_split_active()) {
                 apply_lora_immediately = false;
             } else {
                 apply_lora_immediately = true;
             }
         } else if (sd_ctx_params->lora_apply_mode == LORA_APPLY_IMMEDIATELY) {
+            if (row_split_active()) {
+                LOG_WARN(
+                    "row-split tensors do not support the immediately LoRA apply mode; "
+                    "LoRAs will not be applied to them (use --lora-apply-mode at_runtime)");
+            }
             apply_lora_immediately = true;
         } else {
             apply_lora_immediately = false;
@@ -752,13 +994,14 @@ public:
                     }
                 }
             } else if (sd_version_is_qwen_image(version)) {
-                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                bool enable_vision = version != VERSION_QWEN_IMAGE_LAYERED;
+                cond_stage_model   = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
                                                                  version,
                                                                  "",
-                                                                 true,
+                                                                 enable_vision,
                                                                  model_manager);
-                diffusion_model  = std::make_shared<Qwen::QwenImageRunner>(backend_for(SDBackendModule::DIFFUSION),
+                diffusion_model    = std::make_shared<Qwen::QwenImageRunner>(backend_for(SDBackendModule::DIFFUSION),
                                                                           tensor_storage_map,
                                                                           "model.diffusion_model",
                                                                           version,
@@ -785,6 +1028,14 @@ public:
                                                                                tensor_storage_map,
                                                                                "model",
                                                                                model_manager);
+            } else if (sd_version_is_minit2i(version)) {
+                cond_stage_model = std::make_shared<MiniT2IConditioner>(backend_for(SDBackendModule::TE),
+                                                                        tensor_storage_map,
+                                                                        model_manager);
+                diffusion_model  = std::make_shared<MiniT2I::MiniT2IRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                           tensor_storage_map,
+                                                                           "model.diffusion_model.model.net",
+                                                                           model_manager);
             } else if (sd_version_is_anima(version)) {
                 cond_stage_model = std::make_shared<AnimaConditioner>(backend_for(SDBackendModule::TE),
                                                                       tensor_storage_map,
@@ -958,7 +1209,7 @@ public:
                 }
             };
 
-            if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1) {
+            if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1 || sd_version_is_minit2i(version)) {
                 LOG_INFO("using FakeVAE");
                 first_stage_model = std::make_shared<FakeVAE>(version,
                                                               backend_for(SDBackendModule::VAE),
@@ -1299,6 +1550,8 @@ public:
                     }
                 } else if (sd_version_is_sefi_image(version)) {
                     pred_type = SEFI_FLOW_PRED;
+                } else if (sd_version_is_minit2i(version)) {
+                    pred_type = MINIT2I_FLOW_PRED;
                 } else {
                     pred_type = EPS_PRED;
                 }
@@ -1334,6 +1587,11 @@ public:
                 case SEFI_FLOW_PRED: {
                     LOG_INFO("running in SeFi-Image dual-time FLOW mode");
                     denoiser = std::make_shared<SefiFlowDenoiser>();
+                    break;
+                }
+                case MINIT2I_FLOW_PRED: {
+                    LOG_INFO("running in MiniT2I FLOW mode");
+                    denoiser = std::make_shared<MiniT2IFlowDenoiser>();
                     break;
                 }
                 default: {
@@ -2032,11 +2290,12 @@ public:
         }
 
         int64_t last_progress_us     = ggml_time_us();
-        sd::Tensor<float> x_t        = !noise.empty()
-                                           ? denoiser->noise_scaling(sigmas[0], noise, init_latent)
-                                           : init_latent;
-        sd::Tensor<float> denoised   = x_t;
         SamplePreviewContext preview = prepare_sample_preview_context();
+
+        sd::Tensor<float> x_t      = !noise.empty()
+                                         ? denoiser->noise_scaling(sigmas[0], noise, init_latent)
+                                         : init_latent;
+        sd::Tensor<float> denoised = x_t;
 
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             if (get_cancel_flag() == SD_CANCEL_ALL) {
@@ -2100,9 +2359,9 @@ public:
             sd_sample::SampleStepCacheDispatcher step_cache(cache_runtime, step, sigma);
             std::vector<sd::Tensor<float>> controls;
             DiffusionParams diffusion_params;
-            diffusion_params.x                  = &noised_input;
-            diffusion_params.timesteps          = &timesteps_tensor;
-            diffusion_params.increase_ref_index = increase_ref_index;
+            diffusion_params.x              = &noised_input;
+            diffusion_params.timesteps      = &timesteps_tensor;
+            diffusion_params.ref_index_mode = Rope::ref_index_mode_from_bool(increase_ref_index);
             sd::guidance::GuidanceInput step_guidance_input;
             step_guidance_input.step          = step;
             step_guidance_input.schedule_size = sigmas.size();
@@ -2155,6 +2414,9 @@ public:
                         audio_length,
                         frame_rate,
                         video_positions.empty() ? nullptr : &video_positions};
+                } else if (sd_version_is_minit2i(version)) {
+                    diffusion_params.extra = MiniT2IDiffusionExtra{
+                        condition.c_vector.empty() ? nullptr : &condition.c_vector};
                 } else {
                     diffusion_params.extra = std::monostate{};
                 }
@@ -2335,6 +2597,8 @@ public:
                 latent_channel = 3;
             } else if (version == VERSION_CHROMA_RADIANCE) {
                 latent_channel = 3;
+            } else if (sd_version_is_minit2i(version)) {
+                latent_channel = 3;
             } else if (sd_version_is_pid(version)) {
                 latent_channel = 3;
             } else if (sd_version_is_sefi_image(version)) {
@@ -2346,6 +2610,10 @@ public:
             }
         }
         return latent_channel;
+    }
+
+    int get_image_channels() const {
+        return version == VERSION_QWEN_IMAGE_LAYERED ? 4 : 3;
     }
 
     int get_image_seq_len(int h, int w) {
@@ -2416,7 +2684,7 @@ public:
     }
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
-        if (sd_version_is_pid(version)) {
+        if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
         }
         auto latents = first_stage_model->diffusion_to_vae_latents(x);
@@ -2591,6 +2859,7 @@ const char* prediction_to_str[] = {
     "sd3_flow",
     "flux_flow",
     "sefi_flow",
+    "minit2i_flow",
 };
 
 const char* sd_prediction_name(enum prediction_t prediction) {
@@ -2776,6 +3045,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->vae_format           = SD_VAE_FORMAT_AUTO;
     sd_ctx_params->backend              = nullptr;
     sd_ctx_params->params_backend       = nullptr;
+    sd_ctx_params->split_mode           = nullptr;
     sd_ctx_params->rpc_servers          = nullptr;
     sd_ctx_params->pulid_weights_path   = nullptr;
 }
@@ -2815,6 +3085,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "eager_load: %s\n"
              "backend: %s\n"
              "params_backend: %s\n"
+             "split_mode: %s\n"
              "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
              "circular_x: %s\n"
@@ -2851,6 +3122,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->eager_load),
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
+             SAFE_STR(sd_ctx_params->split_mode),
              BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
              BOOL_STR(sd_ctx_params->circular_x),
@@ -2934,6 +3206,7 @@ void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     sd_img_gen_params->seed              = -1;
     sd_img_gen_params->batch_count       = 1;
     sd_img_gen_params->control_strength  = 0.9f;
+    sd_img_gen_params->qwen_image_layers = 3;
     sd_img_gen_params->pm_params         = {nullptr, 0, nullptr, 20.f};
     sd_img_gen_params->pulid_params      = {nullptr, 1.0f};
     sd_img_gen_params->vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
@@ -2960,6 +3233,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              "seed: %" PRId64
              "\n"
              "batch_count: %d\n"
+             "qwen_image_layers: %d\n"
              "ref_images_count: %d\n"
              "auto_resize_ref_image: %s\n"
              "increase_ref_index: %s\n"
@@ -2976,6 +3250,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              sd_img_gen_params->strength,
              sd_img_gen_params->seed,
              sd_img_gen_params->batch_count,
+             sd_img_gen_params->qwen_image_layers,
              sd_img_gen_params->ref_images_count,
              BOOL_STR(sd_img_gen_params->auto_resize_ref_image),
              BOOL_STR(sd_img_gen_params->increase_ref_index),
@@ -3243,6 +3518,7 @@ struct GenerationRequest {
     bool has_ref_images                      = false;
     const sd_cache_params_t* cache_params    = nullptr;
     int batch_count                          = 1;
+    int qwen_image_layers                    = 3;
     int shifted_timestep                     = 0;
     float strength                           = 1.f;
     float control_strength                   = 0.f;
@@ -3268,6 +3544,7 @@ struct GenerationRequest {
         diffusion_model_down_factor = sd_ctx->sd->get_diffusion_model_down_factor();
         seed                        = sd_img_gen_params->seed;
         batch_count                 = sd_img_gen_params->batch_count;
+        qwen_image_layers           = std::max(0, sd_img_gen_params->qwen_image_layers);
         clip_skip                   = sd_img_gen_params->clip_skip;
         shifted_timestep            = sd_img_gen_params->sample_params.shifted_timestep;
         strength                    = sd_img_gen_params->strength;
@@ -3972,6 +4249,34 @@ public:
     ImageVaeAxesGuard& operator=(const ImageVaeAxesGuard&) = delete;
 };
 
+static sd::Tensor<float> ensure_image_tensor_channels(sd::Tensor<float> image, int channels) {
+    if (image.empty()) {
+        return image;
+    }
+    GGML_ASSERT(image.dim() == 4);
+    int64_t current_channels = image.shape()[2];
+    if (current_channels == channels) {
+        return image;
+    }
+    if (channels == 4) {
+        sd::Tensor<float> alpha = sd::full<float>({image.shape()[0], image.shape()[1], 1, image.shape()[3]}, 1.f);
+        if (current_channels == 3) {
+            return sd::ops::concat(image, alpha, 2);
+        }
+        if (current_channels == 1) {
+            sd::Tensor<float> rgb = sd::ops::concat(image, image, 2);
+            rgb                   = sd::ops::concat(rgb, image, 2);
+            return sd::ops::concat(rgb, alpha, 2);
+        }
+    }
+    if (channels == 3 && current_channels >= 3) {
+        return sd::ops::slice(image, 2, 0, 3);
+    }
+    GGML_ABORT("cannot convert image tensor from %lld to %d channels",
+               (long long)current_channels,
+               channels);
+}
+
 static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd_ctx_t* sd_ctx,
                                                                               const sd_img_gen_params_t* sd_img_gen_params,
                                                                               GenerationRequest* request,
@@ -3981,6 +4286,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
     sd::Tensor<float> init_image_tensor;
     sd::Tensor<float> control_image_tensor;
     sd::Tensor<float> mask_image_tensor;
+    int image_channels = sd_ctx->sd->get_image_channels();
 
     if (sd_img_gen_params->init_image.data != nullptr) {
         LOG_INFO("IMG2IMG");
@@ -3997,7 +4303,8 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
             plan->sample_steps = static_cast<int>(plan->sigmas.size() - 1);
         }
 
-        init_image_tensor = sd_image_to_tensor(sd_img_gen_params->init_image, request->width, request->height);
+        init_image_tensor = ensure_image_tensor_channels(sd_image_to_tensor(sd_img_gen_params->init_image, request->width, request->height),
+                                                         image_channels);
     }
 
     if (sd_img_gen_params->mask_image.data != nullptr) {
@@ -4029,7 +4336,11 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
     sd::Tensor<float> init_latent;
     sd::Tensor<float> control_latent;
     if (init_image_tensor.empty()) {
-        init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height);
+        if (sd_ctx->sd->version == VERSION_QWEN_IMAGE_LAYERED) {
+            init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->qwen_image_layers + 1, true);
+        } else {
+            init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height);
+        }
     } else {
         init_latent = sd_ctx->sd->encode_first_stage(init_image_tensor);
         if (init_latent.empty()) {
@@ -4048,12 +4359,13 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
 
     std::vector<sd::Tensor<float>> ref_images;
     for (int i = 0; i < sd_img_gen_params->ref_images_count; i++) {
-        ref_images.push_back(sd_image_to_tensor(sd_img_gen_params->ref_images[i]));
+        ref_images.push_back(ensure_image_tensor_channels(sd_image_to_tensor(sd_img_gen_params->ref_images[i]),
+                                                          image_channels));
     }
 
     if (ref_images.empty() && sd_version_is_unet_edit(sd_ctx->sd->version)) {
         LOG_WARN("This model needs at least one reference image; using an empty reference");
-        ref_images.push_back(sd::zeros<float>({request->width, request->height, 3, 1}));
+        ref_images.push_back(sd::zeros<float>({request->width, request->height, image_channels, 1}));
         request->guidance.img_cfg = request->guidance.txt_cfg;
         request->use_img_uncond   = false;
     }
@@ -4079,7 +4391,10 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
             vae_width  = round(vae_width / factor) * factor;
 
             auto resized_ref_img = sd::ops::interpolate(ref_images[i],
-                                                        {static_cast<int>(vae_width), static_cast<int>(vae_height), 3, 1});
+                                                        {static_cast<int>(vae_width),
+                                                         static_cast<int>(vae_height),
+                                                         ref_images[i].shape()[2],
+                                                         ref_images[i].shape()[3]});
 
             LOG_DEBUG("resize vae ref image %d from %" PRId64 "x%" PRId64 " to %" PRId64 "x%" PRId64,
                       static_cast<int>(i),
@@ -4224,6 +4539,11 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     if (request->use_uncond || request->use_high_noise_uncond) {
         if (sd_version_is_ideogram4(sd_ctx->sd->version)) {
             uncond.c_vector = sd::Tensor<float>::from_vector({1.0f});
+        } else if (sd_version_is_minit2i(sd_ctx->sd->version)) {
+            // MiniT2I derives the unconditional signal from the same T5 hidden
+            // states with a zeroed prompt mask, so no extra text encode is needed.
+            uncond.c_crossattn = cond.c_crossattn;
+            uncond.c_vector    = sd::Tensor<float>::zeros_like(cond.c_vector);
         } else {
             bool zero_out_masked = false;
             if (sd_version_is_sdxl(sd_ctx->sd->version) &&
@@ -4304,13 +4624,41 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
             cancelled = true;
             break;
         }
-        int64_t t1              = ggml_time_ms();
-        sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(final_latents[i]);
-        if (image.empty()) {
-            LOG_ERROR("decode_first_stage failed for latent %" PRId64, i + 1);
-            return nullptr;
+        int64_t t1 = ggml_time_ms();
+        if (sd_ctx->sd->version == VERSION_QWEN_IMAGE_LAYERED) {
+            int qwen_image_latent_layers = request.qwen_image_layers + 1;
+            if (final_latents[i].dim() < 5 || final_latents[i].shape()[2] < qwen_image_latent_layers) {
+                LOG_ERROR("qwen image layered expected at least %d latent layers, got shape dim=%d",
+                          qwen_image_latent_layers,
+                          final_latents[i].dim());
+                return nullptr;
+            }
+            for (int layer_index = 0; layer_index < qwen_image_latent_layers; layer_index++) {
+                if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                    LOG_ERROR("cancelling latent decodings");
+                    cancelled = true;
+                    break;
+                }
+                sd::Tensor<float> layer_latent = sd::ops::slice(final_latents[i], 2, layer_index, layer_index + 1);
+                layer_latent.squeeze_(2);
+                sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(layer_latent);
+                if (image.empty()) {
+                    LOG_ERROR("decode_first_stage failed for latent %zu layer %d", i + 1, layer_index + 1);
+                    return nullptr;
+                }
+                decoded_images.push_back(std::move(image));
+            }
+            if (cancelled) {
+                break;
+            }
+        } else {
+            sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(final_latents[i]);
+            if (image.empty()) {
+                LOG_ERROR("decode_first_stage failed for latent %" PRId64, i + 1);
+                return nullptr;
+            }
+            decoded_images.push_back(std::move(image));
         }
-        decoded_images.push_back(std::move(image));
         int64_t t2 = ggml_time_ms();
         LOG_INFO("latent %zu decoded, taking %.2fs", i + 1, (t2 - t1) * 1.0f / 1000);
     }
