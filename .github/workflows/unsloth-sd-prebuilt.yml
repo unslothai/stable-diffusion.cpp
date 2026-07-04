@@ -254,6 +254,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_FLAGS='/bigobj' `
             -DSD_BUILD_EXAMPLES=ON `
             -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
