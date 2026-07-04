@@ -54,7 +54,10 @@ def _collect(bin_dir: Path) -> list[Path]:
     for p in sorted(bin_dir.rglob("*")):
         if not p.is_file():
             continue
-        if p.name in _BINARIES or p.suffix.lower() in _LIB_SUFFIXES:
+        # Versioned ELF sonames (libcudart.so.12, libcublas.so.12) have a numeric
+        # Path.suffix, so match ".so." anywhere in the name too -- the CUDA leg ships
+        # the toolkit runtime under its soname next to the binaries (RPATH $ORIGIN).
+        if p.name in _BINARIES or p.suffix.lower() in _LIB_SUFFIXES or ".so." in p.name.lower():
             found.append(p)
     return found
 

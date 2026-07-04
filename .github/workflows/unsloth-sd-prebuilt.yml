@@ -1,23 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
 
-name: Unsloth SD prebuilt (CPU/Apple)
+name: Unsloth SD prebuilt (CPU/Apple/CUDA)
 
 # Build and publish OUR OWN stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
 # the platforms where the native engine is the FASTER choice: CPU (Linux/WSL/Windows)
-# and Apple (Metal). GPU hosts use diffusers/torch, so no CUDA/ROCm/Vulkan here.
+# and Apple (Metal), plus a Linux CUDA 12 leg for GPU hosts that want the native
+# engine (torchless installs / the Studio's explicit --accelerator cuda path).
 #
-# Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 5-way
-# CPU/Apple matrix:
-#   resolve      -- pick the leejet release tag (supply-chain aged), stamp a source
-#                   tarball from that tag, decide if our release already exists.
-#   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
-#   build-windows-- Windows x64 (MSVC + Ninja).
-#   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
-#                   draft->publish. If ANY build leg fails, assemble is skipped and
-#                   nothing is published (the Studio needs the full asset set).
+# Shape mirrors unslothai/llama.cpp's prebuilt pipeline:
+#   resolve         -- pick the leejet release tag (supply-chain aged), stamp a source
+#                      tarball from that tag, decide if our release already exists.
+#   build-unix      -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
+#   build-windows   -- Windows x64 (MSVC + Ninja).
+#   build-linux-cuda-- Linux x64 + CUDA 12.8 (Turing..Blackwell fatbin, runtime libs
+#                      bundled, RPATH $ORIGIN; the driver libcuda is NOT bundled).
+#   assemble        -- fingerprint gate, sha256 + manifest, coverage gate, atomic
+#                      draft->publish. If ANY build leg fails, assemble is skipped and
+#                      nothing is published (the Studio needs the full asset set).
 #
-# Asset names match the Studio installer's resolve_release_asset (leejet-compatible).
+# Asset names match the Studio installer's resolve_release_asset (leejet-compatible):
+# the CUDA asset carries the "cuda12" marker, which the installer's Linux branch only
+# selects for an explicit cuda accelerator request (auto/cpu skip marked assets).
 
 on:
   schedule:
@@ -279,9 +283,114 @@ jobs:
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64.zip
           if-no-files-found: error
 
+  build-linux-cuda:
+    name: linux-cuda12-x64
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    env:
+      # Consumer + datacenter fatbin: 75 Turing, 80 A100, 86 Ampere consumer, 89 Ada,
+      # 90 Hopper, 100 Blackwell datacenter, 120 Blackwell consumer. 100/120 need
+      # CUDA >= 12.8, which is why the toolkit is pinned to 12.8.1.
+      CUDA_ARCHITECTURES: "75;80;86;89;90;100;120"
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Free disk space
+        run: |
+          # The CUDA toolkit (nvcc + cudart + cublas) plus object files for the full
+          # arch list can exhaust the runner's ~14 GB free root disk, so drop
+          # preinstalled SDKs we do not use BEFORE installing the toolkit.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/share/swift /usr/local/share/boost || true
+          docker system prune -af || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install cuda-toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "12.8.1"
+          method: "network"
+          # nvcc + cudart + cublas is enough to compile and link the CUDA backend;
+          # libcuda (the driver) resolves on the GPU host at runtime.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev", "thrust"]'
+
+      - name: Build sd-cli + sd-server
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # GGML_BACKEND_DL=OFF links the CUDA backend statically into the binaries
+          # (no dispatch .so to ship); GGML_CPU_ALL_VARIANTS keeps the runtime AVX
+          # dispatch CPU fallback. RPATH $ORIGIN resolves the bundled CUDA runtime
+          # libs placed next to the executables at package time.
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            -DSD_CUDA=ON \
+            -DGGML_BACKEND_DL=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+            -DCMAKE_CUDA_FLAGS='-Xcudafe "--diag_suppress=177" -Xcudafe "--diag_suppress=550"' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
+
+      - name: Bundle CUDA runtime next to the binaries
+        run: |
+          set -euo pipefail
+          # libcudart / libcublas / libcublasLt are the toolkit RUNTIME (redistributable),
+          # copied under their sonames so the $ORIGIN RPATH resolves them from the same
+          # dir. libcuda (the driver) is deliberately NOT bundled.
+          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          [ -n "$CUDA_ROOT" ] || CUDA_ROOT="${CUDA_PATH:-/usr/local/cuda}"
+          for lib in libcudart libcublas libcublasLt; do
+            for so in "$CUDA_ROOT"/lib64/${lib}.so.*; do
+              [ -e "$so" ] && cp -av "$so" src/build/bin/ || true
+            done
+          done
+          ls -la src/build/bin
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: linux-cuda12-x64
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: leejet/stable-diffusion.cpp
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-linux-cuda12-x64
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-linux-cuda12-x64.zip
+          if-no-files-found: error
+
   assemble:
     name: Assemble + publish
-    needs: [resolve, build-unix, build-windows]
+    needs: [resolve, build-unix, build-windows, build-linux-cuda]
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
     permissions:
@@ -329,7 +438,7 @@ jobs:
             --publish-repo "$GITHUB_REPOSITORY"
           ls -la dist
 
-      - name: Coverage gate (all 5 CPU/Apple assets present)
+      - name: Coverage gate (all 6 CPU/Apple/CUDA assets present)
         run: |
           set -eu
           TAG='${{ needs.resolve.outputs.tag }}'
@@ -339,7 +448,8 @@ jobs:
             "sd-${TAG}-bin-Darwin-macOS-x86_64.zip" \
             "sd-${TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip" \
             "sd-${TAG}-bin-Linux-Ubuntu-24.04-aarch64.zip" \
-            "sd-${TAG}-bin-win-cpu-x64.zip"; do
+            "sd-${TAG}-bin-win-cpu-x64.zip" \
+            "sd-${TAG}-bin-linux-cuda12-x64.zip"; do
             [ -s "dist/$f" ] || { echo "ERROR: missing $f" >&2; fail=1; }
           done
           [ "$fail" = 0 ] || { echo "ERROR: refusing to publish a partial release" >&2; exit 1; }
@@ -358,7 +468,7 @@ jobs:
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server) for upstream [${TAG}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${TAG}). GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server) for upstream [${TAG}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${TAG}). Covers CPU (Linux/WSL/Windows), Apple (Metal), and Linux CUDA 12 (Turing through Blackwell, CUDA runtime bundled, NVIDIA driver required on the host)."
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
             gh release delete "$TAG" --repo "$REPO" --yes
           fi
