@@ -10,10 +10,44 @@
 #include "model/common/rope.hpp"
 #include "model_manager.h"
 
+enum class RefImageResizeMode {
+    NONE,
+    LONGEST_SIDE,
+    AREA,
+};
+
+struct RefImageParams {
+    bool pass_to_vlm                   = false;
+    bool pass_to_dit                   = true;
+    Rope::RefIndexMode ref_index_mode  = Rope::RefIndexMode::FIXED;
+    bool force_ref_timestep_zero       = false;
+    bool resize_before_vae             = true;
+    int vae_input_max_pixels           = -1;
+    RefImageResizeMode vlm_resize_mode = RefImageResizeMode::AREA;
+    int vlm_min_size                   = -1;
+    int vlm_max_size                   = -1;
+    bool resize_vae_to_target          = false;
+};
+
+const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
+    {"flux_kontext", {false, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::NONE, -1, -1}},
+    {"longcat", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+    {"flux2", {false, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::NONE, -1, -1}},
+    {"qwen", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+    {"qwen_layered", {true, true, Rope::RefIndexMode::DECREASE, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+    {"mage_flow", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, -1, 384, true}},
+    {"z_image_omni", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
+    {"krea2_ostris_edit", {true, true, Rope::RefIndexMode::INCREASE, true, true, -1, RefImageResizeMode::AREA, -1, -1}},
+    {"krea2_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768}},
+    {"cosmos_reference", {false, true, Rope::RefIndexMode::INCREASE, false, false, -1, RefImageResizeMode::NONE, -1, -1}},
+};
+
 struct UNetDiffusionExtra {
     int num_video_frames                           = -1;
     const std::vector<sd::Tensor<float>>* controls = nullptr;
     float control_strength                         = 0.f;
+    const sd::Tensor<float>* ip_context            = nullptr;
+    float ip_scale                                 = 1.f;
 };
 
 struct SkipLayerDiffusionExtra {
@@ -53,8 +87,38 @@ struct LTXAVDiffusionExtra {
     const sd::Tensor<float>* video_positions = nullptr;
 };
 
+enum class MiniMaxH3ReferenceKind : int32_t {
+    IMAGE,
+    VIDEO,
+    AUDIO,
+    VIDEO_AUDIO,
+};
+
+struct MiniMaxH3ReferenceBlock {
+    MiniMaxH3ReferenceKind kind = MiniMaxH3ReferenceKind::IMAGE;
+    int32_t video_index         = -1;
+    int32_t audio_index         = -1;
+};
+
+struct MiniMaxH3DiffusionExtra {
+    const sd::Tensor<int32_t>* text_token_tags                    = nullptr;
+    const sd::Tensor<int32_t>* keyframe_indices                   = nullptr;
+    const std::vector<sd::Tensor<float>>* reference_audio_latents = nullptr;
+    const std::vector<MiniMaxH3ReferenceBlock>* reference_blocks  = nullptr;
+    int audio_length                                              = 0;
+    float video_sigma_shift                                       = 12.f;
+    float audio_sigma_shift                                       = 3.f;
+};
+
 struct MiniT2IDiffusionExtra {
     const sd::Tensor<float>* mask = nullptr;
+};
+
+struct HunyuanVideoDiffusionExtra {
+    const sd::Tensor<float>* guidance   = nullptr;
+    const sd::Tensor<float>* byt5       = nullptr;
+    const sd::Tensor<float>* vision     = nullptr;
+    const sd::Tensor<float>* timestep_r = nullptr;
 };
 
 using DiffusionExtraParams = std::variant<std::monostate,
@@ -65,7 +129,9 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           WanDiffusionExtra,
                                           HiDreamO1DiffusionExtra,
                                           LTXAVDiffusionExtra,
-                                          MiniT2IDiffusionExtra>;
+                                          MiniMaxH3DiffusionExtra,
+                                          MiniT2IDiffusionExtra,
+                                          HunyuanVideoDiffusionExtra>;
 
 struct DiffusionParams {
     const sd::Tensor<float>* x                        = nullptr;
@@ -74,7 +140,7 @@ struct DiffusionParams {
     const sd::Tensor<float>* c_concat                 = nullptr;
     const sd::Tensor<float>* y                        = nullptr;
     const std::vector<sd::Tensor<float>>* ref_latents = nullptr;
-    Rope::RefIndexMode ref_index_mode                 = Rope::RefIndexMode::FIXED;
+    RefImageParams ref_image_params                   = {false, false, Rope::RefIndexMode::FIXED, false};
     DiffusionExtraParams extra                        = std::monostate{};
 };
 

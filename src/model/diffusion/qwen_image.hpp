@@ -3,6 +3,7 @@
 
 #include <memory>
 
+#include "core/util.h"
 #include "model/common/block.hpp"
 #include "model/diffusion/dit.hpp"
 #include "model/diffusion/flux.hpp"
@@ -102,9 +103,9 @@ namespace Qwen {
             }
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx,
-                             ggml_tensor* timesteps,
-                             ggml_tensor* addition_t_cond = nullptr) {
+        virtual ggml_tensor* forward(GGMLRunnerContext* ctx,
+                                     ggml_tensor* timesteps,
+                                     ggml_tensor* addition_t_cond = nullptr) {
             // timesteps: [N,]
             // return: [N, embedding_dim]
             auto timestep_embedder = std::dynamic_pointer_cast<TimestepEmbedding>(blocks["timestep_embedder"]);
@@ -182,7 +183,7 @@ namespace Qwen {
             auto to_v     = std::dynamic_pointer_cast<Linear>(blocks["to_v"]);
             auto to_out_0 = std::dynamic_pointer_cast<Linear>(blocks["to_out.0"]);
 
-            if (sd_backend_is(ctx->backend, "Vulkan")) {
+            if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
                 to_out_0->set_force_prec_f32(true);
             }
 
@@ -415,10 +416,14 @@ namespace Qwen {
 
     public:
         QwenImageModel() {}
-        QwenImageModel(QwenImageConfig config)
+        QwenImageModel(QwenImageConfig config,
+                       std::shared_ptr<QwenTimestepProjEmbeddings> time_text_embed = nullptr)
             : config(config) {
-            int64_t inner_dim         = config.num_attention_heads * config.attention_head_dim;
-            blocks["time_text_embed"] = std::shared_ptr<GGMLBlock>(new QwenTimestepProjEmbeddings(inner_dim, config.use_additional_t_cond));
+            int64_t inner_dim = config.num_attention_heads * config.attention_head_dim;
+            if (time_text_embed == nullptr) {
+                time_text_embed = std::make_shared<QwenTimestepProjEmbeddings>(inner_dim, config.use_additional_t_cond);
+            }
+            blocks["time_text_embed"] = std::move(time_text_embed);
             blocks["txt_norm"]        = std::shared_ptr<GGMLBlock>(new RMSNorm(config.joint_attention_dim, 1e-6f));
             blocks["img_in"]          = std::shared_ptr<GGMLBlock>(new Linear(config.in_channels, inner_dim));
             blocks["txt_in"]          = std::shared_ptr<GGMLBlock>(new Linear(config.joint_attention_dim, inner_dim));
@@ -516,7 +521,7 @@ namespace Qwen {
                 if (input->ne[3] == 1) {
                     input = ggml_reshape_4d(ctx->ggml_ctx, input, input->ne[0], input->ne[1], 1, input->ne[2]);
                 }
-                return DiT::patchify(ctx->ggml_ctx, input, 1, config.patch_size, config.patch_size, N);
+                return DiT::patchify_3d(ctx->ggml_ctx, input, 1, config.patch_size, config.patch_size, N);
             };
 
             auto img           = patchify_input(x);
@@ -566,12 +571,21 @@ namespace Qwen {
                         const String2TensorStorage& tensor_storage_map      = {},
                         const std::string prefix                            = "",
                         SDVersion version                                   = VERSION_QWEN_IMAGE,
-                        bool zero_cond_t                                    = false,
-                        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                        const char* model_args                              = nullptr)
             : DiffusionModelRunner(backend, prefix, weight_manager),
               config(QwenImageConfig::detect_from_weights(tensor_storage_map, prefix)),
               version(version) {
-            config.zero_cond_t = config.zero_cond_t || zero_cond_t;
+            for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
+                if (key == "qwen_image_zero_cond_t") {
+                    bool parsed = false;
+                    if (parse_strict_bool(value, parsed)) {
+                        config.zero_cond_t = config.zero_cond_t || parsed;
+                    } else {
+                        LOG_WARN("ignoring invalid Qwen Image model arg '%s=%s'", key.c_str(), value.c_str());
+                    }
+                }
+            }
             if (version == VERSION_QWEN_IMAGE_LAYERED) {
                 config.use_additional_t_cond = true;
             }
@@ -705,8 +719,8 @@ namespace Qwen {
                            *diffusion_params.x,
                            *diffusion_params.timesteps,
                            tensor_or_empty(diffusion_params.context),
-                           diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
-                           diffusion_params.ref_index_mode);
+                           diffusion_params.ref_latents && diffusion_params.ref_image_params.pass_to_dit ? *diffusion_params.ref_latents : empty_ref_latents,
+                           diffusion_params.ref_image_params.ref_index_mode);
         }
 
         void test() {
@@ -775,7 +789,6 @@ namespace Qwen {
                                                                                             tensor_storage_map,
                                                                                             "model.diffusion_model",
                                                                                             VERSION_QWEN_IMAGE,
-                                                                                            false,
                                                                                             model_manager);
 
             if (!model_manager->register_runner_params("Qwen image test",

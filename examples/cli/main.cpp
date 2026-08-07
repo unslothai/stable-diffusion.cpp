@@ -199,7 +199,7 @@ struct SDCliParams {
         options.manual_options = {
             {"-M",
              "--mode",
-             "run mode, one of [img_gen, vid_gen, upscale, convert, metadata], default: img_gen",
+             "run mode, one of [img_gen, adetailer, vid_gen, upscale, convert, metadata], default: img_gen",
              on_mode_arg},
             {"",
              "--preview",
@@ -566,6 +566,65 @@ bool save_results(const SDCliParams& cli_params,
     return sucessful_reults != 0;
 }
 
+static bool apply_adetailer(sd_ctx_t* sd_ctx,
+                            const sd_ctx_params_t& sd_ctx_params,
+                            const SDContextParams& ctx_params,
+                            const SDGenerationParams& gen_params,
+                            const sd_img_gen_params_t& img_gen_params,
+                            SDMode mode,
+                            SDImageVec& results,
+                            int num_results) {
+    if (gen_params.ad_model_path.empty()) {
+        return true;
+    }
+
+    sd_adetailer_params_t ad_params{};
+    ad_params.prompt          = gen_params.ad_prompt.empty() ? nullptr : gen_params.ad_prompt.c_str();
+    ad_params.negative_prompt = gen_params.ad_negative_prompt.empty() ? nullptr : gen_params.ad_negative_prompt.c_str();
+    ad_params.extra_ad_args   = gen_params.extra_ad_args.c_str();
+
+    ADetailerCtxPtr ad_ctx(new_adetailer_ctx(gen_params.ad_model_path.c_str(),
+                                             ctx_params.n_threads,
+                                             sd_ctx_params.backend,
+                                             sd_ctx_params.params_backend));
+    if (ad_ctx == nullptr) {
+        LOG_ERROR("new_adetailer_ctx failed");
+        return false;
+    }
+
+    for (int i = 0; i < num_results; ++i) {
+        if (results[i].data == nullptr) {
+            continue;
+        }
+        sd_img_gen_params_t ad_generation_params = img_gen_params;
+        ad_generation_params.seed                = img_gen_params.seed + i;
+        if (mode == IMG_GEN) {
+            ad_generation_params.width    = 512;
+            ad_generation_params.height   = 512;
+            ad_generation_params.strength = 0.4f;
+        }
+        sd_image_t* detailed_images = nullptr;
+        int detailed_count          = 0;
+        if (!adetail_image(ad_ctx.get(),
+                           sd_ctx,
+                           results[i],
+                           &ad_params,
+                           &ad_generation_params,
+                           &detailed_images,
+                           &detailed_count) ||
+            detailed_count <= 0 || detailed_images == nullptr || detailed_images[0].data == nullptr) {
+            free_sd_images(detailed_images, detailed_count);
+            LOG_ERROR("ADetailer failed for image %d", i + 1);
+            return false;
+        }
+        free(results[i].data);
+        results[i]         = detailed_images[0];
+        detailed_images[0] = {0, 0, 0, nullptr};
+        free_sd_images(detailed_images, detailed_count);
+    }
+    return true;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
@@ -596,6 +655,11 @@ int main(int argc, const char* argv[]) {
             return 1;
         }
         return 0;
+    }
+
+    if (!gen_params.ad_model_path.empty() && cli_params.mode != IMG_GEN && cli_params.mode != ADETAILER) {
+        LOG_ERROR("--ad-model is only supported in image generation and adetailer modes");
+        return 1;
     }
 
     if (gen_params.video_frames > 4) {
@@ -653,7 +717,8 @@ int main(int argc, const char* argv[]) {
                                                cli_params.output_path.c_str(),
                                                ctx_params.wtype,
                                                ctx_params.tensor_type_rules.c_str(),
-                                               cli_params.convert_name);
+                                               cli_params.convert_name,
+                                               ctx_params.n_threads);
         if (!success) {
             LOG_ERROR("convert '%s'/'%s' to '%s' failed",
                       ctx_params.model_path.c_str(),
@@ -689,6 +754,18 @@ int main(int argc, const char* argv[]) {
         return true;
     };
 
+    auto load_audio = [&](const std::string& path, SDAudioOwner& audio) -> bool {
+        std::vector<float> samples;
+        uint32_t sample_rate = 0;
+        uint32_t channels    = 0;
+        if (!load_wav_from_file(path, samples, sample_rate, channels)) {
+            LOG_ERROR("load WAV audio from '%s' failed", path.c_str());
+            return false;
+        }
+        audio.reset(std::move(samples), sample_rate, channels);
+        return true;
+    };
+
     if (gen_params.init_image_path.size() > 0) {
         if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image)) {
             return 1;
@@ -709,6 +786,37 @@ int main(int argc, const char* argv[]) {
                 return 1;
             }
             gen_params.ref_images.push_back(std::move(ref_image));
+        }
+    }
+
+    if (!gen_params.ref_video_paths.empty()) {
+        gen_params.ref_videos.clear();
+        gen_params.ref_videos.reserve(gen_params.ref_video_paths.size());
+        for (const auto& path : gen_params.ref_video_paths) {
+            std::vector<SDImageOwner> frames;
+            if (!load_images_from_dir(path, frames, 0, 0, 0, cli_params.verbose) || frames.empty()) {
+                LOG_ERROR("load reference video frames from '%s' failed", path.c_str());
+                return 1;
+            }
+            gen_params.ref_videos.push_back(std::move(frames));
+        }
+
+        gen_params.ref_video_audios.clear();
+        gen_params.ref_video_audios.resize(gen_params.ref_videos.size());
+        for (size_t i = 0; i < gen_params.ref_video_audio_paths.size(); ++i) {
+            if (!load_audio(gen_params.ref_video_audio_paths[i], gen_params.ref_video_audios[i])) {
+                return 1;
+            }
+        }
+    }
+
+    if (!gen_params.ref_audio_paths.empty()) {
+        gen_params.ref_audios.clear();
+        gen_params.ref_audios.resize(gen_params.ref_audio_paths.size());
+        for (size_t i = 0; i < gen_params.ref_audio_paths.size(); ++i) {
+            if (!load_audio(gen_params.ref_audio_paths[i], gen_params.ref_audios[i])) {
+                return 1;
+            }
         }
     }
 
@@ -749,6 +857,16 @@ int main(int argc, const char* argv[]) {
                              0.8f,
                              1.0f,
                              false);
+        }
+    }
+
+    if (gen_params.ip_adapter_image_path.size() > 0) {
+        if (!load_sd_image_from_file(gen_params.ip_adapter_image.put(),
+                                     gen_params.ip_adapter_image_path.c_str(),
+                                     0,
+                                     0)) {
+            LOG_ERROR("load image from '%s' failed", gen_params.ip_adapter_image_path.c_str());
+            return 1;
         }
     }
 
@@ -805,15 +923,22 @@ int main(int argc, const char* argv[]) {
             gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen_params.sample_params.sample_method);
         }
 
-        if (cli_params.mode == IMG_GEN) {
-            sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
+        sd_img_gen_params_t img_gen_params{};
+        const bool use_img_gen_params = cli_params.mode == IMG_GEN || cli_params.mode == ADETAILER;
+        if (use_img_gen_params) {
+            img_gen_params = gen_params.to_sd_img_gen_params_t();
+        }
 
+        if (cli_params.mode == IMG_GEN) {
             sd_image_t* generated_images = nullptr;
             if (!generate_image(sd_ctx.get(), &img_gen_params, &generated_images, &num_results)) {
                 generated_images = nullptr;
                 num_results      = 0;
             }
             results.adopt(generated_images, num_results);
+        } else if (cli_params.mode == ADETAILER) {
+            num_results = 1;
+            results.push_back(gen_params.init_image.release());
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
             sd_image_t* generated_video        = nullptr;
@@ -825,6 +950,18 @@ int main(int argc, const char* argv[]) {
 
         if (!results) {
             LOG_ERROR("generate failed");
+            return 1;
+        }
+
+        if (use_img_gen_params &&
+            !apply_adetailer(sd_ctx.get(),
+                             sd_ctx_params,
+                             ctx_params,
+                             gen_params,
+                             img_gen_params,
+                             cli_params.mode,
+                             results,
+                             num_results)) {
             return 1;
         }
     }

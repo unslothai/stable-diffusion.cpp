@@ -33,11 +33,13 @@ private:
         ggml_tensor* tensor = nullptr;
         std::string desc;
 
-        ResidencyMode residency_mode   = ResidencyMode::ParamBackend;
-        ggml_backend_t compute_backend = nullptr;
-        ggml_backend_t params_backend  = nullptr;
-        bool allow_split_buffer        = false;
-        bool metadata_validated        = false;
+        ResidencyMode residency_mode       = ResidencyMode::ParamBackend;
+        ggml_backend_t compute_backend     = nullptr;
+        ggml_backend_t params_backend      = nullptr;
+        bool allow_split_buffer            = false;
+        bool params_follow_compute_backend = false;
+        bool metadata_validated            = false;
+        enum ggml_op usage_op              = GGML_OP_NONE;
 
         int active_prepare_count = 0;
 
@@ -129,8 +131,13 @@ public:
                                 ResidencyMode residency_mode,
                                 ggml_backend_t compute_backend,
                                 ggml_backend_t params_backend,
-                                size_t* registered_tensor_size = nullptr,
-                                bool allow_split_buffer        = false);
+                                size_t* registered_tensor_size                         = nullptr,
+                                bool allow_split_buffer                                = false,
+                                bool params_follow_compute_backend                     = false,
+                                const std::map<ggml_tensor*, enum ggml_op>* tensor_ops = nullptr);
+
+    bool unregister_param_tensors(const std::string& desc,
+                                  size_t* registered_tensor_size = nullptr);
 
     template <typename Runner>
     bool register_runner_params(const std::string& desc,
@@ -170,6 +177,8 @@ public:
     bool validate_registered_tensors();
     bool load_all_params_eagerly();
 
+    bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
+                                ggml_backend_t compute_backend) override;
     bool prepare_params(const std::vector<ggml_tensor*>& tensors) override;
     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void release_params_backend_params(const std::vector<ggml_tensor*>& tensors) override;
