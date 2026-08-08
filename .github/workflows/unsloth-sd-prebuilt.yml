@@ -1,23 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
 
-name: Unsloth SD prebuilt (CPU/Apple)
+name: Unsloth SD prebuilt (CPU/Apple/CUDA)
 
 # Build and publish OUR OWN stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
-# the platforms where the native engine is the FASTER choice: CPU (Linux/WSL/Windows)
-# and Apple (Metal). GPU hosts use diffusers/torch, so no CUDA/ROCm/Vulkan here.
+# the platforms where the native engine is the FASTER choice: CPU (Linux/WSL/Windows),
+# Apple (Metal), and now Linux CUDA. The last one is a correction: this pipeline was
+# built on the premise that a GPU host runs diffusers/torch instead, and MiniMax-H3
+# breaks that premise by needing more VRAM than a consumer card has, which sends those
+# hosts to the GGUF engine after all.
 #
 # Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 5-way
-# CPU/Apple matrix:
+# CPU/Apple matrix plus one best-effort CUDA leg:
 #   resolve      -- take THIS repository at the requested ref, merge the pinned PR set
 #                   in scripts/unsloth/pr-set.json, stamp a source tarball, name it
 #                   after the upstream release the tree descends from (supply-chain
 #                   aged), decide if our release already exists.
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
 #   build-windows-- Windows x64 (MSVC + Ninja).
+#   build-linux-cuda -- Linux x64, CUDA 12.8, best effort (continue-on-error).
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
-#                   draft->publish. If ANY build leg fails, assemble is skipped and
-#                   nothing is published (the Studio needs the full asset set).
+#                   draft->publish. If any of the five CPU/Apple legs fails, assemble
+#                   is skipped and nothing is published (the Studio needs the full
+#                   asset set). The CUDA leg is exempt: it ships when it built and is
+#                   absent when it did not, so it can never hold back the fallbacks.
 #
 # Asset names match the Studio installer's resolve_release_asset.
 #
@@ -326,6 +332,111 @@ jobs:
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip
           if-no-files-found: error
 
+  # Linux CUDA. The rest of this pipeline is CPU and Apple on the premise that GPU hosts use
+  # diffusers/torch, and that premise fails for MiniMax-H3: its Diffusers path needs about
+  # 68.5 GB of VRAM, so every consumer card falls back to the GGUF engine, which on Linux had
+  # no accelerated build at all. Measured on one box: 65 s/step at 320x192 on 96 CPU threads,
+  # against 21.5 s/step at 960x544 from a CUDA build. That is the difference between a render
+  # taking four hours and taking eleven minutes.
+  #
+  # continue-on-error, and deliberately so. The CPU and Apple assets are what Studio falls back
+  # to, and a CUDA toolchain failure must never stop them publishing. assemble collects bundles
+  # by the sd-*-bin-* pattern, so this asset appears when it built and is simply absent when it
+  # did not; the coverage gate lists only the five CPU/Apple assets and must keep doing so.
+  build-linux-cuda:
+    name: Linux-Ubuntu-22.04-x86_64-cuda12
+    needs: resolve
+    continue-on-error: true
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Free disk for the toolkit
+        run: |
+          set -eux
+          # The hosted image ships ~25 GB free; the toolkit plus a seven-architecture ggml-cuda
+          # build does not fit beside the preinstalled Android and .NET trees.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h /
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "12.8.1"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+
+      - name: Build sd-cli + sd-server (CUDA)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Turing through Blackwell. 12.8 is the first toolkit that can emit sm_100 (B200) and
+          # sm_120 (RTX 50), and anything older than Turing is not a realistic host for a 20 GB
+          # video denoiser. build.yml's Windows leg uses the same list plus 61 and 70.
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            -DSD_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES='75;80;86;89;90;100;120'
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
+
+      - name: Bundle the CUDA runtime beside the binaries
+        run: |
+          set -euo pipefail
+          # A Studio host has an NVIDIA driver but not necessarily a CUDA runtime, and Studio's
+          # torch install keeps its own copies somewhere we must not depend on. Ship ours and
+          # point the binaries at their own directory, or sd-cli dies on a missing libcublas.
+          BIN="${GITHUB_WORKSPACE}/src/build/bin"
+          CUDA_LIB="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64"
+          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            src="$(find "$CUDA_LIB" -maxdepth 1 -name "${so}*" | sort | tail -1)"
+            [ -n "$src" ] || { echo "ERROR: $so not found under $CUDA_LIB" >&2; exit 1; }
+            cp -L "$src" "$BIN/$so"
+          done
+          for exe in sd-cli sd-server; do
+            patchelf --set-rpath '$ORIGIN' "$BIN/$exe"
+          done
+          ldd "$BIN/sd-cli" | sed -n '1,40p'
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: Linux-Ubuntu-22.04-x86_64-cuda12
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: ${{ github.repository }}
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip
+          if-no-files-found: error
+
   build-windows:
     name: win-cpu-x64
     needs: resolve
@@ -393,7 +504,7 @@ jobs:
 
   assemble:
     name: Assemble + publish
-    needs: [resolve, build-unix, build-windows]
+    needs: [resolve, build-unix, build-windows, build-linux-cuda]
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
     permissions:
