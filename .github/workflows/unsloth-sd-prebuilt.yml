@@ -9,28 +9,34 @@ name: Unsloth SD prebuilt (CPU/Apple)
 #
 # Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 5-way
 # CPU/Apple matrix:
-#   resolve      -- pick the leejet release tag (supply-chain aged), stamp a source
-#                   tarball from that tag, decide if our release already exists.
+#   resolve      -- stamp a source tarball from THIS repository at the requested ref,
+#                   name it after the upstream release the tree descends from
+#                   (supply-chain aged), decide if our release already exists.
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
 #   build-windows-- Windows x64 (MSVC + Ninja).
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
 #                   draft->publish. If ANY build leg fails, assemble is skipped and
 #                   nothing is published (the Studio needs the full asset set).
 #
-# Asset names match the Studio installer's resolve_release_asset (leejet-compatible).
+# Asset names match the Studio installer's resolve_release_asset.
+#
+# We build THIS repository's tree, not a tarball fetched from anywhere else. Our fixes are
+# commits here, so there is nothing to re-apply at build time and nothing to keep in step
+# with a foreign tag. The published tag still names the upstream release the tree descends
+# from, so a box can say what it is built on without the build depending on that repository.
 
 on:
   schedule:
     - cron: '17 20 * * *'      # ~1pm PT-ish; daily
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'leejet release tag (master-<n>-<sha>) or "latest"'
-        default: 'latest'
+      ref:
+        description: 'Ref in THIS repository to build (branch, tag or sha)'
+        default: 'master'
         required: true
         type: string
       min_age_hours:
-        description: 'For "latest": only build a release public for >= this many hours (blank = 6)'
+        description: 'Refuse a tree whose base upstream release is younger than this many hours (blank = 6)'
         default: ''
         required: false
         type: string
@@ -44,7 +50,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sd-prebuilt-${{ github.event.inputs.tag || 'scheduled' }}
+  group: sd-prebuilt-${{ github.event.inputs.ref || 'scheduled' }}
   cancel-in-progress: false
 
 env:
@@ -59,82 +65,61 @@ jobs:
     outputs:
       tag: ${{ steps.r.outputs.tag }}
       upstream_tag: ${{ steps.r.outputs.upstream_tag }}
-      patch_list: ${{ steps.r.outputs.patch_list }}
+      ahead: ${{ steps.r.outputs.ahead }}
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       source_artifact: ${{ steps.r.outputs.source_artifact }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout mirror (for tooling; upstream remote added below)
+      - name: Checkout this repository with full history, which the tag name is derived from
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          ref: ${{ github.event.inputs.ref || 'master' }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - id: r
         run: |
           set -euo pipefail
-          REQ='${{ github.event.inputs.tag || 'latest' }}'
           AGE_H='${{ github.event.inputs.min_age_hours }}'
           [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_SD_MIN_RELEASE_AGE_HOURS:-6}"
 
-          if [ "$REQ" = "latest" ]; then
-            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
-            TAG="$(gh api 'repos/leejet/stable-diffusion.cpp/releases?per_page=100' \
-              --jq "[.[] | select(.draft==false and .prerelease==false) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
-            [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "no leejet release older than ${AGE_H}h" >&2; exit 1; }
-            echo "selected leejet $TAG (aged >= ${AGE_H}h)"
-          else
-            TAG="$REQ"
-          fi
-          printf '%s' "$TAG" | grep -qE '^master-[0-9]+-[0-9a-f]+$' \
-            || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
-          UPSTREAM_TAG="$TAG"
-
-          # Stash patches/ before the upstream checkout: it is tracked HERE and absent from
-          # leejet's tree, so checking out their tag in this worktree would remove it.
-          PATCHES="${RUNNER_TEMP}/patches"
-          rm -rf "$PATCHES"; mkdir -p "$PATCHES"
-          cp -a patches/. "$PATCHES"/ 2>/dev/null || true
-
-          # Fetch leejet's source AT THAT TAG and tar it (no .git); the build legs
-          # extract this identical tree. Our own scripts come from the tooling checkout.
-          git remote add upstream https://github.com/leejet/stable-diffusion.cpp.git || true
-          git fetch -q --depth 1 upstream "refs/tags/${TAG}:refs/tags/${TAG}"
-          git checkout -q --detach "refs/tags/${TAG}"
-
-          # Apply the local patch set (see patches/README.md). Each one is a fix that is open
-          # upstream but not yet in a release; the set is normally empty. A non-empty set moves
-          # the published tag to <upstream tag>-u<id>, so the tag says what the box carries and a
-          # changed set republishes instead of matching an existing release and skipping.
+          # The tree we build is this checkout. The tag still has to say which upstream release
+          # it descends from, so read that from the history rather than from a foreign API.
           #
-          # --check runs over ALL of them first, so a stale patch stops the run before the tree
-          # is half-modified. That failure is the intended signal: upstream either merged the fix
-          # (delete the patch) or moved the code under it (refresh and re-verify it).
-          PATCH_LIST=""
-          FILES=()
-          while IFS= read -r f; do FILES+=("$f"); done < <(find "$PATCHES" -maxdepth 1 -name '*.patch' | sort)
-          if [ "${#FILES[@]}" -gt 0 ]; then
-            for p in "${FILES[@]}"; do
-              git apply --check "$p" || {
-                echo "ERROR: $(basename "$p") no longer applies to ${UPSTREAM_TAG}." >&2
-                echo "       Upstream merged it (delete the file) or moved the code under it" >&2
-                echo "       (refresh it). See patches/README.md." >&2
-                exit 1
-              }
-            done
-            for p in "${FILES[@]}"; do
-              git apply "$p"
-              PATCH_LIST="${PATCH_LIST}${PATCH_LIST:+,}$(basename "$p")"
-              echo "applied $(basename "$p")"
-            done
-            PATCH_ID="$(cat "${FILES[@]}" | sha256sum | cut -c1-7)"
-            TAG="${UPSTREAM_TAG}-u${PATCH_ID}"
-            echo "patched build: ${UPSTREAM_TAG} + ${PATCH_LIST} -> ${TAG}"
-          fi
+          # HIGHEST reachable release, not nearest. `git describe` answers "nearest", and on a
+          # merge-shaped history that is the wrong answer: this tree reaches master-813 through a
+          # merge 73 commits back and master-811 on its own line 13 commits back, so describe
+          # names it after 811 and understates what it actually contains. The strict regex also
+          # keeps out our own published tags, which live in this repository and carry a -u suffix.
+          UPSTREAM_TAG="$(git tag -l --merged HEAD 'master-*' \
+            | grep -E '^master-[0-9]+-[0-9a-f]+$' | sort -t- -k2,2n | tail -1)"
+          [ -n "$UPSTREAM_TAG" ] || {
+            echo "no upstream release tag is reachable from this ref; cannot name the build" >&2
+            exit 1
+          }
+
+          # Supply-chain aging, kept but re-pointed: it now guards the upstream release the tree
+          # descends from, not the moment we merged it. A tree whose base is hours old is the
+          # thing worth waiting on; our own commits on top are reviewed here.
+          BASE_TS="$(git log -1 --format=%ct "refs/tags/${UPSTREAM_TAG}")"
+          CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+          [ "$BASE_TS" -le "$CUTOFF" ] || {
+            echo "base release ${UPSTREAM_TAG} is younger than ${AGE_H}h; refusing" >&2
+            exit 1
+          }
+
+          # Always -u<sha>: the tree is ours, never a stock upstream one, and the suffix is what
+          # tells Studio's installer to go straight to this repository's releases instead of
+          # trying an upstream download that is guaranteed to 404.
+          HEAD_SHA7="$(git rev-parse --short=7 HEAD)"
+          TAG="${UPSTREAM_TAG}-u${HEAD_SHA7}"
+          AHEAD="$(git rev-list --count "refs/tags/${UPSTREAM_TAG}..HEAD")"
+          echo "building this repository at ${HEAD_SHA7} (${AHEAD} commits past ${UPSTREAM_TAG}) -> ${TAG}"
 
           # Does OUR published release already exist? (drafts don't count.) Checked against the
-          # final, patch-aware tag so a patch-set change is never mistaken for an existing build.
+          # final tag, which carries the head sha, so a new commit republishes instead of matching.
           EXISTS=false
           if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
             EXISTS=true
@@ -155,7 +140,7 @@ jobs:
           {
             echo "tag=$TAG"
             echo "upstream_tag=$UPSTREAM_TAG"
-            echo "patch_list=$PATCH_LIST"
+            echo "ahead=$AHEAD"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "source_artifact=$SRC_ARTIFACT"
@@ -246,7 +231,7 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
           LABEL: ${{ matrix.label }}
           COMMIT: ${{ needs.resolve.outputs.commit }}
-          SOURCE_REPO: leejet/stable-diffusion.cpp
+          SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
@@ -311,7 +296,7 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
           LABEL: win-cpu-x64
           COMMIT: ${{ needs.resolve.outputs.commit }}
-          SOURCE_REPO: leejet/stable-diffusion.cpp
+          SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
         run: python tooling/scripts/unsloth/package_bundle.py
 
@@ -367,8 +352,8 @@ jobs:
           python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
             --upstream-tag '${{ needs.resolve.outputs.upstream_tag }}' \
-            --patches '${{ needs.resolve.outputs.patch_list }}' \
-            --source-repo 'leejet/stable-diffusion.cpp' \
+            --patches '' \
+            --source-repo "$GITHUB_REPOSITORY" \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
             --publish-repo "$GITHUB_REPOSITORY"
@@ -403,11 +388,12 @@ jobs:
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
           UPSTREAM_TAG='${{ needs.resolve.outputs.upstream_tag }}'
-          PATCH_LIST='${{ needs.resolve.outputs.patch_list }}'
+          AHEAD='${{ needs.resolve.outputs.ahead }}'
+          COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server) for upstream [${UPSTREAM_TAG}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${UPSTREAM_TAG}). GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
-          if [ -n "$PATCH_LIST" ]; then
-            NOTES="${NOTES}"$'\n\n'"Not a stock upstream build. It carries the patch set in [patches/](https://github.com/${REPO}/tree/master/patches), each one a fix that is open upstream but not yet in a release, which is what the \`-u\` suffix on the tag marks:"$'\n\n'"$(printf '%s' "$PATCH_LIST" | tr ',' '\n' | sed 's/^/- `/; s/$/`/')"$'\n\n'"\`sd-prebuilt-manifest.json\` records the same list."
+          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          if [ "${AHEAD:-0}" -gt 0 ]; then
+            NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
           fi
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
             gh release delete "$TAG" --repo "$REPO" --yes

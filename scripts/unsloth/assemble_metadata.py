@@ -39,15 +39,19 @@ def main() -> int:
     ap.add_argument("--tag", required = True)
     ap.add_argument("--source-repo", required = True)
     ap.add_argument("--commit", required = True)
-    # A patched build is tagged <upstream tag>-u<id>, so the two differ exactly when patches were
-    # applied. Both are recorded: the tag identifies the artifact, upstream_tag and patches say
-    # what it is made of, so a consumer can tell a stock build from a patched one without
-    # unpacking it. See patches/README.md.
+    # Our build is tagged <upstream tag>-u<head sha>, so the two differ whenever this tree carries
+    # anything past that release, which it always does. Both are recorded: the tag identifies the
+    # artifact, upstream_tag says which upstream release the tree descends from, and commit says
+    # exactly what was compiled, so a consumer can tell what it has without unpacking it.
+    #
+    # --patches is retained and always empty. The build no longer applies a patch set at build
+    # time; the fixes are commits in this repository. Keeping the field means existing manifest
+    # readers do not have to change.
     ap.add_argument("--upstream-tag", default = "")
     ap.add_argument(
         "--patches",
         default = "",
-        help = "comma-separated patch filenames applied to the upstream tree (empty = stock)",
+        help = "retained for manifest compatibility; always empty now that fixes are commits",
     )
     ap.add_argument("--dist", required = True, help = "dir holding the sd-*.zip bundles")
     ap.add_argument("--out", required = True, help = "dir to write the metadata json into")
