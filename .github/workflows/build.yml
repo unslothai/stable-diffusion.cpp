@@ -478,7 +478,9 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.16
         with:
           key: windows-rocm-${{ env.ROCM_VERSION }}-x64
-          evict-old-files: 1d
+          # 500M (the action default) truncates this build's cache at save, and
+          # a truncated cache still restores then misses: 4.13% hits measured.
+          max-size: 2G
 
       - name: Install ROCm with Wheels
         if: steps.cache-rocm.outputs.cache-hit != 'true'
@@ -595,7 +597,7 @@ jobs:
         uses: ggml-org/ccache-action@v1.2.16
         with:
           key: ubuntu-rocm-cmake-${{ matrix.ROCM_VERSION }}-${{ matrix.build }}
-          evict-old-files: 1d
+          max-size: 2G
 
       - name: Dependencies
         id: depends
