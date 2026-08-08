@@ -9,9 +9,10 @@ name: Unsloth SD prebuilt (CPU/Apple)
 #
 # Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 5-way
 # CPU/Apple matrix:
-#   resolve      -- stamp a source tarball from THIS repository at the requested ref,
-#                   name it after the upstream release the tree descends from
-#                   (supply-chain aged), decide if our release already exists.
+#   resolve      -- take THIS repository at the requested ref, merge the pinned PR set
+#                   in scripts/unsloth/pr-set.json, stamp a source tarball, name it
+#                   after the upstream release the tree descends from (supply-chain
+#                   aged), decide if our release already exists.
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
 #   build-windows-- Windows x64 (MSVC + Ninja).
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
@@ -20,10 +21,18 @@ name: Unsloth SD prebuilt (CPU/Apple)
 #
 # Asset names match the Studio installer's resolve_release_asset.
 #
-# We build THIS repository's tree, not a tarball fetched from anywhere else. Our fixes are
-# commits here, so there is nothing to re-apply at build time and nothing to keep in step
-# with a foreign tag. The published tag still names the upstream release the tree descends
-# from, so a box can say what it is built on without the build depending on that repository.
+# We build THIS repository's tree, not a tarball fetched from anywhere else. Our own fixes are
+# commits here, so there is nothing to re-apply at build time and nothing to keep in step with a
+# foreign tag. The published tag still names the upstream release the tree descends from, so a box
+# can say what it is built on without the build depending on that repository.
+#
+# On top of that tree, scripts/unsloth/pr-set.json can pin pull requests in THIS repository to
+# exact reviewed commits, merged in listed order at build time. That is the same mechanism as
+# unslothai/llama.cpp, with one deliberate difference: there the base is a pristine upstream
+# release and every Unsloth change stays pinned, whereas here the base is our own tree, so a
+# merged fix is simply in it and its pin is deleted. To carry a fix that exists as an upstream
+# pull request, vendor it here as a PR first and pin that; the build never fetches from another
+# repository.
 
 on:
   schedule:
@@ -66,6 +75,7 @@ jobs:
       tag: ${{ steps.r.outputs.tag }}
       upstream_tag: ${{ steps.r.outputs.upstream_tag }}
       ahead: ${{ steps.r.outputs.ahead }}
+      pins: ${{ steps.r.outputs.pins }}
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       source_artifact: ${{ steps.r.outputs.source_artifact }}
@@ -110,16 +120,89 @@ jobs:
             exit 1
           }
 
-          # Always -u<sha>: the tree is ours, never a stock upstream one, and the suffix is what
+          # Resolve the PR mix set (scripts/unsloth/pr-set.json). Same mechanism as
+          # unslothai/llama.cpp: an exact, reviewed commit per entry, so an author pushing more
+          # commits cannot change what the nightly ships. Only PRs in THIS repository may be
+          # pinned; to carry an upstream fix, vendor it here as a PR first and pin that.
+          #
+          # The gate lives here rather than only in a lint, because a red lint does not stop the
+          # schedule.
+          jq -e '.prs | type == "array" and all(.[];
+                   type == "string"
+                   or (type == "object" and (.url | type == "string")
+                       and ((if .required == null then true else .required end) | type == "boolean")))' \
+             scripts/unsloth/pr-set.json >/dev/null \
+            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
+          PRS='[]'
+          URL_RE='^https://github\.com/unslothai/stable-diffusion\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
+          while read -r url REQUIRED; do
+            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/unslothai/stable-diffusion.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
+            NUM="${BASH_REMATCH[1]}"; SHA="${BASH_REMATCH[2]}"
+            PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}")" \
+              || { echo "refusing #${NUM}: could not fetch PR metadata (nonexistent number in '$url', or a transient API failure); fix the pin or retry" >&2; exit 1; }
+            STATE="$(jq -r '.state' <<<"$PR_JSON")"
+            HEAD_PR="$(jq -r '.head.sha' <<<"$PR_JSON")"
+            N_COMMITS="$(jq -r '.commits' <<<"$PR_JSON")"
+            TITLE="$(jq -r '.title' <<<"$PR_JSON")"
+            if [ "$STATE" != "open" ]; then
+              # Dropping a pin changes SETHASH and the tag, so the release would ship without that
+              # change under a new name. Refuse unless the entry is explicitly optional.
+              if [ "$REQUIRED" != "false" ]; then
+                echo "refusing #${NUM}: pin is ${STATE} and required. If it merged, delete the pin (its commits are already in this tree). Otherwise mark it \"required\": false or repin it." >&2
+                exit 1
+              fi
+              echo "::warning::skipping optional pin #${NUM} (${STATE}): $url"
+              continue
+            fi
+            # A pin pasted from the wrong PR would build arbitrary code while the manifest blames
+            # #<num>. The commits listing is capped at 250; past that, skip rather than false-fail.
+            if [ "$N_COMMITS" -gt 250 ]; then
+              echo "note: #${NUM} has ${N_COMMITS} commits (over the API listing cap); skipping pin membership check"
+            elif ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$SHA"; then
+              echo "refusing #${NUM}: pinned commit ${SHA} is not a commit of that PR (wrong paste, or force-pushed away)" >&2
+              exit 1
+            fi
+            [ "$SHA" = "$HEAD_PR" ] || echo "note: #${NUM} is pinned to ${SHA} but its head has moved to ${HEAD_PR}"
+            echo "including #${NUM} @ ${SHA}"
+            PRS="$(jq -c --arg n "$NUM" --arg s "$SHA" --arg u "$url" --arg t "$TITLE" '. + [{number: ($n|tonumber), sha: $s, url: $u, title: $t}]' <<<"$PRS")"
+          done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
+                          | "\(.url)\t\(if .required == null then true else .required end)"' scripts/unsloth/pr-set.json | tr '\t' ' ')
+
+          # Merge the pinned commits onto this tree, in listed order (merge order matters for
+          # conflicts). diff3 so additive_merge.py can see the merge base and refuse to guess on
+          # anything that is not a provable add/add.
+          for row in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
+            NUM="${row%%:*}"; SHA="${row##*:}"
+            git fetch -q --no-tags origin "$SHA" \
+              || git fetch -q --no-tags origin "refs/pull/${NUM}/head" \
+              || { echo "could not fetch commit ${SHA} for #${NUM}" >&2; exit 1; }
+            git -c user.name='Unsloth CI' -c user.email='ci@unsloth.ai' \
+                -c merge.conflictStyle=diff3 merge --no-edit "$SHA" && continue
+            python3 scripts/unsloth/additive_merge.py \
+              || { echo "merging #${NUM} conflicts in a way that needs a human; fix the pin" >&2; exit 1; }
+            git -c user.name='Unsloth CI' -c user.email='ci@unsloth.ai' commit --no-edit -q
+            echo "merged #${NUM} with additive conflict resolution"
+          done
+
+          # Always -u<id>: the tree is ours, never a stock upstream one, and the suffix is what
           # tells Studio's installer to go straight to this repository's releases instead of
-          # trying an upstream download that is guaranteed to 404.
+          # trying an upstream download that is guaranteed to 404. With no pins the id is the head
+          # sha; with pins it also hashes the pinned number:sha pairs, so a repin or a reorder
+          # yields a new tag and a rebuild while an unchanged set still matches and skips.
           HEAD_SHA7="$(git rev-parse --short=7 HEAD)"
-          TAG="${UPSTREAM_TAG}-u${HEAD_SHA7}"
+          if [ "$(jq length <<<"$PRS")" = 0 ]; then
+            TAG_ID="$HEAD_SHA7"
+          else
+            TAG_ID="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" \
+              | { cat; echo "$HEAD_SHA7"; } | sha256sum | cut -c1-7)"
+          fi
+          TAG="${UPSTREAM_TAG}-u${TAG_ID}"
           AHEAD="$(git rev-list --count "refs/tags/${UPSTREAM_TAG}..HEAD")"
-          echo "building this repository at ${HEAD_SHA7} (${AHEAD} commits past ${UPSTREAM_TAG}) -> ${TAG}"
+          PIN_LIST="$(jq -r 'map("#\(.number)") | join(",")' <<<"$PRS")"
+          echo "building this repository at ${HEAD_SHA7} (${AHEAD} commits past ${UPSTREAM_TAG}), pins [${PIN_LIST}] -> ${TAG}"
 
           # Does OUR published release already exist? (drafts don't count.) Checked against the
-          # final tag, which carries the head sha, so a new commit republishes instead of matching.
+          # final tag, so a new commit or a repin republishes instead of matching.
           EXISTS=false
           if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
             EXISTS=true
@@ -141,6 +224,7 @@ jobs:
             echo "tag=$TAG"
             echo "upstream_tag=$UPSTREAM_TAG"
             echo "ahead=$AHEAD"
+            echo "pins=$PIN_LIST"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "source_artifact=$SRC_ARTIFACT"
@@ -352,7 +436,7 @@ jobs:
           python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
             --upstream-tag '${{ needs.resolve.outputs.upstream_tag }}' \
-            --patches '' \
+            --patches '${{ needs.resolve.outputs.pins }}' \
             --source-repo "$GITHUB_REPOSITORY" \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
@@ -392,8 +476,12 @@ jobs:
           COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
           NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          PINS='${{ needs.resolve.outputs.pins }}'
           if [ "${AHEAD:-0}" -gt 0 ]; then
             NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
+          fi
+          if [ -n "$PINS" ]; then
+            NOTES="${NOTES}"$'\n\n'"It also carries these pinned pull requests, merged at build time from \`scripts/unsloth/pr-set.json\`: ${PINS}."
           fi
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
             gh release delete "$TAG" --repo "$REPO" --yes

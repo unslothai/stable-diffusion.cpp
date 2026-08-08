@@ -1,0 +1,24 @@
+{
+  "_doc": [
+    "unslothai/stable-diffusion.cpp PRs to merge into the nightly prebuilds, on top of this",
+    "repository's own tree. Each entry pins an exact commit -- copy the url of the commit you",
+    "reviewed from the PR's commits tab:",
+    "  https://github.com/unslothai/stable-diffusion.cpp/pull/8/commits/<40-hex-sha>",
+    "Only that commit is built, even if the author keeps pushing; update the pin to take newer code.",
+    "",
+    "Only PRs in THIS repository may be pinned. To carry a fix that exists as an upstream pull",
+    "request, vendor it here first: open it as a PR against this repository and pin that. The",
+    "build never fetches from another repository.",
+    "",
+    "An entry is a bare url string (required) or {\"url\": ..., \"required\": false}. A required pin",
+    "that is no longer open fails the build rather than silently shipping without it, because",
+    "dropping a pin changes the tag and would publish a quietly different binary under a new name.",
+    "Mark an entry optional to let it rot away instead.",
+    "",
+    "Merging a pinned PR into master drops it from this list's job, not from the build: the base",
+    "here is this repository's own tree, so a merged fix is already in it. That is the one place",
+    "this differs from unslothai/llama.cpp, where the base is a pristine upstream release and every",
+    "one of our changes has to stay pinned. Delete the pin once it is merged."
+  ],
+  "prs": []
+}
