@@ -451,6 +451,9 @@ jobs:
     env:
       ROCM_VERSION: "7.14.0"
       GPU_TARGETS: "gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
+      # rocm-sdk re-expands clang from the wheel every run, so its mtime always
+      # differs and the default compiler_check=mtime misses every object.
+      CCACHE_COMPILERCHECK: content
 
     steps:
       - uses: actions/checkout@v3
@@ -479,6 +482,8 @@ jobs:
         with:
           key: windows-rocm-${{ env.ROCM_VERSION }}-x64
           evict-old-files: 1d
+          # Upper bound, not a reservation: ccache stores only what it compiles.
+          max-size: 2G
 
       - name: Install ROCm with Wheels
         if: steps.cache-rocm.outputs.cache-hit != 'true'
@@ -596,6 +601,8 @@ jobs:
         with:
           key: ubuntu-rocm-cmake-${{ matrix.ROCM_VERSION }}-${{ matrix.build }}
           evict-old-files: 1d
+          # Plateaus at the 500M default (88.19% full, 142 misses/run).
+          max-size: 2G
 
       - name: Dependencies
         id: depends
