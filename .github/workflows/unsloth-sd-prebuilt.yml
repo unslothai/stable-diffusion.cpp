@@ -58,6 +58,8 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.r.outputs.tag }}
+      upstream_tag: ${{ steps.r.outputs.upstream_tag }}
+      patch_list: ${{ steps.r.outputs.patch_list }}
       commit: ${{ steps.r.outputs.commit }}
       exists: ${{ steps.r.outputs.exists }}
       source_artifact: ${{ steps.r.outputs.source_artifact }}
@@ -87,18 +89,56 @@ jobs:
           fi
           printf '%s' "$TAG" | grep -qE '^master-[0-9]+-[0-9a-f]+$' \
             || { echo "refusing non-release tag '$TAG'" >&2; exit 1; }
+          UPSTREAM_TAG="$TAG"
 
-          # Does OUR published release already exist? (drafts don't count.)
-          EXISTS=false
-          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
-            EXISTS=true
-          fi
+          # Stash patches/ before the upstream checkout: it is tracked HERE and absent from
+          # leejet's tree, so checking out their tag in this worktree would remove it.
+          PATCHES="${RUNNER_TEMP}/patches"
+          rm -rf "$PATCHES"; mkdir -p "$PATCHES"
+          cp -a patches/. "$PATCHES"/ 2>/dev/null || true
 
           # Fetch leejet's source AT THAT TAG and tar it (no .git); the build legs
           # extract this identical tree. Our own scripts come from the tooling checkout.
           git remote add upstream https://github.com/leejet/stable-diffusion.cpp.git || true
           git fetch -q --depth 1 upstream "refs/tags/${TAG}:refs/tags/${TAG}"
           git checkout -q --detach "refs/tags/${TAG}"
+
+          # Apply the local patch set (see patches/README.md). Each one is a fix that is open
+          # upstream but not yet in a release; the set is normally empty. A non-empty set moves
+          # the published tag to <upstream tag>-u<id>, so the tag says what the box carries and a
+          # changed set republishes instead of matching an existing release and skipping.
+          #
+          # --check runs over ALL of them first, so a stale patch stops the run before the tree
+          # is half-modified. That failure is the intended signal: upstream either merged the fix
+          # (delete the patch) or moved the code under it (refresh and re-verify it).
+          PATCH_LIST=""
+          FILES=()
+          while IFS= read -r f; do FILES+=("$f"); done < <(find "$PATCHES" -maxdepth 1 -name '*.patch' | sort)
+          if [ "${#FILES[@]}" -gt 0 ]; then
+            for p in "${FILES[@]}"; do
+              git apply --check "$p" || {
+                echo "ERROR: $(basename "$p") no longer applies to ${UPSTREAM_TAG}." >&2
+                echo "       Upstream merged it (delete the file) or moved the code under it" >&2
+                echo "       (refresh it). See patches/README.md." >&2
+                exit 1
+              }
+            done
+            for p in "${FILES[@]}"; do
+              git apply "$p"
+              PATCH_LIST="${PATCH_LIST}${PATCH_LIST:+,}$(basename "$p")"
+              echo "applied $(basename "$p")"
+            done
+            PATCH_ID="$(cat "${FILES[@]}" | sha256sum | cut -c1-7)"
+            TAG="${UPSTREAM_TAG}-u${PATCH_ID}"
+            echo "patched build: ${UPSTREAM_TAG} + ${PATCH_LIST} -> ${TAG}"
+          fi
+
+          # Does OUR published release already exist? (drafts don't count.) Checked against the
+          # final, patch-aware tag so a patch-set change is never mistaken for an existing build.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
           # ggml is a REQUIRED submodule; the server frontend + libwebp/libwebm are not
           # (we build with SD_SERVER_BUILD_FRONTEND / SD_WEBP / SD_WEBM off), so fetch only
           # ggml to keep the source tarball small and the build self-contained.
@@ -114,6 +154,8 @@ jobs:
 
           {
             echo "tag=$TAG"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "patch_list=$PATCH_LIST"
             echo "commit=$COMMIT"
             echo "exists=$EXISTS"
             echo "source_artifact=$SRC_ARTIFACT"
@@ -324,6 +366,8 @@ jobs:
           set -eux
           python3 tooling/scripts/unsloth/assemble_metadata.py \
             --tag '${{ needs.resolve.outputs.tag }}' \
+            --upstream-tag '${{ needs.resolve.outputs.upstream_tag }}' \
+            --patches '${{ needs.resolve.outputs.patch_list }}' \
             --source-repo 'leejet/stable-diffusion.cpp' \
             --commit '${{ needs.resolve.outputs.commit }}' \
             --dist dist --out dist \
@@ -358,8 +402,13 @@ jobs:
         run: |
           set -eux
           TAG='${{ needs.resolve.outputs.tag }}'
+          UPSTREAM_TAG='${{ needs.resolve.outputs.upstream_tag }}'
+          PATCH_LIST='${{ needs.resolve.outputs.patch_list }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server) for upstream [${TAG}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${TAG}). GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server) for upstream [${UPSTREAM_TAG}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${UPSTREAM_TAG}). GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          if [ -n "$PATCH_LIST" ]; then
+            NOTES="${NOTES}"$'\n\n'"Not a stock upstream build. It carries the patch set in [patches/](https://github.com/${REPO}/tree/master/patches), each one a fix that is open upstream but not yet in a release, which is what the \`-u\` suffix on the tag marks:"$'\n\n'"$(printf '%s' "$PATCH_LIST" | tr ',' '\n' | sed 's/^/- `/; s/$/`/')"$'\n\n'"\`sd-prebuilt-manifest.json\` records the same list."
+          fi
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
             gh release delete "$TAG" --repo "$REPO" --yes
           fi

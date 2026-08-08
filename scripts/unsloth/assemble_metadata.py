@@ -39,6 +39,16 @@ def main() -> int:
     ap.add_argument("--tag", required = True)
     ap.add_argument("--source-repo", required = True)
     ap.add_argument("--commit", required = True)
+    # A patched build is tagged <upstream tag>-u<id>, so the two differ exactly when patches were
+    # applied. Both are recorded: the tag identifies the artifact, upstream_tag and patches say
+    # what it is made of, so a consumer can tell a stock build from a patched one without
+    # unpacking it. See patches/README.md.
+    ap.add_argument("--upstream-tag", default = "")
+    ap.add_argument(
+        "--patches",
+        default = "",
+        help = "comma-separated patch filenames applied to the upstream tree (empty = stock)",
+    )
     ap.add_argument("--dist", required = True, help = "dir holding the sd-*.zip bundles")
     ap.add_argument("--out", required = True, help = "dir to write the metadata json into")
     ap.add_argument("--publish-repo", required = True)
@@ -70,6 +80,8 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "tag": args.tag,
+        "upstream_tag": args.upstream_tag or args.tag,
+        "patches": [p for p in args.patches.split(",") if p],
         "source_repo": args.source_repo,
         "source_commit": args.commit,
         "publish_repo": args.publish_repo,
