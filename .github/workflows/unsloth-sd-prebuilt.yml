@@ -381,7 +381,12 @@ jobs:
         with:
           cuda: "12.8.1"
           method: "network"
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+          # sub-packages are installed as cuda-<name>-12-8. cuBLAS is not under that
+          # prefix (it ships as libcublas / libcublas-dev), so it has to go in the
+          # other list or apt cannot find it. cudart-dev is what carries the headers;
+          # cudart alone is the runtime and does not compile anything.
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
       - name: Build sd-cli + sd-server (CUDA)
         working-directory: src
@@ -407,11 +412,13 @@ jobs:
           # torch install keeps its own copies somewhere we must not depend on. Ship ours and
           # point the binaries at their own directory, or sd-cli dies on a missing libcublas.
           BIN="${GITHUB_WORKSPACE}/src/build/bin"
-          CUDA_LIB="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64"
+          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
           sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+          # cudart lands under the toolkit root; the libcublas debs land in the system
+          # multiarch dir. Search both rather than guess which is which.
           for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-            src="$(find "$CUDA_LIB" -maxdepth 1 -name "${so}*" | sort | tail -1)"
-            [ -n "$src" ] || { echo "ERROR: $so not found under $CUDA_LIB" >&2; exit 1; }
+            src="$(find "$CUDA_ROOT" /usr/lib/x86_64-linux-gnu -name "${so}*" -type f 2>/dev/null | sort | tail -1)"
+            [ -n "$src" ] || { echo "ERROR: $so not found under $CUDA_ROOT or /usr/lib/x86_64-linux-gnu" >&2; exit 1; }
             cp -L "$src" "$BIN/$so"
           done
           for exe in sd-cli sd-server; do
