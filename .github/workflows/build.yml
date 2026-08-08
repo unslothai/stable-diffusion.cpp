@@ -482,6 +482,8 @@ jobs:
         with:
           key: windows-rocm-${{ env.ROCM_VERSION }}-x64
           evict-old-files: 1d
+          # Upper bound, not a reservation: ccache stores only what it compiles.
+          max-size: 2G
 
       - name: Install ROCm with Wheels
         if: steps.cache-rocm.outputs.cache-hit != 'true'
