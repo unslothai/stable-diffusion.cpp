@@ -47,6 +47,16 @@ def _env(name: str) -> str:
     return val
 
 
+def _is_runtime_lib(name: str) -> bool:
+    lowered = name.lower()
+    if Path(lowered).suffix in _LIB_SUFFIXES:
+        return True
+    # Versioned ELF sonames: libcudart.so.12, libcublas.so.12.8.4.1. Path.suffix sees
+    # ".12" and would drop these, but the name has to stay exactly as DT_NEEDED spells
+    # it, so match the ".so." infix instead of renaming the file.
+    return ".so." in lowered
+
+
 def _collect(bin_dir: Path) -> list[Path]:
     """The binaries + sibling runtime libs to ship. Recurse so a nested bin/ layout
     (some generators emit build/bin/, some build/bin/Release/) is still captured."""
@@ -54,7 +64,7 @@ def _collect(bin_dir: Path) -> list[Path]:
     for p in sorted(bin_dir.rglob("*")):
         if not p.is_file():
             continue
-        if p.name in _BINARIES or p.suffix.lower() in _LIB_SUFFIXES:
+        if p.name in _BINARIES or _is_runtime_lib(p.name):
             found.append(p)
     return found
 
