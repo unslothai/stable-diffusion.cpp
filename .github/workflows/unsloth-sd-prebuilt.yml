@@ -444,7 +444,8 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
           cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
-          ccache --show-stats
+          # Diagnostic only, under set -e: never fail a good build over stats.
+          ccache --show-stats || true
 
       - name: Bundle the CUDA runtime beside the binaries
         run: |
