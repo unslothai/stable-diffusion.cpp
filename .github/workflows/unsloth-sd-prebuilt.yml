@@ -349,6 +349,11 @@ jobs:
     continue-on-error: true
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
+    # One source of truth for both: the ccache key has to track whatever changes
+    # the objects, and these two do.
+    env:
+      CUDA_VERSION: "12.8.1"
+      CUDA_ARCHS: "75;80;86;89;90;100;120"
     steps:
       - name: Checkout mirror (tooling)
         uses: actions/checkout@v4
@@ -379,7 +384,7 @@ jobs:
         id: cuda-toolkit
         uses: Jimver/cuda-toolkit@v0.2.22
         with:
-          cuda: "12.8.1"
+          cuda: ${{ env.CUDA_VERSION }}
           method: "network"
           # sub-packages are installed as cuda-<name>-12-8. cuBLAS is not under that
           # prefix (it ships as libcublas / libcublas-dev), so it has to go in the
@@ -388,6 +393,34 @@ jobs:
           sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
+      # This leg rebuilt every object on every run: 3903 s of the 4121 s job on
+      # 2026-08-09, and 4942 s on the run before it, with no speedup between the
+      # two. The repo held no cache entry for it at all, only build.yml's ROCm
+      # ones.
+      #
+      # The key carries the CUDA version and the architecture list because both
+      # decide the objects. ccache hashes compiler identity into every entry, so
+      # a cache written by another toolkit can never hit -- a version-less key
+      # is what held the llama.cpp ROCm legs at a 0% hit rate and made them that
+      # pipeline's critical path (llama.cpp#88). restore-keys lets a new tag
+      # start from the previous generation instead of from nothing.
+      - name: ccache key
+        id: cckey
+        run: echo "archs=$(echo "$CUDA_ARCHS" | tr ';' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          restore-keys: |
+            sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          # Saved by the explicit step below instead, so a failed build still
+          # keeps what it compiled.
+          save: false
+
       - name: Build sd-cli + sd-server (CUDA)
         working-directory: src
         run: |
@@ -395,6 +428,10 @@ jobs:
           # Turing through Blackwell. 12.8 is the first toolkit that can emit sm_100 (B200) and
           # sm_120 (RTX 50), and anything older than Turing is not a realistic host for a 20 GB
           # video denoiser. build.yml's Windows leg uses the same list plus 61 and 70.
+          #
+          # The CUDA launcher matters more than the other two here: Jimver installs nvcc outside
+          # the default search, and nvcc is nearly the whole build, so caching only C/CXX would
+          # leave the expensive half uncached.
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DSD_BUILD_EXAMPLES=ON \
@@ -402,8 +439,12 @@ jobs:
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
             -DSD_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES='75;80;86;89;90;100;120'
+            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
           cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
+          ccache --show-stats
 
       - name: Bundle the CUDA runtime beside the binaries
         run: |
@@ -443,6 +484,28 @@ jobs:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip
           if-no-files-found: error
+
+      - name: Evict stale ccache files
+        # !cancelled(), unlike the save below: a cancelled job gets one short
+        # teardown window that is not replenished, and the save is what needs
+        # it.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        # Save even when the build failed. The objects compiled before the
+        # failure still count, and this leg is continue-on-error, so a failure
+        # here is routine. always(), not !cancelled(): a job killed by the cap
+        # takes the cancellation path, and that is the most expensive case to
+        # lose (llama.cpp#81).
+        if: ${{ always() }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          # Trailing dash keeps this distinct from the key the ccache action
+          # restored from, so the save is never a no-op against itself.
+          key: ccache-sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   build-windows:
     name: win-cpu-x64
