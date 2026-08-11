@@ -331,6 +331,7 @@ jobs:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip
           if-no-files-found: error
+          retention-days: 7
 
   # Linux CUDA. The rest of this pipeline is CPU and Apple on the premise that GPU hosts use
   # diffusers/torch, and that premise fails for MiniMax-H3: its Diffusers path needs about
@@ -485,6 +486,7 @@ jobs:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip
           if-no-files-found: error
+          retention-days: 7
 
       - name: Evict stale ccache files
         # !cancelled(), unlike the save below: a cancelled job gets one short
@@ -572,10 +574,15 @@ jobs:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64.zip
           if-no-files-found: error
+          retention-days: 7
 
   assemble:
     name: Assemble + publish
     needs: [resolve, build-unix, build-windows, build-linux-cuda]
+    # Consumed by `reclaim` to tell "these bundles are now release assets" from
+    # "nothing will ever read these". Set only after draft=false lands.
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
     permissions:
@@ -649,6 +656,7 @@ jobs:
           retention-days: 7
 
       - name: Publish GitHub release
+        id: publish
         if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
         run: |
           set -eux
@@ -673,3 +681,144 @@ jobs:
             --notes "$NOTES" \
             dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+
+  # Ported from unslothai/llama.cpp's unsloth-prebuilt.yml `reclaim` job, which
+  # this pipeline was copied from without it. Nothing here ever deleted its own
+  # artifacts, so every run's bundles sat until GitHub's retention expired them:
+  # measured 2026-08-11, 168 live artifacts / 13.49 GiB, spread over 27 runs
+  # whose binaries were already published as release assets.
+  reclaim:
+    name: Reclaim artifact storage
+    needs: [resolve, assemble]
+    # always(), so a run that publishes NOTHING still cleans up after itself.
+    # Gating on `published` is what leaks: a workflow_dispatch defaults to
+    # publish:false, and a cancelled run never reaches publish either.
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: write   # delete this run's artifacts
+      contents: read   # read the release asset list
+    steps:
+      - name: Delete artifacts already published as release assets
+        if: ${{ needs.assemble.outputs.published == 'true' }}
+        # Never fail a published release over cleanup.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+
+          if [ -z "${TAG:-}" ]; then
+            echo "no tag resolved; leaving artifacts untouched"
+            exit 0
+          fi
+
+          # Gate 1: the release must exist and be published, not a draft.
+          draft="$(gh release view "$TAG" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          if [ "$draft" != "false" ]; then
+            echo "release $TAG is '$draft', not a published release; leaving artifacts untouched"
+            exit 0
+          fi
+          assets="$RUNNER_TEMP/reclaim-assets.txt"
+          arts="$RUNNER_TEMP/reclaim-arts.tsv"
+          gh release view "$TAG" --repo "$repo" --json assets -q '.assets[].name' | sort > "$assets"
+          echo "release $TAG has $(wc -l < "$assets") assets"
+
+          # Gate 2: only THIS run's artifacts are even considered, so the step
+          # cannot reach another run's -- including a concurrent build's.
+          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
+          echo "this run has $(grep -c . "$arts" || true) live artifacts"
+
+          freed=0; deleted=0; kept=0; failed=0
+          while IFS="$(printf '\t')" read -r id size name; do
+            [ -z "${id:-}" ] && continue
+            # Gate 3: delete only what is provably already on the release.
+            # Build children upload `sd-<tag>-bin-<label>`; assemble publishes it
+            # as `<name>.zip`. Anything that does not match is KEPT -- that is
+            # what protects a partial publish, and it also keeps the
+            # `unsloth-sd-prebuilt-<tag>` full-set fallback artifact.
+            # -F: fixed string. Without it every `.` in the name is a regex
+            # wildcard, and the tag carries dots (Ubuntu-22.04).
+            if grep -qxF -- "${name}.zip" "$assets" || grep -qxF -- "${name}.tar.gz" "$assets"; then
+              # < /dev/null so the command can never consume the loop's stdin
+              # and silently truncate the sweep to one artifact.
+              if err="$(gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
+                freed=$(( freed + size )); deleted=$(( deleted + 1 ))
+              else
+                printf '  could not delete %s: %s\n' "$name" "$err"
+                failed=$(( failed + 1 ))
+              fi
+            else
+              printf '  KEEP %s (no matching release asset)\n' "$name"
+              kept=$(( kept + 1 ))
+            fi
+          done < "$arts"
+
+          echo "deleted $deleted artifacts, freed $(( freed / 1048576 )) MiB, kept $kept, failed $failed"
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed artifact(s) could not be deleted; storage will be reclaimed by retention instead"
+          fi
+          {
+            echo "### Artifact storage reclaimed"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| release | \`$TAG\` |"
+            echo "| artifacts deleted | $deleted |"
+            echo "| storage freed | $(( freed / 1048576 )) MiB |"
+            echo "| kept (no release asset) | $kept |"
+            echo "| delete failures | $failed |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete artifacts of a run that published nothing
+        # The other step's name-match against release assets is meaningless
+        # here: either no release was written, or the tag belongs to a DIFFERENT
+        # run's release. So the rule is simply that nothing will ever consume
+        # these -- a publish:false dispatch is a test, and a cancelled or failed
+        # run is not resumable past the missing legs -- and they are deleted.
+        if: ${{ needs.assemble.outputs.published != 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          arts="$RUNNER_TEMP/reclaim-unpublished.tsv"
+
+          # Same containment as the published path: only THIS run's artifacts
+          # are listed, so the step cannot reach a concurrent build's.
+          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
+          n="$(grep -c . "$arts" || true)"
+          echo "run published nothing; deleting its $n live artifact(s)"
+
+          freed=0; deleted=0; failed=0
+          while IFS="$(printf '\t')" read -r id size name; do
+            [ -z "${id:-}" ] && continue
+            if err="$(gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null 2>&1)"; then
+              freed=$(( freed + size )); deleted=$(( deleted + 1 ))
+            else
+              printf '  could not delete %s: %s\n' "$name" "$err"
+              failed=$(( failed + 1 ))
+            fi
+          done < "$arts"
+
+          echo "deleted $deleted artifacts, freed $(( freed / 1048576 )) MiB, failed $failed"
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed artifact(s) could not be deleted; storage will be reclaimed by retention instead"
+          fi
+          {
+            echo "### Artifact storage reclaimed (unpublished run)"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| artifacts deleted | $deleted |"
+            echo "| storage freed | $(( freed / 1048576 )) MiB |"
+            echo "| delete failures | $failed |"
+          } >> "$GITHUB_STEP_SUMMARY"
