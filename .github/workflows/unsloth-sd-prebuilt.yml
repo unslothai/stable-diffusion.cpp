@@ -94,7 +94,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout this repository with full history, which the tag name is derived from
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           ref: ${{ github.event.inputs.ref || 'master' }}
           fetch-depth: 0
@@ -243,7 +243,7 @@ jobs:
 
       - name: Upload source artifact
         if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: ${{ steps.r.outputs.source_artifact }}
           path: ${{ runner.temp }}/sd-source-${{ steps.r.outputs.tag }}.tar.gz
@@ -281,13 +281,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout mirror (tooling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           path: tooling
           fetch-depth: 1
 
       - name: Download source @ ${{ needs.resolve.outputs.tag }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: ${{ needs.resolve.outputs.source_artifact }}
           path: srcpkg
@@ -331,7 +331,7 @@ jobs:
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip
@@ -362,7 +362,7 @@ jobs:
       CUDA_ARCHS: "75;80;86;89;90;100;120"
     steps:
       - name: Checkout mirror (tooling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           path: tooling
           fetch-depth: 1
@@ -376,7 +376,7 @@ jobs:
           df -h /
 
       - name: Download source @ ${{ needs.resolve.outputs.tag }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: ${{ needs.resolve.outputs.source_artifact }}
           path: srcpkg
@@ -388,7 +388,7 @@ jobs:
 
       - name: Install CUDA toolkit
         id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@v0.2.22
+        uses: Jimver/cuda-toolkit@95b5a29a2823ef87666dcd45ec236fc4f82498d0  # v0.2.22
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: "network"
@@ -486,7 +486,7 @@ jobs:
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip
@@ -508,7 +508,7 @@ jobs:
         # takes the cancellation path, and that is the most expensive case to
         # lose (llama.cpp#81).
         if: ${{ always() }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           # Trailing dash keeps this distinct from the key the ccache action
@@ -522,13 +522,13 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Checkout mirror (tooling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           path: tooling
           fetch-depth: 1
 
       - name: Download source @ ${{ needs.resolve.outputs.tag }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: ${{ needs.resolve.outputs.source_artifact }}
           path: srcpkg
@@ -540,13 +540,13 @@ jobs:
           mkdir -p src
           tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.11"
       - name: Install Ninja
         run: choco install ninja --no-progress
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
 
       - name: Build sd-cli + sd-server
         shell: pwsh
@@ -574,7 +574,7 @@ jobs:
         run: python tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64
           path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64.zip
@@ -596,13 +596,13 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout mirror (tooling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           path: tooling
           fetch-depth: 1
 
       - name: Download bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           path: dist
           pattern: sd-*-bin-*
@@ -663,7 +663,7 @@ jobs:
       # human wants the rescue bundle.
       - name: Upload full set (artifact fallback)
         if: ${{ always() && !success() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: unsloth-sd-prebuilt-${{ needs.resolve.outputs.tag }}
           path: dist/*
