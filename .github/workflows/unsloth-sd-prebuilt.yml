@@ -520,6 +520,9 @@ jobs:
     needs: resolve
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: windows-2022
+    # Gate on the environment, matching unslothai/unsloth's release-desktop.yml:
+    # the job that can read the signing credentials is named explicitly.
+    environment: release-signing
     steps:
       - name: Checkout mirror (tooling)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -561,6 +564,21 @@ jobs:
             -DGGML_NATIVE=OFF
           cmake --build build --config Release -j 3 --target sd-cli sd-server
 
+      # Before packaging, so every PE the bundle carries is signed. Windows
+      # Smart App Control evaluates each binary as it loads and refuses an
+      # unknown unsigned one with status 0xc0e90002, which the user sees as a
+      # "Bad Image" dialog naming the file. sd-cli.exe and sd-server.exe ship
+      # unsigned today.
+      - name: Sign Windows binaries
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: src/build/bin
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
       - name: Package bundle
         shell: pwsh
         env:
@@ -572,6 +590,22 @@ jobs:
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
         run: python tooling/scripts/unsloth/package_bundle.py
+
+      # The gate, run on the finished zip rather than the build tree: packaging
+      # copies files in after signing, so the zip is the only thing that proves
+      # what ships.
+      - name: Verify every PE in the bundle is signed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $zips = @(Get-ChildItem dist -Filter *.zip -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName })
+          if ($zips.Count -eq 0) {
+            Write-Host '::error::no bundle in dist/; packaging produced nothing to verify'
+            exit 1
+          }
+          & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
+          exit $LASTEXITCODE
 
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
