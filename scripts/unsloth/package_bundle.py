@@ -35,6 +35,10 @@ from pathlib import Path
 # (static builds usually have none; Metal / a shared ggml can add a few).
 _BINARIES = ("sd-cli", "sd-server", "sd-cli.exe", "sd-server.exe")
 _LIB_SUFFIXES = (".dylib", ".so", ".dll", ".metal", ".metallib")
+# Kernel-library trees a ROCm build loads at runtime, relative to the library that owns them
+# (<dir of librocblas>/rocblas/library). Shipped with their layout intact; everything else
+# is flattened.
+_KERNEL_TREES = ("rocblas", "hipblaslt")
 
 _FINGERPRINT = "Compiled by the Unsloth team"
 
@@ -57,15 +61,28 @@ def _is_runtime_lib(name: str) -> bool:
     return ".so." in lowered
 
 
-def _collect(bin_dir: Path) -> list[Path]:
-    """The binaries + sibling runtime libs to ship. Recurse so a nested bin/ layout
-    (some generators emit build/bin/, some build/bin/Release/) is still captured."""
-    found: list[Path] = []
+def _kernel_tree_path(p: Path, bin_dir: Path) -> Path | None:
+    """``rocblas/library/<file>`` for a file inside a kernel tree, else None."""
+    rel = p.relative_to(bin_dir)
+    for i, part in enumerate(rel.parts[:-1]):
+        if part in _KERNEL_TREES and rel.parts[i + 1 : i + 2] == ("library",):
+            return Path(*rel.parts[i:])
+    return None
+
+
+def _collect(bin_dir: Path) -> list[tuple[Path, str]]:
+    """(file, archive-relative name) for the binaries + sibling runtime libs to ship. Recurse
+    so a nested bin/ layout (some generators emit build/bin/, some build/bin/Release/) is still
+    captured. Kernel trees keep their layout; everything else lands flat."""
+    found: list[tuple[Path, str]] = []
     for p in sorted(bin_dir.rglob("*")):
         if not p.is_file():
             continue
-        if p.name in _BINARIES or _is_runtime_lib(p.name):
-            found.append(p)
+        tree = _kernel_tree_path(p, bin_dir)
+        if tree is not None:
+            found.append((p, tree.as_posix()))
+        elif p.name in _BINARIES or _is_runtime_lib(p.name):
+            found.append((p, p.name))
     return found
 
 
@@ -83,11 +100,11 @@ def main() -> int:
         return 2
 
     files = _collect(bin_dir)
-    have_cli = any(f.name in ("sd-cli", "sd-cli.exe") for f in files)
+    have_cli = any(f.name in ("sd-cli", "sd-cli.exe") for f, _ in files)
     if not have_cli:
         print(f"package_bundle: no sd-cli under {bin_dir}; refusing to package", file = sys.stderr)
         return 1
-    have_server = any(f.name in ("sd-server", "sd-server.exe") for f in files)
+    have_server = any(f.name in ("sd-server", "sd-server.exe") for f, _ in files)
 
     out_dir.mkdir(parents = True, exist_ok = True)
     stem = f"sd-{tag}-bin-{label}"
@@ -108,10 +125,11 @@ def main() -> int:
     # Deterministic-ish: sort members; drop the archive if it already exists.
     zip_path.unlink(missing_ok = True)
     with zipfile.ZipFile(zip_path, "w", compression = zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            # Flatten under the named top-level dir; keep just the basename so the
-            # binaries sit at sd-<tag>-bin-<label>/<name> regardless of build layout.
-            zf.write(f, arcname = f"{stem}/{f.name}")
+        for f, name in files:
+            # Flatten under the named top-level dir so the binaries sit at
+            # sd-<tag>-bin-<label>/<name> regardless of build layout; only the kernel trees
+            # keep their path.
+            zf.write(f, arcname = f"{stem}/{name}")
         zf.writestr(f"{stem}/UNSLOTH_BUILD.txt", provenance)
         if license_file and Path(license_file).is_file():
             zf.write(license_file, arcname = f"{stem}/LICENSE")

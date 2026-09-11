@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
 
-name: Unsloth SD prebuilt (CPU/Apple/CUDA)
+name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan/ROCm)
 
 # Build and publish OUR OWN stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
 # the platforms where the native engine is the FASTER choice: CPU (Linux/WSL/Windows),
@@ -19,6 +19,11 @@ name: Unsloth SD prebuilt (CPU/Apple/CUDA)
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
 #   build-windows-- Windows x64 (MSVC + Ninja).
 #   build-linux-cuda -- Linux x64, CUDA 12.8, best effort (continue-on-error).
+#   build-linux-vulkan, build-linux-rocm, build-windows-vulkan
+#                -- the AMD legs, same best-effort rule as CUDA. Without them an AMD host gets
+#                   no accelerated sd-cli from this mirror at all: the Studio installer falls
+#                   back to an upstream build that lacks the MiniMax-H3 fixes, and when that
+#                   one does not come up, to the CPU build (unsloth#8814).
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
 #                   draft->publish. If any of the five CPU/Apple legs fails, assemble
 #                   is skipped and nothing is published (the Studio needs the full
@@ -615,9 +620,340 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Linux Vulkan. Works on every AMD card the Mesa RADV driver covers, RDNA 1 and 2 included,
+  # which ROCm does not, and needs nothing on the host beyond the Vulkan loader every AMD
+  # desktop already has.
+  build-linux-vulkan:
+    name: Linux-Ubuntu-22.04-x86_64-vulkan
+    needs: resolve
+    continue-on-error: true
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Vulkan SDK pieces
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvulkan-dev glslc spirv-headers
+
+      - name: Build sd-cli + sd-server (Vulkan)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            -DSD_VULKAN=ON
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: Linux-Ubuntu-22.04-x86_64-vulkan
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: ${{ github.repository }}
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-vulkan
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-vulkan.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # Linux ROCm, built against AMD's TheRock wheels like upstream's build.yml, with one
+  # difference that decides whether it runs at all: the ROCm userspace the binary was linked
+  # against ships in the bundle. Upstream's ROCm zip does not, so it dies on a host whose
+  # ROCm is a different version or absent, which is how the unsloth#8814 reporter's install
+  # went from "installed" to "load_failed" in one second. Same shape as unslothai/llama.cpp's
+  # ROCm leg: libamdhip64, hipblas, rocblas and rocblas/library beside the binaries, rpath
+  # $ORIGIN, so only the kernel driver has to come from the host.
+  build-linux-rocm:
+    name: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+    needs: resolve
+    continue-on-error: true
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    env:
+      ROCM_VERSION: "7.14.0"
+      # Consumer parts, upstream's Windows list. CDNA hosts run diffusers and never reach this.
+      GPU_TARGETS: "gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
+      # rocm-sdk re-expands clang from the wheel every run, so its mtime always differs and
+      # the default compiler_check=mtime misses every object.
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Free disk for the ROCm wheels
+        run: |
+          set -eux
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache
+          docker system prune -af || true
+          df -h /
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Install ROCm (TheRock wheels)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build patchelf
+          python3 -m venv .rocm
+          . .rocm/bin/activate
+          python -m pip install -q --upgrade pip
+          python -m pip install -q --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel]==${ROCM_VERSION}"
+          ROCM_PATH="$(rocm-sdk path --root)"
+          {
+            echo "ROCM_PATH=$ROCM_PATH"
+            echo "HIP_PATH=$ROCM_PATH"
+            echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)"
+            echo "LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "$(rocm-sdk path --bin)" >> "$GITHUB_PATH"
+          echo "$(pwd)/.rocm/bin" >> "$GITHUB_PATH"
+
+      - name: ccache key
+        id: cckey
+        run: echo "archs=$(echo "$GPU_TARGETS" | sha256sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: sd-rocm-${{ env.ROCM_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          restore-keys: |
+            sd-rocm-${{ env.ROCM_VERSION }}-${{ steps.cckey.outputs.archs }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      - name: Build sd-cli + sd-server (ROCm)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600" \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            -DSD_HIPBLAS=ON \
+            -DHIP_PLATFORM=amd \
+            -DGPU_TARGETS="$GPU_TARGETS" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server
+          ccache --show-stats || true
+
+      - name: Bundle the ROCm runtime beside the binaries
+        run: |
+          set -euo pipefail
+          BIN="${GITHUB_WORKSPACE}/src/build/bin"
+          # Every library the binaries resolve from inside the wheel tree. ldd already walks
+          # the closure, so one pass over the binaries and the shared libs beside them is the
+          # whole list.
+          ldd "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/*.so 2>/dev/null \
+            | awk -v r="$ROCM_PATH/" 'index($3, r) == 1 { print $3 }' | sort -u > "$RUNNER_TEMP/rocm-libs.txt"
+          if [ ! -s "$RUNNER_TEMP/rocm-libs.txt" ]; then
+            echo "ERROR: nothing resolved from $ROCM_PATH; is this a HIP build?" >&2
+            exit 1
+          fi
+          while read -r so; do cp -L "$so" "$BIN/$(basename "$so")"; done < "$RUNNER_TEMP/rocm-libs.txt"
+          # rocBLAS loads its Tensile kernels from <dir of librocblas>/rocblas/library at
+          # runtime; without that directory every GEMM fails after the load succeeded.
+          mkdir -p "$BIN/rocblas"
+          cp -r "$ROCM_PATH/lib/rocblas/library" "$BIN/rocblas/"
+          if ls "$BIN"/libhipblaslt.so* >/dev/null 2>&1 && [ -d "$ROCM_PATH/lib/hipblaslt/library" ]; then
+            mkdir -p "$BIN/hipblaslt"
+            cp -r "$ROCM_PATH/lib/hipblaslt/library" "$BIN/hipblaslt/"
+          fi
+          for f in "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/*.so*; do
+            [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"
+          done
+          echo "bundled $(wc -l < "$RUNNER_TEMP/rocm-libs.txt") ROCm libraries"
+          du -sh "$BIN"
+          # The proof the bundle stands alone: resolve with the wheel tree hidden.
+          if LD_LIBRARY_PATH= ldd "$BIN/sd-cli" | grep -i 'not found'; then
+            echo "ERROR: unresolved libraries after bundling" >&2
+            exit 1
+          fi
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: ${{ github.repository }}
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.14.0.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Evict stale ccache files
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache --evict-older-than 14d
+
+      - name: Save ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-sd-rocm-${{ env.ROCM_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
+
+  # Windows Vulkan. The CPU leg with the LunarG SDK and -DSD_VULKAN=ON; signed and verified
+  # the same way, since Smart App Control judges these PEs too.
+  build-windows-vulkan:
+    name: win-vulkan-x64
+    needs: resolve
+    continue-on-error: true
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: windows-2022
+    environment: release-signing
+    env:
+      VULKAN_VERSION: 1.4.328.1
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+
+      - name: Build sd-cli + sd-server (Vulkan)
+        shell: pwsh
+        working-directory: src
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_FLAGS='/bigobj' `
+            -DSD_BUILD_EXAMPLES=ON `
+            -DSD_SERVER_BUILD_FRONTEND=OFF `
+            -DSD_WEBP=OFF -DSD_WEBM=OFF `
+            -DGGML_NATIVE=OFF `
+            -DSD_VULKAN=ON
+          cmake --build build --config Release -j 3 --target sd-cli sd-server
+
+      - name: Sign Windows binaries
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: src/build/bin
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      - name: Package bundle
+        shell: pwsh
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: win-vulkan-x64
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: ${{ github.repository }}
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Verify every PE in the bundle is signed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $zips = @(Get-ChildItem dist -Filter *.zip -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName })
+          if ($zips.Count -eq 0) {
+            Write-Host '::error::no bundle in dist/; packaging produced nothing to verify'
+            exit 1
+          }
+          & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
+          exit $LASTEXITCODE
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-win-vulkan-x64
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-vulkan-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
   assemble:
     name: Assemble + publish
-    needs: [resolve, build-unix, build-windows, build-linux-cuda]
+    needs: [resolve, build-unix, build-windows, build-linux-cuda, build-linux-vulkan, build-linux-rocm, build-windows-vulkan]
     # Consumed by `reclaim` to tell "these bundles are now release assets" from
     # "nothing will ever read these". Set only after draft=false lands.
     outputs:
@@ -671,7 +1007,7 @@ jobs:
             --publish-repo "$GITHUB_REPOSITORY"
           ls -la dist
 
-      - name: Coverage gate (all 5 CPU/Apple assets present)
+      - name: Coverage gate (all 5 CPU/Apple assets present; CUDA, Vulkan and ROCm are best effort)
         run: |
           set -eu
           TAG='${{ needs.resolve.outputs.tag }}'
@@ -718,7 +1054,7 @@ jobs:
           AHEAD='${{ needs.resolve.outputs.ahead }}'
           COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. CPU (Linux/WSL/Windows) and Apple (Metal) always; the CUDA, Vulkan and ROCm assets ship when their leg built."
           PINS='${{ needs.resolve.outputs.pins }}'
           if [ "${AHEAD:-0}" -gt 0 ]; then
             NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
