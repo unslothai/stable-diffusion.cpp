@@ -16,6 +16,8 @@ script serves every OS matrix leg:
     COMMIT    source commit SHA (provenance)
     SOURCE_REPO   e.g. leejet/stable-diffusion.cpp
     LICENSE_FILE  path to the LICENSE to include (optional)
+    KEEP_LAYOUT   "1" ships every file under BIN_DIR at its relative path instead of
+                  flattening (the ROCm leg stages lib/ and .kpack/ that must stay siblings)
 
 The zip unpacks into a single named dir ``sd-<TAG>-bin-<LABEL>/`` containing the
 binaries, their sibling runtime libs, LICENSE, and an UNSLOTH_BUILD.txt provenance
@@ -57,15 +59,18 @@ def _is_runtime_lib(name: str) -> bool:
     return ".so." in lowered
 
 
-def _collect(bin_dir: Path) -> list[Path]:
-    """The binaries + sibling runtime libs to ship. Recurse so a nested bin/ layout
-    (some generators emit build/bin/, some build/bin/Release/) is still captured."""
-    found: list[Path] = []
+def _collect(bin_dir: Path, keep_layout: bool) -> list[tuple[Path, str]]:
+    """(file, archive-relative name) for the binaries + sibling runtime libs to ship. Recurse
+    so a nested bin/ layout (some generators emit build/bin/, some build/bin/Release/) is still
+    captured and flattened. With keep_layout, every file ships at its path under bin_dir."""
+    found: list[tuple[Path, str]] = []
     for p in sorted(bin_dir.rglob("*")):
         if not p.is_file():
             continue
-        if p.name in _BINARIES or _is_runtime_lib(p.name):
-            found.append(p)
+        if keep_layout:
+            found.append((p, p.relative_to(bin_dir).as_posix()))
+        elif p.name in _BINARIES or _is_runtime_lib(p.name):
+            found.append((p, p.name))
     return found
 
 
@@ -82,12 +87,12 @@ def main() -> int:
         print(f"package_bundle: BIN_DIR {bin_dir} is not a directory", file = sys.stderr)
         return 2
 
-    files = _collect(bin_dir)
-    have_cli = any(f.name in ("sd-cli", "sd-cli.exe") for f in files)
+    files = _collect(bin_dir, os.environ.get("KEEP_LAYOUT", "").strip() == "1")
+    have_cli = any(f.name in ("sd-cli", "sd-cli.exe") for f, _ in files)
     if not have_cli:
         print(f"package_bundle: no sd-cli under {bin_dir}; refusing to package", file = sys.stderr)
         return 1
-    have_server = any(f.name in ("sd-server", "sd-server.exe") for f in files)
+    have_server = any(f.name in ("sd-server", "sd-server.exe") for f, _ in files)
 
     out_dir.mkdir(parents = True, exist_ok = True)
     stem = f"sd-{tag}-bin-{label}"
@@ -108,10 +113,9 @@ def main() -> int:
     # Deterministic-ish: sort members; drop the archive if it already exists.
     zip_path.unlink(missing_ok = True)
     with zipfile.ZipFile(zip_path, "w", compression = zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            # Flatten under the named top-level dir; keep just the basename so the
-            # binaries sit at sd-<tag>-bin-<label>/<name> regardless of build layout.
-            zf.write(f, arcname = f"{stem}/{f.name}")
+        for f, name in files:
+            # Under sd-<tag>-bin-<label>/, flat unless KEEP_LAYOUT.
+            zf.write(f, arcname = f"{stem}/{name}")
         zf.writestr(f"{stem}/UNSLOTH_BUILD.txt", provenance)
         if license_file and Path(license_file).is_file():
             zf.write(license_file, arcname = f"{stem}/LICENSE")

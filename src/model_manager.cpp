@@ -1652,7 +1652,7 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             return SIZE_MAX;
         }
         // Vulkan's heap budget subtraction can underflow when usage exceeds the budget.
-        if (total_bytes > 0 && free_bytes > total_bytes) {
+        if (total_bytes > 0 && free_bytes > total_bytes && sd_backend_is(backend, "Vulkan")) {
             return size_t{0};
         }
         const size_t resident = add(compute_backend_resident_bytes(backend),
