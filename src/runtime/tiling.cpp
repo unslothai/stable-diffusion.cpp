@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -93,7 +94,32 @@ static sd::Tensor<float> sd_tensor_split_2d(const sd::Tensor<float>& input, int 
     return output;
 }
 
-static void sd_tensor_merge_2d(const sd::Tensor<float>& input,
+template <typename Fn>
+static void sd_parallel_for_planes(int64_t plane_count, int64_t plane_elements, Fn&& fn) {
+    // Planes are independent and each element is still produced by one thread with the same
+    // arithmetic, so splitting by plane does not change the result.
+    const int64_t min_elements = 1 << 18;
+    int64_t threads            = std::min<int64_t>(plane_count, std::max<int64_t>(1, plane_count * plane_elements / min_elements));
+    threads                    = std::min<int64_t>(threads, std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
+    if (threads <= 1) {
+        fn(0, plane_count);
+        return;
+    }
+    std::vector<std::thread> workers;
+    const int64_t per_thread = (plane_count + threads - 1) / threads;
+    for (int64_t begin = per_thread; begin < plane_count; begin += per_thread) {
+        workers.emplace_back([&fn, begin, end = std::min(plane_count, begin + per_thread)]() { fn(begin, end); });
+    }
+    fn(0, std::min(plane_count, per_thread));
+    for (auto& worker : workers) {
+        worker.join();
+    }
+}
+
+static void sd_tensor_merge_2d(const float* input_data,
+                               int64_t width,
+                               int64_t height,
+                               int64_t plane_count,
                                sd::Tensor<float>* output,
                                int x,
                                int y,
@@ -104,13 +130,10 @@ static void sd_tensor_merge_2d(const sd::Tensor<float>& input,
                                int x_skip,
                                int y_skip) {
     GGML_ASSERT(output != nullptr);
-    int64_t width        = input.shape()[0];
-    int64_t height       = input.shape()[1];
     int64_t img_width    = output->shape()[0];
     int64_t img_height   = output->shape()[1];
-    int64_t input_plane  = sd_tensor_plane_size(input);
+    int64_t input_plane  = width * height;
     int64_t output_plane = sd_tensor_plane_size(*output);
-    int64_t plane_count  = input.numel() / input_plane;
     GGML_ASSERT(output->numel() / output_plane == plane_count);
 
     // unclamped -> expects x in the range [0-1]
@@ -140,25 +163,28 @@ static void sd_tensor_merge_2d(const sd::Tensor<float>& input,
             wy[iy]            = smootherstep_f32(std::min(std::min(y_f_0, y_f_1), 1.f));
         }
     }
-    for (int64_t plane = 0; plane < plane_count; ++plane) {
-        const float* src = input.data() + plane * input_plane;
-        float* dst       = output->data() + plane * output_plane;
-        for (int64_t iy = y_skip; iy < height; iy++) {
-            const float* src_row = src + width * iy;
-            float* dst_row       = dst + img_width * ((y + iy) % img_height);
-            if (blend) {
-                const float sy = wy[iy];
-                for (int64_t ix = x_skip; ix < width; ix++) {
-                    float& out = dst_row[dst_x[ix]];
-                    out        = out + src_row[ix] * sy * wx[ix];
-                }
-            } else {
-                for (int64_t ix = x_skip; ix < width; ix++) {
-                    dst_row[dst_x[ix]] = src_row[ix];
+    float* output_data = output->data();
+    sd_parallel_for_planes(plane_count, input_plane, [&](int64_t first_plane, int64_t last_plane) {
+        for (int64_t plane = first_plane; plane < last_plane; ++plane) {
+            const float* src = input_data + plane * input_plane;
+            float* dst       = output_data + plane * output_plane;
+            for (int64_t iy = y_skip; iy < height; iy++) {
+                const float* src_row = src + width * iy;
+                float* dst_row       = dst + img_width * ((y + iy) % img_height);
+                if (blend) {
+                    const float sy = wy[iy];
+                    for (int64_t ix = x_skip; ix < width; ix++) {
+                        float& out = dst_row[dst_x[ix]];
+                        out        = out + src_row[ix] * sy * wx[ix];
+                    }
+                } else {
+                    for (int64_t ix = x_skip; ix < width; ix++) {
+                        dst_row[dst_x[ix]] = src_row[ix];
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
@@ -172,6 +198,40 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
                                    bool circular_y,
                                    const TileProcessCallback& on_processing,
                                    bool silent) {
+    return process_tiles_2d_batched(
+        input,
+        output_width,
+        output_height,
+        scale,
+        p_tile_size_x,
+        p_tile_size_y,
+        tile_overlap_factor,
+        circular_x,
+        circular_y,
+        [](int) { return 1; },
+        [&](const std::vector<sd::Tensor<float>>& tiles) {
+            TileBatchOutput output;
+            output.data = on_processing(tiles[0]);
+            if (!output.data.empty()) {
+                output.stack_dim = static_cast<size_t>(output.data.dim() - 1);
+            }
+            return output;
+        },
+        silent);
+}
+
+sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
+                                           int output_width,
+                                           int output_height,
+                                           int scale,
+                                           int p_tile_size_x,
+                                           int p_tile_size_y,
+                                           float tile_overlap_factor,
+                                           bool circular_x,
+                                           bool circular_y,
+                                           const TileBatchSizeCallback& batch_size,
+                                           const TileBatchProcessCallback& on_processing,
+                                           bool silent) {
     sd::Tensor<float> output;
     int input_width  = static_cast<int>(input.shape()[0]);
     int input_height = static_cast<int>(input.shape()[1]);
@@ -215,17 +275,17 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
         input_tile_size_y *= scale;
     }
 
-    int num_tiles   = num_tiles_x * num_tiles_y;
-    int tile_count  = 1;
-    bool last_y     = false;
-    bool last_x     = false;
-    float last_time = 0.0f;
-    if (!silent) {
-        LOG_VERBOSE("num tiles : %d, %d ", num_tiles_x, num_tiles_y);
-        LOG_VERBOSE("optimal overlap : %f, %f (targeting %f)", tile_overlap_factor_x, tile_overlap_factor_y, tile_overlap_factor);
-        LOG_VERBOSE("processing %i tiles", num_tiles);
-        pretty_progress(0, num_tiles, 0.0f);
-    }
+    struct TilePlacement {
+        int x_in;
+        int y_in;
+        int x_out;
+        int y_out;
+        int dx;
+        int dy;
+    };
+    std::vector<TilePlacement> placements;
+    bool last_y = false;
+    bool last_x = false;
     for (int y = 0; y < small_height && !last_y; y += non_tile_overlap_y) {
         int dy = 0;
         if (!circular_y && y + tile_size_y >= small_height) {
@@ -248,38 +308,85 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
                 }
                 last_x = true;
             }
-
-            int x_in  = decode ? x : scale * x;
-            int y_in  = decode ? y : scale * y;
-            int x_out = decode ? x * scale : x;
-            int y_out = decode ? y * scale : y;
-
-            int overlap_x_out = decode ? tile_overlap_x * scale : tile_overlap_x;
-            int overlap_y_out = decode ? tile_overlap_y * scale : tile_overlap_y;
-
-            int64_t t1       = ggml_time_ms();
-            auto input_tile  = sd_tensor_split_2d(input, input_tile_size_x, input_tile_size_y, x_in, y_in);
-            auto output_tile = on_processing(input_tile);
-            if (output_tile.empty()) {
-                return {};
-            }
-            GGML_ASSERT(output_tile.shape()[0] == output_tile_size_x && output_tile.shape()[1] == output_tile_size_y);
-            if (output.empty()) {
-                std::vector<int64_t> output_shape = output_tile.shape();
-                output_shape[0]                   = output_width;
-                output_shape[1]                   = output_height;
-                output                            = sd::Tensor<float>::zeros(std::move(output_shape));
-            }
-            sd_tensor_merge_2d(output_tile, &output, x_out, y_out, overlap_x_out, overlap_y_out, circular_x, circular_y, dx, dy);
-
-            if (!silent) {
-                int64_t t2 = ggml_time_ms();
-                last_time  = (t2 - t1) / 1000.0f;
-                pretty_progress(tile_count, num_tiles, last_time);
-            }
-            tile_count++;
+            placements.push_back({decode ? x : scale * x,
+                                  decode ? y : scale * y,
+                                  decode ? x * scale : x,
+                                  decode ? y * scale : y,
+                                  dx,
+                                  dy});
         }
         last_x = false;
+    }
+
+    int overlap_x_out = decode ? tile_overlap_x * scale : tile_overlap_x;
+    int overlap_y_out = decode ? tile_overlap_y * scale : tile_overlap_y;
+    int num_tiles     = num_tiles_x * num_tiles_y;
+    int tile_count    = 1;
+    float last_time   = 0.0f;
+    if (!silent) {
+        LOG_VERBOSE("num tiles : %d, %d ", num_tiles_x, num_tiles_y);
+        LOG_VERBOSE("optimal overlap : %f, %f (targeting %f)", tile_overlap_factor_x, tile_overlap_factor_y, tile_overlap_factor);
+        LOG_VERBOSE("processing %i tiles", num_tiles);
+        pretty_progress(0, num_tiles, 0.0f);
+    }
+    std::vector<sd::Tensor<float>> input_tiles;
+    for (size_t first = 0; first < placements.size();) {
+        const int remaining = static_cast<int>(placements.size() - first);
+        const int count     = std::max(1, std::min(remaining, batch_size(remaining)));
+        const size_t last   = first + static_cast<size_t>(count);
+        int64_t t1          = ggml_time_ms();
+        input_tiles.clear();
+        for (size_t i = first; i < last; ++i) {
+            input_tiles.push_back(sd_tensor_split_2d(input, input_tile_size_x, input_tile_size_y, placements[i].x_in, placements[i].y_in));
+        }
+        auto batch = on_processing(input_tiles);
+        if (batch.data.empty()) {
+            return {};
+        }
+        const int64_t batch_tiles = static_cast<int64_t>(last - first);
+        GGML_ASSERT(batch.stack_dim < static_cast<size_t>(batch.data.dim()) && batch.data.shape()[batch.stack_dim] % batch_tiles == 0);
+        for (size_t d = batch.stack_dim + 1; d < static_cast<size_t>(batch.data.dim()); ++d) {
+            GGML_ASSERT(batch.data.shape()[d] == 1);
+        }
+        std::vector<int64_t> tile_shape = batch.data.shape();
+        tile_shape[batch.stack_dim] /= batch_tiles;
+        GGML_ASSERT(tile_shape[0] == output_tile_size_x && tile_shape[1] == output_tile_size_y);
+        const int64_t tile_numel  = batch.data.numel() / batch_tiles;
+        const int64_t plane_count = tile_numel / (tile_shape[0] * tile_shape[1]);
+        if (output.empty()) {
+            std::vector<int64_t> output_shape = tile_shape;
+            output_shape[0]                   = output_width;
+            output_shape[1]                   = output_height;
+            output                            = sd::Tensor<float>::zeros(std::move(output_shape));
+        }
+        for (size_t i = first; i < last; ++i) {
+            const auto& placement = placements[i];
+            sd_tensor_merge_2d(batch.data.data() + static_cast<int64_t>(i - first) * tile_numel,
+                               tile_shape[0],
+                               tile_shape[1],
+                               plane_count,
+                               &output,
+                               placement.x_out,
+                               placement.y_out,
+                               overlap_x_out,
+                               overlap_y_out,
+                               circular_x,
+                               circular_y,
+                               placement.dx,
+                               placement.dy);
+        }
+
+        if (!silent) {
+            int64_t t2 = ggml_time_ms();
+            last_time  = (t2 - t1) / 1000.0f / static_cast<float>(last - first);
+            for (size_t i = first; i < last; ++i) {
+                pretty_progress(tile_count, num_tiles, last_time);
+                tile_count++;
+            }
+        } else {
+            tile_count += static_cast<int>(last - first);
+        }
+        first = last;
     }
     if (!silent && tile_count < num_tiles) {
         pretty_progress(num_tiles, num_tiles, last_time);

@@ -1,0 +1,348 @@
+From 76b49e564c23b99758642d5bc5013d09774a1e24 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 1 Oct 2026 05:46:18 -0700
+Subject: [PATCH] ggml-cuda: fuse bias epilogues into F16 cuBLAS matmuls,
+ narrow blocks for short-row RMS norm
+
+An F16 matmul on the cuBLAS path writes an F16 temporary, converts it to F32, and the
+graph then adds a bias (and in transformer blocks multiplies by a per-channel scale and
+adds the residual, or applies SWIGLU) in separate passes over the F32 result. When those
+nodes directly follow the matmul and have no other users, they now run inside the F16 -> F32
+conversion: MUL_MAT+ADD, MUL_MAT+ADD+MUL+ADD and MUL_MAT+ADD+GLU(SWIGLU). Every element
+goes through the same rounded operations in the same order (explicit _rn intrinsics stop
+nvcc from contracting them into FMAs), so results are bit-identical.
+GGML_CUDA_CUBLAS_EPILOGUE_FUSION=0 disables it.
+
+RMS norm over rows of at most 128 columns (per-head q/k norms) launched 256-thread blocks
+in which most threads had no element. It now uses the next multiple of 32 threads: each
+thread still owns the same element and each warp the same partial sum, and the wider block
+only added zero partials, so the result is unchanged. GGML_CUDA_NORM_SMALL_ROWS=0 restores
+the 256-thread launch.
+---
+ src/ggml-cuda/ggml-cuda.cu | 200 ++++++++++++++++++++++++++++++++++++-
+ src/ggml-cuda/norm.cu      |  63 ++++++++++++
+ 2 files changed, 262 insertions(+), 1 deletion(-)
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 517d089..0e61996 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2017,8 +2017,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+ };
+ 
++// Elementwise ops that directly follow an F16 cuBLAS matmul, applied while converting its F16
++// output to F32 instead of in separate passes over the F32 result. Each element sees the same
++// rounded operations in the same order as the unfused ADD / MUL / ADD or ADD / SWIGLU nodes
++// (explicit _rn intrinsics keep nvcc from contracting them into FMAs), so results are bit-identical.
++enum ggml_cuda_cublas_epilogue_mode {
++    GGML_CUDA_CUBLAS_EPILOGUE_BIAS,               // dst = mm + bias
++    GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SCALE_RESIDUAL, // dst = residual + (mm + bias) * scale
++    GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SWIGLU,         // dst = silu(mm[:n] + bias[:n]) * (mm[n:] + bias[n:])
++};
++
++struct ggml_cuda_cublas_epilogue {
++    ggml_cuda_cublas_epilogue_mode mode;
++    const float * bias;
++    const float * scale;
++    const float * residual;
++    float *       dst;
++    int64_t       ne0_out;
++    int64_t       n_out;
++};
++
++template <ggml_cuda_cublas_epilogue_mode mode>
++static __global__ void k_cublas_f16_epilogue(const half * __restrict__ mm, const float * __restrict__ bias,
++                                             const float * __restrict__ scale, const float * residual, float * dst,
++                                             const int64_t ne0_out, const int64_t n_out) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n_out) {
++        return;
++    }
++    const int64_t row = i / ne0_out;
++    const int64_t col = i - row*ne0_out;
++    if constexpr (mode == GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SWIGLU) {
++        const int64_t j = row*2*ne0_out + col;
++        const float   x = __fadd_rn(__half2float(mm[j]), bias[col]);
++        const float   g = __fadd_rn(__half2float(mm[j + ne0_out]), bias[col + ne0_out]);
++        dst[i] = __fmul_rn(ggml_cuda_op_silu_single(x), g);
++    } else {
++        float v = __fadd_rn(__half2float(mm[i]), bias[col]);
++        if constexpr (mode == GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SCALE_RESIDUAL) {
++            v = __fadd_rn(residual[i], __fmul_rn(v, scale[col]));
++        }
++        dst[i] = v;
++    }
++}
++
++static void ggml_cuda_cublas_f16_epilogue(const half * mm, const ggml_cuda_cublas_epilogue & epi, cudaStream_t stream) {
++    const int     block = 256;
++    const int64_t grid  = (epi.n_out + block - 1) / block;
++    switch (epi.mode) {
++        case GGML_CUDA_CUBLAS_EPILOGUE_BIAS:
++            k_cublas_f16_epilogue<GGML_CUDA_CUBLAS_EPILOGUE_BIAS><<<grid, block, 0, stream>>>(
++                mm, epi.bias, epi.scale, epi.residual, epi.dst, epi.ne0_out, epi.n_out);
++            break;
++        case GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SCALE_RESIDUAL:
++            k_cublas_f16_epilogue<GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SCALE_RESIDUAL><<<grid, block, 0, stream>>>(
++                mm, epi.bias, epi.scale, epi.residual, epi.dst, epi.ne0_out, epi.n_out);
++            break;
++        case GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SWIGLU:
++            k_cublas_f16_epilogue<GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SWIGLU><<<grid, block, 0, stream>>>(
++                mm, epi.bias, epi.scale, epi.residual, epi.dst, epi.ne0_out, epi.n_out);
++            break;
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ template<ggml_type compute_type>
+-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++                                          const ggml_cuda_cublas_epilogue * epilogue = nullptr) {
+     using traits = batched_mul_mat_traits<compute_type>;
+     using cuda_t = typename traits::cuda_type;
+ 
+@@ -2226,8 +2291,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+ 
+     // Convert output back to F32 if needed
+     if (cu_data_type != CUDA_R_32F) {
++        if constexpr (compute_type == GGML_TYPE_F16) {
++            if (epilogue != nullptr) {
++                ggml_cuda_cublas_f16_epilogue((const half *) dst_temp.get(), *epilogue, main_stream);
++                return;
++            }
++        }
++        GGML_ASSERT(epilogue == nullptr);
+         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
+         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
++    } else {
++        GGML_ASSERT(epilogue == nullptr);
+     }
+ }
+ 
+@@ -3838,6 +3912,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++static bool ggml_cuda_cublas_epilogue_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_CUBLAS_EPILOGUE_FUSION");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++// True when ggml_cuda_mul_mat sends this F16 matmul to cuBLAS with F16 compute and an F16
++// temporary output (the path the epilogue fusion replaces the F16 -> F32 conversion of).
++static bool ggml_cuda_mul_mat_uses_cublas_f16_temp(const ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * src1 = mm->src[1];
++    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(mm) || ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
++        mm->op_params[0] == GGML_PREC_F32 || getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") != nullptr) {
++        return false;
++    }
++    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
++    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
++    if (!fast_fp16_hardware_available(cc) || cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
++        return false;
++    }
++    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
++        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
++    if (bad_padding_clear) {
++        return true;
++    }
++    const int64_t ne11 = src1->ne[1];
++    return !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
++           !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false);
++}
++
++static const ggml_tensor * ggml_cuda_other_src(const ggml_tensor * node, const ggml_tensor * operand) {
++    if (node->src[0] == operand) {
++        return node->src[1];
++    }
++    if (node->src[1] == operand) {
++        return node->src[0];
++    }
++    return nullptr;
++}
++
++// Like ggml_node_has_n_uses(cgraph, idx, 1), but also accepts an in-place node whose view
++// source is the (single-use) node before it, e.g. the bias ADD that ggml_add_inplace builds.
++static bool ggml_cuda_single_use_intermediate(const ggml_cgraph * cgraph, int idx, const ggml_tensor * prev) {
++    const ggml_tensor * node = cgraph->nodes[idx];
++    if (ggml_node_get_use_count(cgraph, idx) != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    return node->view_src == nullptr || node->view_src == prev;
++}
++
++static bool ggml_cuda_is_row_vector(const ggml_tensor * t, int64_t ne0) {
++    return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == ne0 && ggml_nelements(t) == ne0;
++}
++
++// MUL_MAT (F16 weights, cuBLAS) followed by a row bias ADD, optionally then MUL by a row scale and
++// ADD of a residual, or SWIGLU. Returns the number of extra nodes consumed, 0 if not fused.
++static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (!ggml_cuda_cublas_epilogue_enabled() || i + 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor * mm  = cgraph->nodes[i];
++    ggml_tensor * add = cgraph->nodes[i + 1];
++    if (mm->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD || (add->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
++        !ggml_node_has_n_uses(cgraph, i, 1) || !ggml_are_same_shape(mm, add) || add->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(add)) {
++        return 0;
++    }
++    const ggml_tensor * bias = ggml_cuda_other_src(add, mm);
++    if (!ggml_cuda_is_row_vector(bias, mm->ne[0]) || !ggml_cuda_mul_mat_uses_cublas_f16_temp(ctx, mm)) {
++        return 0;
++    }
++
++    ggml_cuda_cublas_epilogue epi = {};
++    epi.mode    = GGML_CUDA_CUBLAS_EPILOGUE_BIAS;
++    epi.bias    = (const float *) bias->data;
++    epi.dst     = (float *) add->data;
++    epi.ne0_out = add->ne[0];
++    epi.n_out   = ggml_nelements(add);
++    int consumed = 1;
++
++    if (i + 2 < cgraph->n_nodes && ggml_cuda_single_use_intermediate(cgraph, i + 1, mm)) {
++        ggml_tensor * mul = cgraph->nodes[i + 2];
++        ggml_tensor * res = i + 3 < cgraph->n_nodes ? cgraph->nodes[i + 3] : nullptr;
++        const ggml_tensor * glu = cgraph->nodes[i + 2];
++        if (res != nullptr && mul->op == GGML_OP_MUL && res->op == GGML_OP_ADD && (mul->flags & GGML_TENSOR_FLAG_COMPUTE) &&
++            (res->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i + 2, 1) &&
++            ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && mul->type == GGML_TYPE_F32 &&
++            res->type == GGML_TYPE_F32 && ggml_is_contiguous(res)) {
++            const ggml_tensor * scale    = ggml_cuda_other_src(mul, add);
++            const ggml_tensor * residual = ggml_cuda_other_src(res, mul);
++            if (mul->src[0] == add && ggml_cuda_is_row_vector(scale, add->ne[0]) && residual != nullptr &&
++                residual->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) && ggml_are_same_shape(residual, res)) {
++                epi.mode     = GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SCALE_RESIDUAL;
++                epi.scale    = (const float *) scale->data;
++                epi.residual = (const float *) residual->data;
++                epi.dst      = (float *) res->data;
++                consumed     = 3;
++            }
++        } else if (glu->op == GGML_OP_GLU && (glu->flags & GGML_TENSOR_FLAG_COMPUTE) && glu->src[0] == add &&
++                   glu->src[1] == nullptr && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
++                   ggml_get_op_params_i32(glu, 1) == 0 && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
++                   add->ne[0] % 2 == 0 && glu->ne[0] * 2 == add->ne[0] && ggml_nrows(glu) == ggml_nrows(add)) {
++            epi.mode    = GGML_CUDA_CUBLAS_EPILOGUE_BIAS_SWIGLU;
++            epi.dst     = (float *) glu->data;
++            epi.ne0_out = glu->ne[0];
++            epi.n_out   = ggml_nelements(glu);
++            consumed    = 2;
++        }
++    }
++
++    ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, mm->src[0], mm->src[1], mm, &epi);
++    return consumed;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -4523,6 +4714,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    if (node->op == GGML_OP_MUL_MAT) {
++        const int consumed = ggml_cuda_try_fuse_cublas_epilogue(*cuda_ctx, cgraph, i);
++        if (consumed > 0) {
++            return consumed;
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index c3758cd..9c9385f 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -301,10 +301,68 @@ static void group_norm_f32_cuda(
+     }
+ }
+ 
++// Rows of at most 128 columns (per-head q/k norms) leave most of a 256-thread block idle. A block
++// of the next multiple of 32 gives every thread the same element and every warp the same partial
++// sum; the 256-thread reduction only adds zero partials on top, so the result is bit-identical.
++// GGML_CUDA_NORM_SMALL_ROWS=0 restores the 256-thread launch.
++static bool rms_norm_small_rows_enabled() {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    return false;
++#else
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_NORM_SMALL_ROWS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled && WARP_SIZE == 32;
++#endif
++}
++
++template <int block_size, bool do_multiply>
++static void rms_norm_f32_launch_small(
++        const float * x, float * dst, const int ncols, const dim3 blocks_num,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
++        const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
++        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
++        cudaStream_t stream) {
++    const dim3 block_dims(block_size, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_size > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
++    ggml_cuda_kernel_launch(rms_norm_f32<block_size, do_multiply>, launch_params,
++        x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
++        mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++}
++
++template <bool do_multiply>
++static bool rms_norm_f32_try_small(
++        const float * x, float * dst, const int ncols, const dim3 blocks_num,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
++        const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
++        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
++        cudaStream_t stream) {
++    if (ncols > 128 || !rms_norm_small_rows_enabled()) {
++        return false;
++    }
++    if (ncols <= 32) {
++        rms_norm_f32_launch_small<32, do_multiply>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
++            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream);
++    } else if (ncols <= 64) {
++        rms_norm_f32_launch_small<64, do_multiply>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
++            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream);
++    } else {
++        rms_norm_f32_launch_small<128, do_multiply>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
++            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream);
++    }
++    return true;
++}
++
+ static void rms_norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
++    if (rms_norm_f32_try_small<false>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps,
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), stream)) {
++        return;
++    }
+     if (ncols < 1024) {
+         const dim3 block_dims(256, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+@@ -360,6 +418,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
++        if (rms_norm_f32_try_small<true>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps,
++                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
++                mul_nchannels_packed, mul_nsamples_packed, stream)) {
++            return;
++        }
+         if (ncols < 1024) {
+             const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-- 
+2.43.0
+

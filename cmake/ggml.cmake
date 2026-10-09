@@ -21,6 +21,18 @@ endif()
 target_include_directories(${SD_LIB} PRIVATE "${sd_ggml_private_include}")
 set_property(TARGET ${SD_LIB} PROPERTY SD_GGML_PRIVATE_INCLUDE_DIR "${sd_ggml_private_include}")
 
+# The fused DiT ops come from scripts/unsloth/ggml-patches/0004; an unpatched ggml keeps the unfused H3 graph.
+set(sd_ggml_header "${sd_ggml_private_include}/../include/ggml.h")
+if(EXISTS "${sd_ggml_header}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${sd_ggml_header}")
+    file(STRINGS "${sd_ggml_header}" sd_ggml_h3_fused_ops REGEX "ggml_rope_pe_permute\\(")
+endif()
+if(sd_ggml_h3_fused_ops)
+    target_compile_definitions(${SD_LIB} PUBLIC SD_GGML_H3_FUSED_OPS)
+else()
+    message(STATUS "ggml lacks the fused DiT ops patch: MiniMax-H3 uses the unfused graph")
+endif()
+
 if(SD_USE_UPSTREAM_GGML)
     target_compile_definitions(${SD_LIB} PUBLIC SD_USE_UPSTREAM_GGML)
     message(WARNING "Using upstream GGML: INT8 tensorwise/convrot is disabled and FP8 weights are converted to F16 at load time. Some operators may be unsupported and performance may be lower than with patched GGML.")

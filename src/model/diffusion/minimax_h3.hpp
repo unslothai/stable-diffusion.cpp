@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <tuple>
@@ -120,6 +121,48 @@ namespace MiniMaxH3 {
         }
     };
 
+    // Value-preserving graph rewrites for the DiT blocks. Every lever produces the same bits as
+    // the original graph (same arithmetic, same rounding points); each can be switched off:
+    //   SD_H3_GRAPH_FAST=0  restores the original graph for all of them
+    //   SD_H3_FAST_QKV=0    q/k/v: unfused chunk copies, partial RoPE via slice/rope/concat, K/V scale+cast
+    //   SD_H3_FAST_MLP=0    MLP gate: copied chunks + silu + mul instead of one swiglu on views
+    //   SD_H3_FAST_VIEWS=0  modulation/residual segments copied before use instead of read in place
+    //   SD_H3_FAST_SEGMENTS=0  per-segment adaLN modulation / gated residual as mul+add+concat chains
+    //                          instead of one in-place op per segment, MLP Linear scales kept as
+    //                          separate scale ops instead of folded into those ops and the swiglu
+    static bool env_flag(const char* name, bool default_value) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return default_value;
+        }
+        return std::atoi(value) != 0;
+    }
+
+    static bool graph_fast() {
+        static const bool enabled = env_flag("SD_H3_GRAPH_FAST", true);
+        return enabled;
+    }
+
+    static bool fast_qkv() {
+        static const bool enabled = graph_fast() && env_flag("SD_H3_FAST_QKV", true);
+        return enabled;
+    }
+
+    static bool fast_mlp() {
+        static const bool enabled = graph_fast() && env_flag("SD_H3_FAST_MLP", true);
+        return enabled;
+    }
+
+    static bool fast_segments() {
+        static const bool enabled = graph_fast() && env_flag("SD_H3_FAST_SEGMENTS", true);
+        return enabled;
+    }
+
+    static bool fast_views() {
+        static const bool enabled = graph_fast() && env_flag("SD_H3_FAST_VIEWS", true);
+        return enabled;
+    }
+
     static float time_shift_sigma(float sigma, float from_shift, float to_shift) {
         float base = sigma / (from_shift + sigma * (1.f - from_shift));
         return to_shift * base / (1.f + (to_shift - 1.f) * base);
@@ -145,10 +188,57 @@ namespace MiniMaxH3 {
             blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, true, 1.f / 128.f);
         }
 
+        // Scales for forward_folded(): the caller applies `input_scale` to the input (fused into the
+        // preceding op) and `output_scale` to the result (fused into the following op). Returns false
+        // when the Linears cannot be folded (bias, adapter, weight scales, INT8/FP8 weights).
+        bool foldable(GGMLRunnerContext* ctx, float* input_scale, float* output_scale) {
+            auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
+            auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
+            if (fc1->foldable_weight(ctx) == nullptr || fc2->foldable_weight(ctx) == nullptr) {
+                return false;
+            }
+            const float s1 = fc1->effective_scale(ctx);
+            const float s2 = fc2->effective_scale(ctx);
+            // the same factors ggml_ext_linear applies around each matmul
+            *input_scale  = s1;
+            *output_scale = s2 != 1.f ? 1.f / s2 : 1.f;
+            return true;
+        }
+
+        // fc1 matmul -> swiglu with fc1's output scale and fc2's input scale fused in -> fc2 matmul.
+        // x must already carry fc1's input scale; the result still needs foldable()'s output_scale.
+        ggml_tensor* forward_folded(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto fc1      = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
+            auto fc2      = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
+            const float s1 = fc1->effective_scale(ctx);
+            const float s2 = fc2->effective_scale(ctx);
+            auto h        = ggml_ext_linear_matmul(ctx->ggml_ctx, x, fc1->foldable_weight(ctx), fc1->prec_f32());
+            auto halves   = ggml_ext_chunk(ctx->ggml_ctx, h, 2, 0, false);
+#ifndef SD_GGML_H3_FUSED_OPS
+            GGML_UNUSED(s1);
+            GGML_UNUSED(s2);
+            GGML_UNUSED(halves);
+            GGML_ABORT("forward_folded needs the fused swiglu op");
+#else
+            auto gated = ggml_swiglu_scaled(ctx->ggml_ctx, halves[0], halves[1], s1 != 1.f ? 1.f / s1 : 1.f, s2);
+            return ggml_ext_linear_matmul(ctx->ggml_ctx, gated, fc2->foldable_weight(ctx), fc2->prec_f32());
+#endif
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
-            auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
+            auto h   = fc1->forward(ctx, x);
+            if (fast_mlp() && ctx->backend != nullptr && h->type == GGML_TYPE_F32 && ggml_is_contiguous(h)) {
+                // silu(u) * v straight from the two halves of fc1's output: same per-element
+                // silu and product as the copied-chunk graph, without the two chunk copies.
+                auto halves = ggml_ext_chunk(ctx->ggml_ctx, h, 2, 0, false);
+                auto gated  = ggml_swiglu_split(ctx->ggml_ctx, halves[0], halves[1]);
+                if (ggml_backend_supports_op(ctx->backend, gated)) {
+                    return fc2->forward(ctx, gated);
+                }
+            }
+            auto uv = ggml_ext_chunk(ctx->ggml_ctx, h, 2, 0);
             return fc2->forward(ctx, ggml_mul(ctx->ggml_ctx,
                                               ggml_silu(ctx->ggml_ctx, uv[0]),
                                               uv[1]));
@@ -192,6 +282,62 @@ namespace MiniMaxH3 {
             blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false);
         }
 
+        // q/k/v read in place from the fused projection, q/k RMS-normed, then one op per tensor
+        // applies the partial RoPE, writes the head-major layout flash attention reads, and for
+        // K/V applies the kv scale and the F16 cast. Returns nullptr when unsupported.
+        ggml_tensor* forward_head_major(GGMLRunnerContext* ctx,
+                                        ggml_tensor* qkv_out,
+                                        int64_t sequence,
+                                        int64_t batch,
+                                        ggml_tensor* pe) {
+#ifndef SD_GGML_H3_FUSED_OPS
+            return nullptr;
+#else
+            if (!ctx->flash_attn_enabled || ctx->sage_attn_enabled || ctx->backend == nullptr) {
+                return nullptr;
+            }
+            const int64_t inner = heads * head_dim;
+            if (qkv_out->type != GGML_TYPE_F32 || !ggml_is_contiguous(qkv_out) || qkv_out->ne[0] != inner * 3 ||
+                qkv_out->ne[1] != sequence) {
+                return nullptr;
+            }
+            const int n_rot = pe != nullptr ? static_cast<int>(pe->ne[2] * 2) : 0;
+            if (n_rot > head_dim || (pe != nullptr && (pe->ne[0] != 2 || pe->ne[1] != 2 || pe->ne[3] != sequence ||
+                                                        pe->type != GGML_TYPE_F32 || !ggml_is_contiguous(pe)))) {
+                return nullptr;
+            }
+            const float kv_scale = ctx->attn_scale > 0.f ? ctx->attn_scale : 1.f / 128.f;
+
+            auto q_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+            auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+            auto part   = [&](int index) {
+                return ggml_view_4d(ctx->ggml_ctx,
+                                    qkv_out,
+                                    head_dim,
+                                    heads,
+                                    sequence,
+                                    batch,
+                                    head_dim * ggml_element_size(qkv_out),
+                                    qkv_out->nb[1],
+                                    qkv_out->nb[1] * sequence,
+                                    index * inner * ggml_element_size(qkv_out));
+            };
+            auto q = q_norm->forward(ctx, part(0));
+            auto k = k_norm->forward(ctx, part(1));
+            q      = ggml_rope_pe_permute(ctx->ggml_ctx, q, pe, n_rot, 1.f, GGML_TYPE_F32);
+            k      = ggml_rope_pe_permute(ctx->ggml_ctx, k, pe, n_rot, kv_scale, GGML_TYPE_F16);
+            auto v = ggml_rope_pe_permute(ctx->ggml_ctx, part(2), nullptr, 0, kv_scale, GGML_TYPE_F16);
+            if (!ggml_backend_supports_op(ctx->backend, q) || !ggml_backend_supports_op(ctx->backend, k) ||
+                !ggml_backend_supports_op(ctx->backend, v)) {
+                return nullptr;
+            }
+            q = ggml_reshape_3d(ctx->ggml_ctx, q, head_dim, sequence, heads * batch);
+            k = ggml_reshape_3d(ctx->ggml_ctx, k, head_dim, sequence, heads * batch);
+            v = ggml_reshape_3d(ctx->ggml_ctx, v, head_dim, sequence, heads * batch);
+            return ggml_ext_attention_prepared(ctx->ggml_ctx, ctx->backend, q, k, v, heads, batch, kv_scale);
+#endif
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* pe = nullptr) {
@@ -202,7 +348,14 @@ namespace MiniMaxH3 {
 
             int64_t sequence = x->ne[1];
             int64_t batch    = x->ne[2] * x->ne[3];
-            auto qkv         = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
+            auto qkv_out     = qkv_proj->forward(ctx, x);
+            if (fast_qkv()) {
+                auto out = forward_head_major(ctx, qkv_out, sequence, batch, pe);
+                if (out != nullptr) {
+                    return out_proj->forward(ctx, out);
+                }
+            }
+            auto qkv = ggml_ext_chunk(ctx->ggml_ctx, qkv_out, 3, 0);
             auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv[0], head_dim, heads, sequence, batch);
             auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv[1], head_dim, heads, sequence, batch);
             auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv[2], head_dim, heads, sequence, batch);
@@ -331,8 +484,8 @@ namespace MiniMaxH3 {
                                                 projection,
                                                 hidden_size * expand,
                                                 timestep_rows * modalities);
-        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1);
-        return ggml_ext_chunk(ctx, selected, expand, 0);
+        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1, !fast_views());
+        return ggml_ext_chunk(ctx, selected, expand, 0, !fast_views());
     }
 
     static ggml_tensor* modulate_segments(ggml_context* ctx,
@@ -352,7 +505,7 @@ namespace MiniMaxH3 {
                                        expand,
                                        modalities,
                                        segment.modulation_row);
-            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
+            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end, !fast_views());
             part      = ggml_add(ctx,
                                  ggml_add(ctx, part, ggml_mul(ctx, part, mods[scale_index])),
                                  mods[shift_index]);
@@ -371,8 +524,8 @@ namespace MiniMaxH3 {
         ggml_tensor* out = nullptr;
         for (const auto& segment : segments) {
             auto mods = modulation_row(ctx, projection, hidden_size, 6, 3, segment.modulation_row);
-            auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
-            auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end);
+            auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end, !fast_views());
+            auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end, !fast_views());
             auto part = ggml_add(ctx, base, ggml_mul(ctx, add, mods[gate_index]));
             out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
         }
@@ -400,11 +553,95 @@ namespace MiniMaxH3 {
                                                                             config.uses_adaln_curves());
         }
 
+        // The block with every per-segment modulation / gated residual as one in-place op per segment
+        // (no slice copies, no concat) and the MLP Linear scales folded into those ops and the
+        // swiglu. Same arithmetic and rounding as forward(); nullptr when unsupported.
+        ggml_tensor* forward_fused(GGMLRunnerContext* ctx,
+                                   ggml_tensor* x,
+                                   ggml_tensor* t_emb,
+                                   const std::vector<TokenModulationSpan>& segments,
+                                   ggml_tensor* pe) {
+#ifndef SD_GGML_H3_FUSED_OPS
+            return nullptr;
+#else
+            if (ctx->backend == nullptr || segments.empty() || x->type != GGML_TYPE_F32) {
+                return nullptr;
+            }
+            int64_t expected = 0;
+            for (const auto& segment : segments) {
+                if (segment.start != expected || segment.end <= segment.start) {
+                    return nullptr;
+                }
+                expected = segment.end;
+            }
+            if (expected != x->ne[1]) {
+                return nullptr;
+            }
+            auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+            auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+            auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+            auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
+            auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
+            auto mods  = adaln->forward(ctx, t_emb);
+
+            auto vec = [&](const TokenModulationSpan& segment, int index) {
+                return modulation_row(ctx->ggml_ctx, mods, config.hidden_size, 6, 3, segment.modulation_row)[index];
+            };
+            {
+                auto probe_vec = vec(segments[0], 0);
+                auto probe     = ggml_modulate_rows(ctx->ggml_ctx, nullptr, x, probe_vec, probe_vec, 0, 1, 1.f);
+                auto probe_g   = ggml_gated_add_rows(ctx->ggml_ctx, nullptr, x, x, probe_vec, 0, 1, 1.f);
+                if (!ggml_backend_supports_op(ctx->backend, probe) || !ggml_backend_supports_op(ctx->backend, probe_g)) {
+                    return nullptr;
+                }
+            }
+            auto modulate = [&](ggml_tensor* value, int shift_index, int scale_index, float out_scale) {
+                ggml_tensor* out = nullptr;
+                for (const auto& segment : segments) {
+                    out = ggml_modulate_rows(ctx->ggml_ctx, out, value, vec(segment, scale_index), vec(segment, shift_index),
+                                             segment.start, segment.end, out_scale);
+                }
+                return out;
+            };
+            auto gated = [&](ggml_tensor* base, ggml_tensor* update, int gate_index, float update_scale) {
+                ggml_tensor* out = nullptr;
+                for (const auto& segment : segments) {
+                    out = ggml_gated_add_rows(ctx->ggml_ctx, out, base, update, vec(segment, gate_index),
+                                              segment.start, segment.end, update_scale);
+                }
+                return out;
+            };
+
+            auto h = modulate(norm1->forward(ctx, x), 0, 1, 1.f);
+            x      = gated(x, attn->forward(ctx, h, pe), 2, 1.f);
+
+            float mlp_in_scale  = 1.f;
+            float mlp_out_scale = 1.f;
+            bool fold           = fast_mlp() && mlp->foldable(ctx, &mlp_in_scale, &mlp_out_scale);
+            if (fold) {
+                auto probe = ggml_swiglu_scaled(ctx->ggml_ctx, x, x, 1.f, 1.f);
+                fold       = ggml_backend_supports_op(ctx->backend, probe);
+            }
+            if (fold) {
+                h = modulate(norm2->forward(ctx, x), 3, 4, mlp_in_scale);
+                return gated(x, mlp->forward_folded(ctx, h), 5, mlp_out_scale);
+            }
+            h = modulate(norm2->forward(ctx, x), 3, 4, 1.f);
+            return gated(x, mlp->forward(ctx, h), 5, 1.f);
+#endif
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* t_emb,
                              const std::vector<TokenModulationSpan>& segments,
                              ggml_tensor* pe) {
+            if (fast_segments()) {
+                auto out = forward_fused(ctx, x, t_emb, segments, pe);
+                if (out != nullptr) {
+                    return out;
+                }
+            }
             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);

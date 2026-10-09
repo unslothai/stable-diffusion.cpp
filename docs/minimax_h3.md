@@ -52,6 +52,34 @@ which removes most of its attention cost without touching the text encoder. Set
 keep that attention by default (on Vulkan the flash attention decode was slower);
 `SD_H3_VAE_FLASH_ATTN=1` turns it on there.
 
+On NVIDIA GPUs from Ampere on, the unmasked DiT and VAE attention runs a pipelined
+long-sequence variant of the ggml-cuda flash attention kernel (up to 4x faster at H3
+shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0` restores the
+stock kernel. `GGML_CUDA_FA_LONGSEQ_NCOLS=128` opts into a wider tile that is faster on A100 and L4
+but not bit-identical.
+
+The video VAE decodes one 16x16 latent tile per decoder graph by default.
+`SD_H3_VAE_TILE_BATCH=auto` puts several tiles into one graph, sized from free device memory (at
+most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it), and `SD_H3_VAE_TILE_BATCH=N` forces N; the
+batched projections can round differently from the per-tile decode on some GPUs, so it is
+opt-in. The decoder weights stay on the device across temporal chunks
+(`SD_H3_VAE_KEEP_RESIDENT=0` releases them after every chunk), and the decoder blocks use a
+table-based rotary embedding and a fused SwiGLU (`SD_H3_VAE_GRAPH_OPT=0` restores the previous
+graph). Each batched tile still goes through its own attention call.
+
+The DiT blocks use fused ggml ops (CPU and CUDA) for the work around the matmuls and attention:
+partial RoPE with the attention relayout and the K/V scale and F16 cast, per-segment adaLN
+modulation and gated residuals written in place, and the MLP Linear scales folded into those ops
+and the swiglu. The result is bit-identical to the unfused graph. `SD_H3_GRAPH_FAST=0` restores
+the unfused graph; `SD_H3_FAST_QKV=0`, `SD_H3_FAST_MLP=0`, `SD_H3_FAST_SEGMENTS=0` and
+`SD_H3_FAST_VIEWS=0` turn off one part each.
+
+The long-sequence flash attention kernel, the fused cuBLAS epilogues and the fused DiT ops come from
+the ggml patches in `scripts/unsloth/ggml-patches`, which the Unsloth prebuilt binaries carry. A
+source build gets them by applying the patches to the `ggml` submodule before configuring
+(`for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply "../$p"; done`); without
+them the build uses the stock ggml kernels and the unfused DiT graph.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
