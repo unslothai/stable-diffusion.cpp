@@ -58,6 +58,28 @@ shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0
 stock kernel. `GGML_CUDA_FA_LONGSEQ_NCOLS=128` opts into a wider tile that is faster on A100 and L4
 but not bit-identical.
 
+Builds configured with `-DGGML_CUDA_CUDNN=ON` (the Linux CUDA prebuilt is) can run that unmasked
+attention, and the `--sage-attn` attention, through cuDNN's fused attention. By default it replaces
+the flash attention kernel on Ada (sm89) and B200-class (sm100) GPUs and the sage kernel on sm100 only,
+where it measured faster; on an RTX 3090 (sm86) both existing kernels were faster, on an RTX 6000 Ada
+the sage kernel was, and other architectures were not measured.
+Only `cudnn.h` is needed at build time (`GGML_CUDA_CUDNN_INCLUDE_DIR`; the header-only
+cudnn-frontend v1.26.0 is downloaded by CMake unless `GGML_CUDA_CUDNN_FRONTEND_DIR` points at a
+checkout). `libcudnn.so.9` is opened when the first attention op runs and is not shipped: put a cuDNN 9
+built for the same CUDA major version as the binary (cuDNN 9 for CUDA 12 for the prebuilt) on the
+library path or beside the binary, or point `GGML_CUDA_CUDNN_LIB` at it (cuDNN 9.27 needs nothing
+else; older 9.x releases build these kernels with NVRTC and also need that CUDA major's `libnvrtc`).
+Without a loadable cuDNN, on Turing and older, for attention calls under about a million scores
+(where the extra conversions cost more than cuDNN saves) and for any shape cuDNN declines, the
+existing kernels run. The first call of each attention shape builds a cuDNN plan (about 0.4 to 1.3 s
+on a B200, logged once). cuDNN runs F16 with F32 accumulation: for the H3 DiT at 960x544x124 it
+takes about 8 ms per attention call on a B200 against 28 ms for the sage kernel and 43 ms for the
+ggml flash attention kernel, and it is closer to an exact (fp64) reference than either, so frames
+and audio differ slightly from the previous kernels. `GGML_CUDA_CUDNN_ATTN=0` restores them and
+`GGML_CUDA_CUDNN_ATTN=1` uses cuDNN for the flash attention op on any Ampere or newer GPU;
+`GGML_CUDA_CUDNN_SAGE=0` / `=1` does the same for the sage op only, and
+`GGML_CUDA_CUDNN_ATTN_BF16=1` runs cuDNN in BF16 (less accurate, same speed).
+
 The video VAE decodes one 16x16 latent tile per decoder graph by default. `SD_H3_VAE_TILE=N`
 uses N x N latent tiles instead (20 decodes about 0.7 s faster at 960x544x124 on B200); the tile
 seams move, so the frames differ from the default (36 dB PSNR at 20) and it is opt-in.
