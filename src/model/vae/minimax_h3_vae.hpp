@@ -1,11 +1,15 @@
 #ifndef __SD_MODEL_VAE_MINIMAX_H3_VAE_HPP__
 #define __SD_MODEL_VAE_MINIMAX_H3_VAE_HPP__
 
+#include <thread>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -13,6 +17,7 @@
 #include "model/common/rope.hpp"
 #include "model/diffusion/dit.hpp"
 #include "model/vae/vae.hpp"
+#include "runtime/tiling.h"
 
 namespace MiniMaxH3VAE {
 
@@ -244,6 +249,37 @@ namespace MiniMaxH3VAE {
         return ggml_concat(ctx, rotated, tail, 0);
     }
 
+    // Same arithmetic as apply_partial_rope: rotated channel i of each half is
+    // x_lo[i] * pe[0][j][i] + x_hi[i] * pe[1][j][i] as separate mul/mul/add ops, and the tail is
+    // copied unchanged. The halves are read as [half, L, n_head, N] views of the projection
+    // layout, so the per-half permutes, repeats and the tail permute + concat of the generic
+    // path disappear. rope_a / rope_b are the [head_dim, L] coefficient tables built by
+    // MiniMaxH3VideoVAERunner::build_rope_tables. Returns [head_dim, L, n_head * N].
+    static ggml_tensor* apply_partial_rope_tables(ggml_context* ctx,
+                                                  ggml_tensor* x,
+                                                  ggml_tensor* rope_a,
+                                                  ggml_tensor* rope_b,
+                                                  int64_t rot_dim) {
+        const int64_t half = rot_dim / 2;
+        auto heads_view    = [&](int64_t start, int64_t width) {
+            auto view = ggml_view_4d(ctx, x, width, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], start * x->nb[0]);
+            return ggml_permute(ctx, view, 0, 2, 1, 3);  // [width, L, n_head, N]
+        };
+        auto table = [&](ggml_tensor* t, int64_t start) {
+            return ggml_view_2d(ctx, t, half, t->ne[2], t->nb[2], start * t->nb[0]);  // [half, L]
+        };
+        auto lo  = heads_view(0, half);
+        auto hi  = heads_view(half, half);
+        auto out = ggml_concat(ctx,
+                               ggml_add(ctx, ggml_mul(ctx, lo, table(rope_a, 0)), ggml_mul(ctx, hi, table(rope_b, 0))),
+                               ggml_add(ctx, ggml_mul(ctx, lo, table(rope_b, half)), ggml_mul(ctx, hi, table(rope_a, half))),
+                               0);
+        if (rot_dim < x->ne[0]) {
+            out = ggml_concat(ctx, out, ggml_cont(ctx, heads_view(rot_dim, x->ne[0] - rot_dim)), 0);
+        }
+        return ggml_reshape_3d(ctx, out, out->ne[0], out->ne[1], out->ne[2] * out->ne[3]);
+    }
+
     struct DecoderAttention : public GGMLBlock {
         static constexpr int num_head = 32;
         static constexpr int head_dim = 64;
@@ -254,52 +290,156 @@ namespace MiniMaxH3VAE {
             blocks["to_out"] = std::make_shared<Linear>(dim, dim, true);
         }
 
+        // Single-tile flash-attention decode: one ggml_rope_pe_permute per tensor replaces the table RoPE +
+        // chunk / permute / cast chain, bit-identically. nullptr when it does not apply (SD_H3_VAE_FUSED_QKV=0).
+        ggml_tensor* forward_head_major(GGMLRunnerContext* ctx,
+                                        ggml_tensor* qkv,
+                                        ggml_tensor* pe,
+                                        ggml_tensor* rope_a,
+                                        ggml_tensor* rope_b) {
+#ifndef SD_GGML_H3_FUSED_OPS
+            return nullptr;
+#else
+            static const bool enabled = [] {
+                const char* v = getenv("SD_H3_VAE_FUSED_QKV");
+                return v == nullptr || v[0] == '\0' || atoi(v) != 0;
+            }();
+            // rope_a / rope_b are only passed with SD_H3_VAE_GRAPH_OPT on; that path is what this replaces
+            if (!enabled || rope_a == nullptr || rope_b == nullptr || pe == nullptr || ctx->backend == nullptr ||
+                !ctx->flash_attn_enabled || ctx->sage_attn_enabled || qkv->type != GGML_TYPE_F32 ||
+                qkv->ne[3] != 1 || qkv->nb[0] != sizeof(float)) {
+                return nullptr;
+            }
+            const int64_t sequence = qkv->ne[2];
+            const int n_rot        = static_cast<int>(pe->ne[2] * 2);
+            if (pe->type != GGML_TYPE_F32 || !ggml_is_contiguous(pe) || pe->ne[0] != 2 || pe->ne[1] != 2 ||
+                pe->ne[3] != sequence || n_rot > head_dim) {
+                return nullptr;
+            }
+            const float kv_scale = ctx->attn_scale > 0.f ? ctx->attn_scale : 1.f;
+            auto part            = [&](int index) {
+                return ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_head, sequence, 1,
+                                    qkv->nb[1], qkv->nb[2], qkv->nb[3], index * head_dim * sizeof(float));
+            };
+            ggml_tensor* q = nullptr;
+            ggml_tensor* k = nullptr;
+#ifdef SD_GGML_H3_FUSED_QK_NORM
+            // same reduction as GGML_OP_RMS_NORM where supported (SD_H3_VAE_FUSED_QK_NORM=0 keeps it separate)
+            static const bool fuse_norm = [] {
+                const char* v = getenv("SD_H3_VAE_FUSED_QK_NORM");
+                return v == nullptr || v[0] == '\0' || atoi(v) != 0;
+            }();
+            if (fuse_norm) {
+                q = ggml_rope_pe_permute_rms(ctx->ggml_ctx, part(0), pe, n_rot, 1.f, GGML_TYPE_F32, 1e-5f);
+                k = ggml_rope_pe_permute_rms(ctx->ggml_ctx, part(1), pe, n_rot, kv_scale, GGML_TYPE_F16, 1e-5f);
+                if (!ggml_backend_supports_op(ctx->backend, q) || !ggml_backend_supports_op(ctx->backend, k)) {
+                    q = k = nullptr;
+                }
+            }
+#endif
+            if (q == nullptr) {
+                q = ggml_rope_pe_permute(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, part(0), 1e-5f), pe, n_rot, 1.f, GGML_TYPE_F32);
+                k = ggml_rope_pe_permute(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, part(1), 1e-5f), pe, n_rot, kv_scale, GGML_TYPE_F16);
+            }
+            auto v = ggml_rope_pe_permute(ctx->ggml_ctx, part(2), nullptr, 0, kv_scale, GGML_TYPE_F16);
+            if (!ggml_backend_supports_op(ctx->backend, q) || !ggml_backend_supports_op(ctx->backend, k) ||
+                !ggml_backend_supports_op(ctx->backend, v)) {
+                return nullptr;
+            }
+            q = ggml_reshape_3d(ctx->ggml_ctx, q, head_dim, sequence, num_head);
+            k = ggml_reshape_3d(ctx->ggml_ctx, k, head_dim, sequence, num_head);
+            v = ggml_reshape_3d(ctx->ggml_ctx, v, head_dim, sequence, num_head);
+            return ggml_ext_attention_prepared(ctx->ggml_ctx, ctx->backend, q, k, v, num_head, 1, kv_scale);
+#endif
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
-                             ggml_tensor* pe) {
+                             ggml_tensor* pe,
+                             ggml_tensor* rope_a = nullptr,
+                             ggml_tensor* rope_b = nullptr,
+                             int64_t flat_tiles  = 1) {
             auto to_qkv         = std::dynamic_pointer_cast<Linear>(blocks["to_qkv"]);
             auto to_out         = std::dynamic_pointer_cast<Linear>(blocks["to_out"]);
             auto qkv_projection = to_qkv->forward(ctx, x);
-            int64_t sequence    = x->ne[1];
-            int64_t batch_size  = x->ne[2] * x->ne[3];
-            qkv_projection      = ggml_reshape_4d(ctx->ggml_ctx,
-                                                  qkv_projection,
-                                                  3 * head_dim,
-                                                  num_head,
-                                                  sequence,
-                                                  batch_size);
-            auto qkv            = ggml_ext_chunk(ctx->ggml_ctx, qkv_projection, 3, 0);
-            auto q              = ggml_reshape_4d(ctx->ggml_ctx,
-                                                  qkv[0],
-                                                  head_dim,
-                                                  num_head,
-                                                  sequence,
-                                                  batch_size);
-            auto k              = ggml_reshape_4d(ctx->ggml_ctx,
-                                                  qkv[1],
-                                                  head_dim,
-                                                  num_head,
-                                                  sequence,
-                                                  batch_size);
-            auto v              = ggml_reshape_4d(ctx->ggml_ctx,
-                                                  qkv[2],
-                                                  head_dim,
-                                                  num_head,
-                                                  sequence,
-                                                  batch_size);
-            q                   = ggml_rms_norm(ctx->ggml_ctx, q, 1e-5f);
-            k                   = ggml_rms_norm(ctx->ggml_ctx, k, 1e-5f);
-            q                   = apply_partial_rope(ctx->ggml_ctx, q, pe);
-            k                   = apply_partial_rope(ctx->ggml_ctx, k, pe);
-            auto out            = ggml_ext_attention_ext(ctx,
-                                                         q,
-                                                         k,
-                                                         v,
-                                                         num_head,
-                                                         nullptr,
-                                                         true,
-                                                         ctx->flash_attn_enabled);
-            return to_out->forward(ctx, out);
+            int64_t sequence    = x->ne[1] / flat_tiles;
+            int64_t batch_size  = x->ne[2] * x->ne[3] * flat_tiles;
+            auto project_out    = [&](ggml_tensor* attn) {
+                if (flat_tiles > 1) {
+                    attn = ggml_reshape_2d(ctx->ggml_ctx, attn, attn->ne[0], attn->ne[1] * attn->ne[2] * attn->ne[3]);
+                }
+                return to_out->forward(ctx, attn);
+            };
+            qkv_projection = ggml_reshape_4d(ctx->ggml_ctx,
+                                             qkv_projection,
+                                             3 * head_dim,
+                                             num_head,
+                                             sequence,
+                                             batch_size);
+            if (auto fused = forward_head_major(ctx, qkv_projection, pe, rope_a, rope_b)) {
+                return project_out(fused);
+            }
+            auto qkv       = ggml_ext_chunk(ctx->ggml_ctx, qkv_projection, 3, 0);
+            auto q         = ggml_reshape_4d(ctx->ggml_ctx,
+                                             qkv[0],
+                                             head_dim,
+                                             num_head,
+                                             sequence,
+                                             batch_size);
+            auto k         = ggml_reshape_4d(ctx->ggml_ctx,
+                                             qkv[1],
+                                             head_dim,
+                                             num_head,
+                                             sequence,
+                                             batch_size);
+            auto v         = ggml_reshape_4d(ctx->ggml_ctx,
+                                             qkv[2],
+                                             head_dim,
+                                             num_head,
+                                             sequence,
+                                             batch_size);
+            q              = ggml_rms_norm(ctx->ggml_ctx, q, 1e-5f);
+            k              = ggml_rms_norm(ctx->ggml_ctx, k, 1e-5f);
+            if (rope_a != nullptr && rope_b != nullptr) {
+                q = apply_partial_rope_tables(ctx->ggml_ctx, q, rope_a, rope_b, pe->ne[2] * 2);
+                k = apply_partial_rope_tables(ctx->ggml_ctx, k, rope_a, rope_b, pe->ne[2] * 2);
+            } else {
+                q = apply_partial_rope(ctx->ggml_ctx, q, pe);
+                k = apply_partial_rope(ctx->ggml_ctx, k, pe);
+            }
+            const int64_t tiles = v->ne[3];
+            if (tiles > 1) {
+                // Attention kernels split their work by the total problem size (flash attention's
+                // stream-k, batched GEMM heuristics), so a batched call can sum in a different order
+                // than a single-tile call. One call per tile keeps each tile identical to the unbatched decode.
+                std::vector<ggml_tensor*> outs;
+                for (int64_t n = 0; n < tiles; ++n) {
+                    auto qn = ggml_view_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], num_head, q->nb[1], q->nb[2], n * num_head * q->nb[2]);
+                    auto kn = ggml_view_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], num_head, k->nb[1], k->nb[2], n * num_head * k->nb[2]);
+                    auto vn = ggml_view_4d(ctx->ggml_ctx, v, v->ne[0], v->ne[1], v->ne[2], 1, v->nb[1], v->nb[2], v->nb[3], n * v->nb[3]);
+                    outs.push_back(ggml_ext_attention_ext(ctx, qn, kn, vn, num_head, nullptr, true, ctx->flash_attn_enabled));
+                }
+                while (outs.size() > 1) {
+                    std::vector<ggml_tensor*> merged;
+                    for (size_t i = 0; i + 1 < outs.size(); i += 2) {
+                        merged.push_back(ggml_concat(ctx->ggml_ctx, outs[i], outs[i + 1], 2));
+                    }
+                    if (outs.size() % 2 == 1) {
+                        merged.push_back(outs.back());
+                    }
+                    outs = std::move(merged);
+                }
+                return project_out(outs[0]);
+            }
+            auto out = ggml_ext_attention_ext(ctx,
+                                              q,
+                                              k,
+                                              v,
+                                              num_head,
+                                              nullptr,
+                                              true,
+                                              ctx->flash_attn_enabled);
+            return project_out(out);
         }
     };
 
@@ -312,9 +452,13 @@ namespace MiniMaxH3VAE {
             blocks["w2"] = std::make_shared<Linear>(kInnerDim, dim, true);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
-            auto w1   = std::dynamic_pointer_cast<Linear>(blocks["w1"]);
-            auto w2   = std::dynamic_pointer_cast<Linear>(blocks["w2"]);
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, bool fused_glu = false) {
+            auto w1 = std::dynamic_pointer_cast<Linear>(blocks["w1"]);
+            auto w2 = std::dynamic_pointer_cast<Linear>(blocks["w2"]);
+            if (fused_glu) {
+                // silu(first half) * second half in one op; same per-element math as silu + mul.
+                return w2->forward(ctx, ggml_swiglu(ctx->ggml_ctx, w1->forward(ctx, x)));
+            }
             auto gate = ggml_ext_chunk(ctx->ggml_ctx, w1->forward(ctx, x), 2, 0);
             return w2->forward(ctx,
                                ggml_mul(ctx->ggml_ctx,
@@ -344,7 +488,10 @@ namespace MiniMaxH3VAE {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
-                             ggml_tensor* pe) {
+                             ggml_tensor* pe,
+                             ggml_tensor* rope_a = nullptr,
+                             ggml_tensor* rope_b = nullptr,
+                             int64_t flat_tiles  = 1) {
             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
             auto attn  = std::dynamic_pointer_cast<DecoderAttention>(blocks["attn"]);
             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
@@ -352,12 +499,12 @@ namespace MiniMaxH3VAE {
             x          = ggml_add(ctx->ggml_ctx,
                                   x,
                                   ggml_mul(ctx->ggml_ctx,
-                                           attn->forward(ctx, norm1->forward(ctx, x), pe),
+                                           attn->forward(ctx, norm1->forward(ctx, x), pe, rope_a, rope_b, flat_tiles),
                                            params["scale1"]));
             return ggml_add(ctx->ggml_ctx,
                             x,
                             ggml_mul(ctx->ggml_ctx,
-                                     ff->forward(ctx, norm2->forward(ctx, x)),
+                                     ff->forward(ctx, norm2->forward(ctx, x), rope_a != nullptr),
                                      params["scale2"]));
         }
     };
@@ -396,33 +543,61 @@ namespace MiniMaxH3VAE {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* z,
-                             ggml_tensor* pe) {
+                             ggml_tensor* pe,
+                             ggml_tensor* rope_a = nullptr,
+                             ggml_tensor* rope_b = nullptr) {
             int64_t width      = z->ne[0];
             int64_t height     = z->ne[1];
             int64_t num_frames = z->ne[2];
             int64_t batch_size = z->ne[3] / 24;
-            GGML_ASSERT(batch_size == 1);
+            GGML_ASSERT(batch_size * 24 == z->ne[3]);
 
-            z                   = ggml_cont(ctx->ggml_ctx,
-                                            ggml_ext_torch_permute(ctx->ggml_ctx, z, 3, 0, 1, 2));
-            z                   = ggml_reshape_3d(ctx->ggml_ctx,
-                                                  z,
-                                                  24,
-                                                  width * height * num_frames,
-                                                  batch_size);
-            auto x_embedder     = std::dynamic_pointer_cast<Linear>(blocks["x_embedder"]);
-            auto h              = x_embedder->forward(ctx, z);
+            if (batch_size == 1) {
+                z = ggml_cont(ctx->ggml_ctx,
+                              ggml_ext_torch_permute(ctx->ggml_ctx, z, 3, 0, 1, 2));
+                z = ggml_reshape_3d(ctx->ggml_ctx,
+                                    z,
+                                    24,
+                                    width * height * num_frames,
+                                    batch_size);
+            } else {
+                // Tiles are stacked along the channel axis, tile-major: [W, H, T, 24 * N].
+                z = ggml_reshape_3d(ctx->ggml_ctx, z, width * height * num_frames, 24, batch_size);
+                z = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 1, 0, 2, 3));
+            }
+            // Batched tiles run every projection as one 2D matmul over all tiles' tokens. A 3D
+            // activation would broadcast the weight through cublasGemmBatchedEx, whose results
+            // did not match the single-tile GEMM.
+            const bool flat = batch_size > 1;
+            auto x_embedder = std::dynamic_pointer_cast<Linear>(blocks["x_embedder"]);
+            ggml_tensor* h  = nullptr;
+            if (flat) {
+                h = x_embedder->forward(ctx, ggml_reshape_2d(ctx->ggml_ctx, z, z->ne[0], z->ne[1] * z->ne[2]));
+                h = ggml_reshape_3d(ctx->ggml_ctx, h, h->ne[0], z->ne[1], z->ne[2]);
+            } else {
+                h = x_embedder->forward(ctx, z);
+            }
             int64_t num_patches = h->ne[1];
-            h                   = ggml_concat(ctx->ggml_ctx, h, params["register_tokens"], 1);
-            auto zero           = ggml_ext_scale(ctx->ggml_ctx,
-                                                 ggml_ext_slice(ctx->ggml_ctx, h, 1, 0, 1),
-                                                 0.f);
-            h                   = ggml_concat(ctx->ggml_ctx, h, zero, 1);
+            auto registers      = params["register_tokens"];
+            if (batch_size > 1) {
+                registers = ggml_repeat(ctx->ggml_ctx,
+                                        registers,
+                                        ggml_new_tensor_3d(ctx->ggml_ctx, registers->type, dim, num_register_tokens, batch_size));
+            }
+            h         = ggml_concat(ctx->ggml_ctx, h, registers, 1);
+            auto zero = ggml_ext_scale(ctx->ggml_ctx,
+                                       ggml_ext_slice(ctx->ggml_ctx, h, 1, 0, 1),
+                                       0.f);
+            h         = ggml_concat(ctx->ggml_ctx, h, zero, 1);
 
+            const int64_t tokens = h->ne[1];
+            if (flat) {
+                h = ggml_reshape_2d(ctx->ggml_ctx, h, h->ne[0], tokens * batch_size);
+            }
             for (int i = 0; i < num_layers; ++i) {
                 auto block = std::dynamic_pointer_cast<DecoderBlock>(
                     blocks["transformer_blocks." + std::to_string(i)]);
-                h = block->forward(ctx, h, pe);
+                h = block->forward(ctx, h, pe, rope_a, rope_b, flat ? batch_size : 1);
                 sd::ggml_graph_cut::mark_graph_cut(h,
                                                    "minimax_h3_vae.decoder.blocks." + std::to_string(i),
                                                    "hidden_states");
@@ -431,7 +606,10 @@ namespace MiniMaxH3VAE {
             auto norm_out = std::dynamic_pointer_cast<LayerNorm>(blocks["norm_out"]);
             auto proj_out = std::dynamic_pointer_cast<Linear>(blocks["proj_out"]);
             h             = proj_out->forward(ctx, norm_out->forward(ctx, h));
-            h             = ggml_ext_slice(ctx->ggml_ctx, h, 1, 0, num_patches);
+            if (flat) {
+                h = ggml_reshape_3d(ctx->ggml_ctx, h, h->ne[0], tokens, batch_size);
+            }
+            h = ggml_ext_slice(ctx->ggml_ctx, h, 1, 0, num_patches);
             return DiT::unpatchify_3d(ctx->ggml_ctx,
                                       h,
                                       num_frames,
@@ -448,8 +626,8 @@ namespace MiniMaxH3VAE {
         MiniMaxH3VideoVAE() {
             blocks["encoder"]         = std::make_shared<Encoder>();
             blocks["quant_conv"]      = std::make_shared<Conv3d>(48,
-                                                            48,
-                                                            std::tuple{1, 1, 1});
+                                                                 48,
+                                                                 std::tuple{1, 1, 1});
             blocks["post_quant_conv"] = std::make_shared<Conv3d>(24,
                                                                  24,
                                                                  std::tuple{1, 1, 1});
@@ -473,10 +651,12 @@ namespace MiniMaxH3VAE {
                             ggml_tensor* latent,
                             ggml_tensor* pe,
                             ggml_tensor* pixel_mean,
-                            ggml_tensor* pixel_std) {
+                            ggml_tensor* pixel_std,
+                            ggml_tensor* rope_a = nullptr,
+                            ggml_tensor* rope_b = nullptr) {
             auto post_quant = std::dynamic_pointer_cast<Conv3d>(blocks["post_quant_conv"]);
             auto decoder    = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
-            auto pixels     = decoder->forward(ctx, post_quant->forward(ctx, latent), pe);
+            auto pixels     = decoder->forward(ctx, post_quant->forward(ctx, latent), pe, rope_a, rope_b);
             pixels          = ggml_add(ctx->ggml_ctx,
                                        ggml_mul(ctx->ggml_ctx, pixels, pixel_std),
                                        pixel_mean);
@@ -491,6 +671,9 @@ namespace MiniMaxH3VAE {
         sd::Tensor<float> latents_mean;
         sd::Tensor<float> latents_std;
         sd::Tensor<float> rope_cache;
+        sd::Tensor<float> rope_a_cache;
+        sd::Tensor<float> rope_b_cache;
+        std::array<int64_t, 4> rope_key_ = {0, 0, 0, 0};
 
         MiniMaxH3VideoVAERunner(ggml_backend_t backend,
                                 const String2TensorStorage& tensor_storage_map,
@@ -562,6 +745,13 @@ namespace MiniMaxH3VAE {
             params.tile_size_x     = 16;
             params.tile_size_y     = 16;
             params.target_overlap  = 0.25f;
+            // SD_H3_VAE_TILE=N: opt-in N x N latent tiles; the seams move, so frames differ from the default
+            if (const char* tile = getenv("SD_H3_VAE_TILE")) {
+                const int n = atoi(tile);
+                if (n >= 8) {
+                    params.tile_size_x = params.tile_size_y = n;
+                }
+            }
             return params;
         }
 
@@ -576,27 +766,31 @@ namespace MiniMaxH3VAE {
         }
 
         static sd::Tensor<float> blend_temporal(const sd::Tensor<float>& previous,
-                                                const sd::Tensor<float>& current,
+                                                sd::Tensor<float> current,
                                                 int64_t extent) {
-            auto output            = current;
             extent                 = std::min({extent, previous.shape()[2], current.shape()[2]});
             int64_t previous_start = previous.shape()[2] - extent;
+            GGML_ASSERT(previous.dim() == 5 && current.dim() == 5 && previous.shape()[0] == current.shape()[0] &&
+                        previous.shape()[1] == current.shape()[1] && previous.shape()[3] == current.shape()[3] &&
+                        previous.shape()[4] == current.shape()[4]);
+            const int64_t plane           = current.shape()[0] * current.shape()[1];
+            const int64_t previous_frames = previous.shape()[2];
+            const int64_t current_frames  = current.shape()[2];
             for (int64_t b = 0; b < current.shape()[4]; ++b) {
                 for (int64_t c = 0; c < current.shape()[3]; ++c) {
+                    const int64_t channel = b * current.shape()[3] + c;
                     for (int64_t t = 0; t < extent; ++t) {
-                        float wb = static_cast<float>(t) / extent;
-                        float wa = 1.f - wb;
-                        for (int64_t h = 0; h < current.shape()[1]; ++h) {
-                            for (int64_t w = 0; w < current.shape()[0]; ++w) {
-                                output.index(w, h, t, c, b) =
-                                    previous.index(w, h, previous_start + t, c, b) * wa +
-                                    current.index(w, h, t, c, b) * wb;
-                            }
+                        float wb        = static_cast<float>(t) / extent;
+                        float wa        = 1.f - wb;
+                        const float* pa = previous.data() + (channel * previous_frames + previous_start + t) * plane;
+                        float* pb       = current.data() + (channel * current_frames + t) * plane;
+                        for (int64_t i = 0; i < plane; ++i) {
+                            pb[i] = pa[i] * wa + pb[i] * wb;
                         }
                     }
                 }
             }
-            return output;
+            return current;
         }
 
         sd::Tensor<float> encode(int n_threads,
@@ -688,25 +882,27 @@ namespace MiniMaxH3VAE {
                 input.shape()[2],
                 {static_cast<int>(tokens_per_chunk + token_overlap), static_cast<int>(token_overlap)});
             GGML_ASSERT(plan.tiles.size() == static_cast<size_t>(num_chunks));
-            auto result = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& chunk, const VAETemporalTile& tile) {
-                auto decoded = VAE::decode(n_threads,
-                                           chunk,
-                                           tiling,
-                                           true,
-                                           circular_x,
-                                           circular_y,
-                                           silent);
-                if (decoded.empty()) {
-                    return sd::Tensor<float>();
+            const bool keep_resident = env_int("SD_H3_VAE_KEEP_RESIDENT", 1) != 0;
+            // SD_H3_VAE_REUSE_MEMQUERY=0 queries the device for every capacity check.
+            set_reuse_device_query(env_int("SD_H3_VAE_REUSE_MEMQUERY", 1) != 0);
+            struct ReuseQueryGuard {
+                GGMLRunner& runner;
+                ~ReuseQueryGuard() {
+                    runner.set_reuse_device_query(false);
                 }
-
+            } reuse_query_guard{*this};
+            tile_batch_              = 0;
+            per_tile_compute_bytes_  = 0;
+            std::vector<sd::Tensor<float>> pieces;
+            // Runs in chunk order, on a worker thread unless SD_H3_VAE_ASYNC_ASSEMBLY=0.
+            auto assemble = [&](const sd::Tensor<float>& decoded, const VAETemporalTile& tile) {
                 int64_t first_end = std::min<int64_t>(frames_per_chunk, decoded.shape()[2]);
                 auto first        = sd::ops::slice(decoded,
                                                    2,
                                                    std::min<int64_t>(frame_pre_padding, first_end),
                                                    first_end);
                 if (!overlap.empty()) {
-                    first   = blend_temporal(overlap, first, frame_overlap);
+                    first   = blend_temporal(overlap, std::move(first), frame_overlap);
                     overlap = {};
                 }
 
@@ -721,17 +917,274 @@ namespace MiniMaxH3VAE {
                     overlap = {};
                 }
                 return first;
-            });
-            if (result.empty()) {
-                return {};
-            }
-
+            };
+            const bool async_assembly = env_int("SD_H3_VAE_ASYNC_ASSEMBLY", 1) != 0;
+            std::thread assembler;
+            bool assembly_failed = false;
             int64_t expected_frames = input.shape()[2] <= 1 ? 1 : ((x.shape()[2] - 2) / 5) * 17 + 5;
             expected_frames         = std::max<int64_t>(1, expected_frames);
+            // keeps the same frames concat_frames + slice would
+            sd::Tensor<float> result;
+            int64_t frame_offset = 0;
+            auto append_piece    = [&](const sd::Tensor<float>& piece) {
+                GGML_ASSERT(piece.dim() == 5);
+                if (result.empty()) {
+                    std::vector<int64_t> shape = piece.shape();
+                    shape[2]                   = expected_frames;
+                    result                     = sd::Tensor<float>(std::move(shape));
+                }
+                GGML_ASSERT(piece.shape()[0] == result.shape()[0] && piece.shape()[1] == result.shape()[1] &&
+                            piece.shape()[3] == result.shape()[3] && piece.shape()[4] == result.shape()[4]);
+                const int64_t piece_frames = piece.shape()[2];
+                const int64_t keep         = std::min<int64_t>(piece_frames, expected_frames - frame_offset);
+                const int64_t plane        = piece.shape()[0] * piece.shape()[1];
+                const int64_t planes       = piece.shape()[3] * piece.shape()[4];
+                for (int64_t p = 0; keep > 0 && p < planes; ++p) {
+                    memcpy(result.data() + (p * expected_frames + frame_offset) * plane,
+                           piece.data() + p * piece_frames * plane,
+                           sizeof(float) * keep * plane);
+                }
+                frame_offset += std::max<int64_t>(keep, 0);
+            };
+            auto run_assembly = [&](const sd::Tensor<float>& decoded, const VAETemporalTile& tile) {
+                try {
+                    if (async_assembly) {
+                        append_piece(assemble(decoded, tile));
+                    } else {
+                        pieces.push_back(assemble(decoded, tile));
+                    }
+                } catch (const std::exception& error) {
+                    LOG_ERROR("MiniMax-H3 video VAE: chunk assembly failed: %s", error.what());
+                    assembly_failed = true;
+                }
+            };
+            auto join_assembler = [&]() {
+                if (assembler.joinable()) {
+                    assembler.join();
+                }
+            };
+            struct AssemblerGuard {
+                std::thread& thread;
+                ~AssemblerGuard() {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+            } assembler_guard{assembler};
+            bool failed = false;
+            for (const auto& tile : plan.tiles) {
+                auto decoded = decode_spatial_tiles(n_threads,
+                                                    sd::ops::slice(input, 2, tile.start, tile.end),
+                                                    tiling,
+                                                    circular_x,
+                                                    circular_y,
+                                                    silent);
+                if (!keep_resident) {
+                    runner_end();
+                }
+                join_assembler();
+                if (decoded.empty() || assembly_failed) {
+                    failed = true;
+                    break;
+                }
+                if (async_assembly && !tile.last) {
+                    auto chunk = std::make_shared<sd::Tensor<float>>(std::move(decoded));
+                    try {
+                        assembler = std::thread([&run_assembly, chunk, tile]() {
+                            run_assembly(*chunk, tile);
+                        });
+                    } catch (const std::system_error&) {
+                        run_assembly(*chunk, tile);  // no thread available: assemble inline
+                    }
+                } else {
+                    run_assembly(decoded, tile);
+                }
+            }
+            join_assembler();
+            runner_end();
+            if (failed || assembly_failed) {
+                return {};
+            }
+            if (async_assembly) {
+                if (result.empty()) {
+                    return {};
+                }
+                if (frame_offset < expected_frames) {
+                    result = sd::ops::slice(result, 2, 0, frame_offset);
+                }
+                return result;
+            }
+            if (pieces.empty()) {
+                return {};
+            }
+            result = concat_frames(pieces);
             if (result.shape()[2] > expected_frames) {
                 result = sd::ops::slice(result, 2, 0, expected_frames);
             }
             return result;
+        }
+
+        int tile_batch_                = 0;
+        size_t per_tile_compute_bytes_ = 0;
+
+        static int env_int(const char* name, int fallback) {
+            const char* value = getenv(name);
+            if (value == nullptr || value[0] == '\0') {
+                return fallback;
+            }
+            return atoi(value);
+        }
+
+        static sd::Tensor<float> concat_frames(const std::vector<sd::Tensor<float>>& pieces) {
+            std::vector<int64_t> shape = pieces[0].shape();
+            int64_t frames             = 0;
+            for (const auto& piece : pieces) {
+                GGML_ASSERT(piece.dim() == 5 && piece.shape()[0] == shape[0] && piece.shape()[1] == shape[1] &&
+                            piece.shape()[3] == shape[3] && piece.shape()[4] == shape[4]);
+                frames += piece.shape()[2];
+            }
+            shape[2] = frames;
+            sd::Tensor<float> output(shape);
+            const int64_t plane  = shape[0] * shape[1];
+            const int64_t planes = shape[3] * shape[4];
+            int64_t frame_offset = 0;
+            for (const auto& piece : pieces) {
+                const int64_t piece_frames = piece.shape()[2];
+                for (int64_t p = 0; p < planes; ++p) {
+                    memcpy(output.data() + (p * frames + frame_offset) * plane,
+                           piece.data() + p * piece_frames * plane,
+                           sizeof(float) * piece_frames * plane);
+                }
+                frame_offset += piece_frames;
+            }
+            return output;
+        }
+
+        // How many spatial tiles go into one decoder graph. Default 1 (one graph per tile): the
+        // batched graph runs each projection as one matmul over all tiles' tokens, and cuBLAS may
+        // pick a different kernel for the larger M (seen on RTX PRO 6000 Blackwell: 53 dB PSNR vs
+        // the per-tile decode), while it measured no faster there. SD_H3_VAE_TILE_BATCH=N forces N,
+        // SD_H3_VAE_TILE_BATCH=auto runs the first tile alone, measures its compute buffer and sizes
+        // the batch from the free device memory.
+        int resolve_tile_batch() {
+            const char* mode = getenv("SD_H3_VAE_TILE_BATCH");
+            if (mode == nullptr || mode[0] == '\0') {
+                return 1;
+            }
+            int forced = strcmp(mode, "auto") == 0 ? 0 : atoi(mode);
+            if (forced > 0) {
+                return forced;
+            }
+            if (sd_backend_is_cpu(runtime_backend)) {
+                return 1;
+            }
+            if (per_tile_compute_bytes_ == 0) {
+                return 1;
+            }
+            if (tile_batch_ > 0) {
+                return tile_batch_;
+            }
+            size_t free_bytes      = 0;
+            size_t total_bytes     = 0;
+            ggml_backend_dev_t dev = ggml_backend_get_device(runtime_backend);
+            if (dev == nullptr) {
+                tile_batch_ = 1;
+                return tile_batch_;
+            }
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            const size_t reserve   = std::max<size_t>(size_t(1) << 30, total_bytes / 10);
+            const size_t available = free_bytes > reserve ? free_bytes - reserve : 0;
+            // Sized as if the single-tile buffer were still held while the batched one is allocated.
+            int batch   = static_cast<int>(available / per_tile_compute_bytes_);
+            int limit   = std::max(1, env_int("SD_H3_VAE_TILE_BATCH_MAX", 4));
+            tile_batch_ = std::max(1, std::min(batch, limit));
+            LOG_INFO("MiniMax-H3 video VAE: %d tile(s) per decoder graph (%.0f MB per tile, %.0f MB free)",
+                     tile_batch_,
+                     per_tile_compute_bytes_ / (1024.0 * 1024.0),
+                     free_bytes / (1024.0 * 1024.0));
+            return tile_batch_;
+        }
+
+        // Tiles are stacked along the channel axis, so decoder output tile i is the i-th contiguous
+        // block of the [W, H, T, 3 * N, 1] result.
+        TileBatchOutput compute_tile_batch(int n_threads,
+                                           const std::vector<sd::Tensor<float>>& tiles) {
+            TileBatchOutput output;
+            output.stack_dim = 3;
+            if (tiles.size() == 1) {
+                output.data = _compute(n_threads, tiles[0], true);
+                if (per_tile_compute_bytes_ == 0) {
+                    per_tile_compute_bytes_ = reusable_compute_buffer_bytes();
+                }
+                return output;
+            }
+            auto batched = ensure_video_shape(tiles[0]);
+            for (size_t i = 1; i < tiles.size(); ++i) {
+                batched = sd::ops::concat(batched, ensure_video_shape(tiles[i]), 3);
+            }
+            output.data = _compute(n_threads, batched, true);
+            return output;
+        }
+
+        sd::Tensor<float> decode_spatial_tiles(int n_threads,
+                                               const sd::Tensor<float>& chunk,
+                                               const sd_tiling_params_t& tiling,
+                                               bool circular_x,
+                                               bool circular_y,
+                                               bool silent) {
+            const int scale_factor = get_scale_factor();
+            float tile_overlap;
+            int tile_size_x, tile_size_y;
+            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling, chunk.shape()[0], chunk.shape()[1]);
+            return process_tiles_2d_batched(
+                chunk,
+                static_cast<int>(chunk.shape()[0] * scale_factor),
+                static_cast<int>(chunk.shape()[1] * scale_factor),
+                scale_factor,
+                tile_size_x,
+                tile_size_y,
+                tile_overlap,
+                circular_x,
+                circular_y,
+                [&](int) { return resolve_tile_batch(); },
+                [&](const std::vector<sd::Tensor<float>>& tiles) {
+                    auto output = compute_tile_batch(n_threads, tiles);
+                    if (output.data.empty()) {
+                        LOG_ERROR("vae decode compute failed while processing a tile");
+                    }
+                    return output;
+                },
+                silent);
+        }
+
+        // rope_cache is [2, 2, half, L] = [[cos, -sin], [sin, cos]] per (pair, position). Rotated
+        // output d = i + half * j is x_lo[i] * pe[0][j][i] + x_hi[i] * pe[1][j][i]; tables hold the
+        // coefficient of x[d] (a) and of its partner x[d +- half] (b) for every head channel d.
+        void build_rope_tables() {
+            constexpr int64_t head_dim = DecoderAttention::head_dim;
+            const int64_t half         = rope_cache.shape()[2];
+            const int64_t positions    = rope_cache.shape()[3];
+            GGML_ASSERT(rope_cache.shape()[0] == 2 && rope_cache.shape()[1] == 2 && half * 2 <= head_dim);
+            rope_a_cache    = sd::Tensor<float>({head_dim, 1, positions});
+            rope_b_cache    = sd::Tensor<float>({head_dim, 1, positions});
+            const float* pe = rope_cache.data();
+            auto pe_at      = [&](int64_t a, int64_t j, int64_t i, int64_t l) {
+                return pe[((l * half + i) * 2 + j) * 2 + a];
+            };
+            for (int64_t l = 0; l < positions; ++l) {
+                float* a = rope_a_cache.data() + l * head_dim;
+                float* b = rope_b_cache.data() + l * head_dim;
+                for (int64_t i = 0; i < half; ++i) {
+                    a[i]        = pe_at(0, 0, i, l);
+                    b[i]        = pe_at(1, 0, i, l);
+                    a[half + i] = pe_at(1, 1, i, l);
+                    b[half + i] = pe_at(0, 1, i, l);
+                }
+                for (int64_t d = half * 2; d < head_dim; ++d) {
+                    a[d] = 1.f;
+                    b[d] = 0.f;
+                }
+            }
         }
 
         sd::Tensor<float> build_rope(int64_t width,
@@ -767,11 +1220,19 @@ namespace MiniMaxH3VAE {
         sd::Tensor<float> _compute(const int n_threads,
                                    const sd::Tensor<float>& z,
                                    bool decode_graph) override {
-            auto input = ensure_video_shape(z);
+            auto input           = ensure_video_shape(z);
+            const bool graph_opt = decode_graph && env_int("SD_H3_VAE_GRAPH_OPT", 1) != 0;
             if (decode_graph) {
-                rope_cache = build_rope(input.shape()[0],
-                                        input.shape()[1],
-                                        input.shape()[2]);
+                const std::array<int64_t, 4> rope_key = {input.shape()[0], input.shape()[1], input.shape()[2], graph_opt ? 1 : 0};
+                if (rope_key != rope_key_ || rope_cache.empty()) {
+                    rope_cache = build_rope(input.shape()[0],
+                                            input.shape()[1],
+                                            input.shape()[2]);
+                    if (graph_opt) {
+                        build_rope_tables();
+                    }
+                    rope_key_ = rope_key;
+                }
             }
             auto get_graph = [&]() -> ggml_cgraph* {
                 auto value       = make_input(input);
@@ -780,8 +1241,10 @@ namespace MiniMaxH3VAE {
                 auto runner_ctx  = get_context();
                 ggml_tensor* out = nullptr;
                 if (decode_graph) {
-                    auto pe = make_input(rope_cache);
-                    out     = model.decode(&runner_ctx, value, pe, mean, std);
+                    auto pe            = make_input(rope_cache);
+                    ggml_tensor* ropea = graph_opt ? make_input(rope_a_cache) : nullptr;
+                    ggml_tensor* ropeb = graph_opt ? make_input(rope_b_cache) : nullptr;
+                    out                = model.decode(&runner_ctx, value, pe, mean, std, ropea, ropeb);
                 } else {
                     out = model.encode(&runner_ctx, value, mean, std);
                 }

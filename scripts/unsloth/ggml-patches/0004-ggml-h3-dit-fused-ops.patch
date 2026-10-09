@@ -1,0 +1,1020 @@
+From 04e9fe6c85b680c2f8e29c22e084dab6012babbe Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 1 Oct 2026 06:48:01 -0700
+Subject: [PATCH] ggml : fused value-preserving ops for adaLN DiT blocks
+
+Three ops that replace long chains of elementwise ops, copies and concats in
+diffusion transformers such as MiniMax-H3 while producing the same bits as the
+chains they replace (every product, sum, scale and conversion is rounded
+separately, never contracted into an FMA):
+
+- ggml_rope_pe_permute: rotary embedding with a precomputed [cos, -sin; sin,
+  cos] table on the first n_rot channels (non-interleaved pairing), pass-through
+  for the rest, written in the head-major [d, tokens, heads] layout attention
+  reads, with an optional scale and F16 cast. Reads a strided view, so the
+  q/k/v chunks of a fused qkv projection need no copies.
+- ggml_modulate_rows / ggml_gated_add_rows: (x + x*scale) + shift and
+  base + u*gate on a row range, written in place into an accumulator so a
+  sequence split into segments with different modulation vectors needs no
+  slice copies and no concat. Optional output / input scale.
+- ggml_swiglu_scaled: silu(s_in*a) * (s_in*b) scaled by s_out, i.e. a Linear
+  output scale, swiglu and the next Linear input scale in one pass.
+
+CPU and CUDA implementations; other backends report the ops unsupported so
+callers keep their unfused graphs. test-backend-ops covers strided inputs,
+partial and full rotation, F32/F16 outputs, chained segments and the scales.
+---
+ include/ggml.h                  |  62 ++++++++++++
+ src/ggml-backend-meta.cpp       |   3 +-
+ src/ggml-cpu/ggml-cpu.c         |  15 +++
+ src/ggml-cpu/ops.cpp            | 154 +++++++++++++++++++++++++++++
+ src/ggml-cpu/ops.h              |   3 +
+ src/ggml-cuda/ggml-cuda.cu      |  17 ++++
+ src/ggml-cuda/modulate-rows.cu  | 168 ++++++++++++++++++++++++++++++++
+ src/ggml-cuda/modulate-rows.cuh |   7 ++
+ src/ggml-cuda/rope-pe.cu        | 102 +++++++++++++++++++
+ src/ggml-cuda/rope-pe.cuh       |   5 +
+ src/ggml.c                      | 129 +++++++++++++++++++++++-
+ tests/test-backend-ops.cpp      | 139 ++++++++++++++++++++++++++
+ 12 files changed, 801 insertions(+), 3 deletions(-)
+ create mode 100644 src/ggml-cuda/modulate-rows.cu
+ create mode 100644 src/ggml-cuda/modulate-rows.cuh
+ create mode 100644 src/ggml-cuda/rope-pe.cu
+ create mode 100644 src/ggml-cuda/rope-pe.cuh
+
+diff --git a/include/ggml.h b/include/ggml.h
+index 991cc4fc..153eed2a 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -594,6 +594,9 @@ extern "C" {
+ 
+         GGML_OP_QUANTIZE_I8_CONVROT,
+         GGML_OP_SAGE_ATTN,
++        GGML_OP_ROPE_PE_PERMUTE,
++        GGML_OP_MODULATE_ROWS,
++        GGML_OP_SWIGLU_SCALED,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -2461,6 +2464,65 @@ extern "C" {
+             float                 scale,
+             enum ggml_sage_attn_mode mode);
+ 
++    // Rotary embedding with a precomputed cos/sin table, fused with the head-major relayout
++    // attention kernels consume, an optional scale and an optional cast to F16.
++    // a:      F32 [head_dim, n_head, n_tokens, n_batch], rows contiguous (other strides free)
++    // pe:     F32 contiguous [2, 2, n_rot/2, n_tokens], pe[c, r, j, t] = M[r][c] of the 2x2 rotation
++    //         for pair j of token t (non-interleaved pairing j <-> j + n_rot/2); NULL when n_rot == 0
++    // result: `type` (F32 or F16) contiguous [head_dim, n_tokens, n_head, n_batch]
++    //         i <  n_rot: y = a[j]*pe[0, r, j, t] + a[j + n_rot/2]*pe[1, r, j, t] (r = i / (n_rot/2), j = i % (n_rot/2))
++    //         i >= n_rot: y = a[i]
++    //         y = scale*y when scale != 1, then y is converted to `type`.
++    // Each product, the sum, the scale and the conversion are rounded separately, so the result
++    // matches the equivalent chain of ggml_mul/ggml_add/ggml_concat/ggml_scale/ggml_cpy bit for bit.
++    GGML_API struct ggml_tensor * ggml_rope_pe_permute(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * pe,
++            int                   n_rot,
++            float                 scale,
++            enum ggml_type        type);
++
++    // Row-range modulation for adaLN-style blocks whose sequence is split into segments that use
++    // different modulation vectors. Writes rows [row0, row1) along dim 1 (all of dims 2 and 3) of the
++    // result and leaves every other row as it is in `acc`: chain one call per segment, passing the
++    // previous result as `acc` (written in place); the first call passes acc = NULL and gets a new
++    // tensor shaped like x / base. x, base, u: F32 with contiguous rows; scale, shift, gate: F32
++    // with ne[0] == x->ne[0] elements, broadcast over rows.
++    //   ggml_modulate_rows:  y = (x + x*scale) + shift; then y = out_scale*y when out_scale != 1
++    //   ggml_gated_add_rows: w = u_scale*u when u_scale != 1 (else u); y = base + w*gate
++    // Each product, sum and scale is rounded separately, so the result equals the slice +
++    // ggml_mul/ggml_add/ggml_scale + ggml_concat chain bit for bit.
++    GGML_API struct ggml_tensor * ggml_modulate_rows(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * acc,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * scale,
++            struct ggml_tensor  * shift,
++            int64_t               row0,
++            int64_t               row1,
++            float                 out_scale);
++
++    GGML_API struct ggml_tensor * ggml_gated_add_rows(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * acc,
++            struct ggml_tensor  * base,
++            struct ggml_tensor  * u,
++            struct ggml_tensor  * gate,
++            int64_t               row0,
++            int64_t               row1,
++            float                 u_scale);
++
++    // swiglu on two separately scaled halves, then scaled: with a' = in_scale*a, b' = in_scale*b,
++    // y = out_scale*(silu(a')*b') (each scale skipped when it is 1). a, b: F32, same shape, rows
++    // contiguous. Matches ggml_scale -> ggml_swiglu_split -> ggml_scale bit for bit.
++    GGML_API struct ggml_tensor * ggml_swiglu_scaled(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            float                 in_scale,
++            float                 out_scale);
++
+     GGML_API void ggml_flash_attn_ext_set_prec(
+             struct ggml_tensor * a,
+             enum ggml_prec       prec);
+diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
+index 539b4f70..5a34e748 100644
+--- a/src/ggml-backend-meta.cpp
++++ b/src/ggml-backend-meta.cpp
+@@ -151,7 +151,8 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
+ 
+ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+-    if (op->op == GGML_OP_SAGE_ATTN) {
++    if (op->op == GGML_OP_SAGE_ATTN || op->op == GGML_OP_ROPE_PE_PERMUTE ||
++        op->op == GGML_OP_MODULATE_ROWS || op->op == GGML_OP_SWIGLU_SCALED) {
+         return false;
+     }
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 350777c1..d83f15f9 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -2190,6 +2190,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_glu(params, tensor);
+             } break;
++        case GGML_OP_ROPE_PE_PERMUTE:
++            {
++                ggml_compute_forward_rope_pe_permute(params, tensor);
++            } break;
++        case GGML_OP_MODULATE_ROWS:
++            {
++                ggml_compute_forward_modulate_rows(params, tensor);
++            } break;
++        case GGML_OP_SWIGLU_SCALED:
++            {
++                ggml_compute_forward_swiglu_scaled(params, tensor);
++            } break;
+         case GGML_OP_GET_REL_POS:
+             {
+                 ggml_compute_forward_get_rel_pos(params, tensor);
+@@ -2522,6 +2534,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_ROPE:
+         case GGML_OP_ROPE_BACK:
+         case GGML_OP_ADD_REL_POS:
++        case GGML_OP_ROPE_PE_PERMUTE:
++        case GGML_OP_MODULATE_ROWS:
++        case GGML_OP_SWIGLU_SCALED:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 727a4058..40fe1949 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <vector>
+ 
+ struct ggml_fp8_e4m3_cpu {
+     uint8_t value;
+@@ -12136,3 +12137,156 @@ void ggml_compute_forward_quantize_i8_convrot(const ggml_compute_params * params
+         memset(dst_data + rows * dst->nb[1], 0, (size_t)(rows_padded - rows) * dst->nb[1]);
+     }
+ }
++
++// ggml_compute_forward_rope_pe_permute
++
++void ggml_compute_forward_rope_pe_permute(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * pe   = dst->src[1];
++
++    GGML_ASSERT(src0->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
++
++    const int   n_rot = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int   half  = n_rot / 2;
++
++    const int64_t D = src0->ne[0];
++    const int64_t H = src0->ne[1];
++    const int64_t L = src0->ne[2];
++    const int64_t N = src0->ne[3];
++
++    const int64_t nrows = H * L * N;
++    const int64_t dr    = (nrows + params->nth - 1) / params->nth;
++    const int64_t ir0   = dr * params->ith;
++    const int64_t ir1   = MIN(ir0 + dr, nrows);
++
++    // Same rounding points as the unfused graph: each product, the sum, the scale and the
++    // conversion are separate passes, so no contraction into fused multiply-adds can happen.
++    std::vector<float> p0(n_rot), p1(n_rot), y(D);
++
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t h = ir % H;
++        const int64_t l = (ir / H) % L;
++        const int64_t n = ir / (H * L);
++
++        const float * x = (const float *) ((const char *) src0->data + h * src0->nb[1] + l * src0->nb[2] + n * src0->nb[3]);
++
++        if (n_rot > 0) {
++            const float * t = (const float *) pe->data + l * (int64_t) half * 4;
++            for (int i = 0; i < n_rot; ++i) {
++                const int r = i / half;
++                const int j = i - r * half;
++                p0[i]       = x[j] * t[4 * j + 2 * r + 0];
++            }
++            for (int i = 0; i < n_rot; ++i) {
++                const int r = i / half;
++                const int j = i - r * half;
++                p1[i]       = x[j + half] * t[4 * j + 2 * r + 1];
++            }
++            ggml_vec_add_f32(n_rot, y.data(), p0.data(), p1.data());
++        }
++        if (D > n_rot) {
++            memcpy(y.data() + n_rot, x + n_rot, (D - n_rot) * sizeof(float));
++        }
++        if (scale != 1.0f) {
++            ggml_vec_scale_f32((int) D, y.data(), scale);
++        }
++
++        char * out = (char *) dst->data + l * dst->nb[1] + h * dst->nb[2] + n * dst->nb[3];
++        if (dst->type == GGML_TYPE_F32) {
++            memcpy(out, y.data(), D * sizeof(float));
++        } else {
++            ggml_cpu_fp32_to_fp16(y.data(), (ggml_fp16_t *) out, D);
++        }
++    }
++}
++
++// ggml_compute_forward_modulate_rows
++
++void ggml_compute_forward_modulate_rows(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0];
++    const ggml_tensor * b = dst->src[1];
++    const ggml_tensor * c = dst->src[2];
++
++    const int     mode = ggml_get_op_params_i32(dst, 0);
++    const int64_t row0 = ggml_get_op_params_i32(dst, 1);
++    const int64_t row1 = ggml_get_op_params_i32(dst, 2);
++    const float   s    = ggml_get_op_params_f32(dst, 3);
++
++    const int64_t nc    = a->ne[0];
++    const int64_t nr1   = row1 - row0;
++    const int64_t nrows = nr1 * a->ne[2] * a->ne[3];
++    const int64_t dr    = (nrows + params->nth - 1) / params->nth;
++    const int64_t ir0   = dr * params->ith;
++    const int64_t ir1   = MIN(ir0 + dr, nrows);
++
++    // separate passes keep every product, sum and scale individually rounded, as in the unfused graph
++    std::vector<float> t(nc), w(nc);
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t i1 = row0 + ir % nr1;
++        const int64_t i2 = (ir / nr1) % a->ne[2];
++        const int64_t i3 = ir / (nr1 * a->ne[2]);
++
++        const float * x = (const float *) ((const char *) a->data + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
++        float * y       = (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
++
++        if (mode == 0) {
++            ggml_vec_mul_f32((int) nc, t.data(), x, (const float *) b->data);
++            ggml_vec_add_f32((int) nc, w.data(), x, t.data());
++            ggml_vec_add_f32((int) nc, y, w.data(), (const float *) c->data);
++            if (s != 1.0f) {
++                ggml_vec_scale_f32((int) nc, y, s);
++            }
++        } else {
++            const float * u = (const float *) ((const char *) b->data + i1 * b->nb[1] + i2 * b->nb[2] + i3 * b->nb[3]);
++            memcpy(w.data(), u, nc * sizeof(float));
++            if (s != 1.0f) {
++                ggml_vec_scale_f32((int) nc, w.data(), s);
++            }
++            ggml_vec_mul_f32((int) nc, t.data(), w.data(), (const float *) c->data);
++            ggml_vec_add_f32((int) nc, y, x, t.data());
++        }
++    }
++}
++
++// ggml_compute_forward_swiglu_scaled
++
++void ggml_compute_forward_swiglu_scaled(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0];
++    const ggml_tensor * b = dst->src[1];
++
++    const float in_scale  = ggml_get_op_params_f32(dst, 0);
++    const float out_scale = ggml_get_op_params_f32(dst, 1);
++
++    const int64_t nc    = a->ne[0];
++    const int64_t nrows = ggml_nrows(a);
++    const int64_t dr    = (nrows + params->nth - 1) / params->nth;
++    const int64_t ir0   = dr * params->ith;
++    const int64_t ir1   = MIN(ir0 + dr, nrows);
++
++    std::vector<float> xa(nc), xb(nc);
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t i1 = ir % a->ne[1];
++        const int64_t i2 = (ir / a->ne[1]) % a->ne[2];
++        const int64_t i3 = ir / (a->ne[1] * a->ne[2]);
++
++        memcpy(xa.data(), (const char *) a->data + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3], nc * sizeof(float));
++        memcpy(xb.data(), (const char *) b->data + i1 * b->nb[1] + i2 * b->nb[2] + i3 * b->nb[3], nc * sizeof(float));
++        if (in_scale != 1.0f) {
++            ggml_vec_scale_f32((int) nc, xa.data(), in_scale);
++            ggml_vec_scale_f32((int) nc, xb.data(), in_scale);
++        }
++        float * y = (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
++        ggml_vec_swiglu_f32((int) nc, y, xa.data(), xb.data());
++        if (out_scale != 1.0f) {
++            ggml_vec_scale_f32((int) nc, y, out_scale);
++        }
++    }
++}
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 3b579167..e09cc11d 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -98,6 +98,9 @@ void ggml_compute_forward_win_part(const struct ggml_compute_params * params, st
+ void ggml_compute_forward_win_unpart(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_unary(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_rope_pe_permute(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_modulate_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_swiglu_scaled(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_get_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_add_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rwkv_wkv6(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 517d0894..2c0984a0 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -44,6 +44,8 @@
+ #include "ggml-cuda/rope.cuh"
+ #include "ggml-cuda/roll.cuh"
+ #include "ggml-cuda/scale.cuh"
++#include "ggml-cuda/rope-pe.cuh"
++#include "ggml-cuda/modulate-rows.cuh"
+ #include "ggml-cuda/snake.cuh"
+ #include "ggml-cuda/softcap.cuh"
+ #include "ggml-cuda/softmax.cuh"
+@@ -3002,6 +3004,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_SAGE_ATTN:
+             ggml_cuda_sage_attn(ctx, dst);
+             break;
++        case GGML_OP_ROPE_PE_PERMUTE:
++            ggml_cuda_op_rope_pe_permute(ctx, dst);
++            break;
++        case GGML_OP_MODULATE_ROWS:
++            ggml_cuda_op_modulate_rows(ctx, dst);
++            break;
++        case GGML_OP_SWIGLU_SCALED:
++            ggml_cuda_op_swiglu_scaled(ctx, dst);
++            break;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             ggml_cuda_cross_entropy_loss(ctx, dst);
+             break;
+@@ -5886,6 +5897,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_SAGE_ATTN:
+             return ggml_cuda_sage_attn_supported(dev_ctx->device, op);
++        case GGML_OP_ROPE_PE_PERMUTE:
++            return ggml_cuda_rope_pe_permute_supported(op);
++        case GGML_OP_MODULATE_ROWS:
++            return ggml_cuda_modulate_rows_supported(op);
++        case GGML_OP_SWIGLU_SCALED:
++            return ggml_cuda_swiglu_scaled_supported(op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+         case GGML_OP_OPT_STEP_ADAMW:
+diff --git a/src/ggml-cuda/modulate-rows.cu b/src/ggml-cuda/modulate-rows.cu
+new file mode 100644
+index 00000000..1b639d28
+--- /dev/null
++++ b/src/ggml-cuda/modulate-rows.cu
+@@ -0,0 +1,168 @@
++#include "modulate-rows.cuh"
++#include "unary.cuh"
++
++// Rounding matches the unfused graph: __fmul_rn/__fadd_rn are the separately rounded MUL and ADD
++// kernels (never contracted into an FMA), `s*y + bias` is the expression the SCALE kernel
++// evaluates, and the swiglu product is the GLU kernel's silu(a)*b.
++
++template <int mode, bool has_scale>
++static __global__ void modulate_rows_kernel(
++        const char * __restrict__ a, const char * __restrict__ b, const char * __restrict__ c, char * __restrict__ dst,
++        const int nc, const int64_t nr1, const int64_t ne2, const int64_t row0,
++        const int64_t nba1, const int64_t nba2, const int64_t nba3,
++        const int64_t nbb1, const int64_t nbb2, const int64_t nbb3,
++        const int64_t nbd1, const int64_t nbd2, const int64_t nbd3,
++        const float s, const float bias) {
++    const int64_t ir = blockIdx.x;
++    const int64_t i1 = row0 + ir % nr1;
++    const int64_t i2 = (ir / nr1) % ne2;
++    const int64_t i3 = ir / (nr1 * ne2);
++
++    const float * xa = (const float *) (a + i1 * nba1 + i2 * nba2 + i3 * nba3);
++    float       * y  = (float *) (dst + i1 * nbd1 + i2 * nbd2 + i3 * nbd3);
++
++    if constexpr (mode == 0) {
++        const float * scale = (const float *) b;
++        const float * shift = (const float *) c;
++        for (int i = threadIdx.x; i < nc; i += blockDim.x) {
++            const float x = xa[i];
++            float v = __fadd_rn(__fadd_rn(x, __fmul_rn(x, scale[i])), shift[i]);
++            if constexpr (has_scale) {
++                v = s * v + bias;
++            }
++            y[i] = v;
++        }
++    } else {
++        const float * u    = (const float *) (b + i1 * nbb1 + i2 * nbb2 + i3 * nbb3);
++        const float * gate = (const float *) c;
++        for (int i = threadIdx.x; i < nc; i += blockDim.x) {
++            float w = u[i];
++            if constexpr (has_scale) {
++                w = s * w + bias;
++            }
++            y[i] = __fadd_rn(xa[i], __fmul_rn(w, gate[i]));
++        }
++    }
++}
++
++void ggml_cuda_op_modulate_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0];
++    const ggml_tensor * b = dst->src[1];
++    const ggml_tensor * c = dst->src[2];
++
++    const int     mode = ggml_get_op_params_i32(dst, 0);
++    const int64_t row0 = ggml_get_op_params_i32(dst, 1);
++    const int64_t row1 = ggml_get_op_params_i32(dst, 2);
++    const float   s    = ggml_get_op_params_f32(dst, 3);
++
++    const int64_t nr1   = row1 - row0;
++    const int64_t nrows = nr1 * a->ne[2] * a->ne[3];
++    const int     nc    = (int) a->ne[0];
++    if (nrows == 0) {
++        return;
++    }
++
++    cudaStream_t stream = ctx.stream();
++    const dim3   grid((unsigned int) nrows, 1, 1);
++    const dim3   block(256, 1, 1);
++
++#define MODULATE_ROWS_LAUNCH(MODE, HAS_SCALE)                                                                   \
++    modulate_rows_kernel<MODE, HAS_SCALE><<<grid, block, 0, stream>>>(                                          \
++        (const char *) a->data, (const char *) b->data, (const char *) c->data, (char *) dst->data, nc, nr1,    \
++        a->ne[2], row0, a->nb[1], a->nb[2], a->nb[3], b->nb[1], b->nb[2], b->nb[3], dst->nb[1], dst->nb[2],     \
++        dst->nb[3], s, 0.0f)
++
++    if (mode == 0) {
++        if (s != 1.0f) {
++            MODULATE_ROWS_LAUNCH(0, true);
++        } else {
++            MODULATE_ROWS_LAUNCH(0, false);
++        }
++    } else {
++        if (s != 1.0f) {
++            MODULATE_ROWS_LAUNCH(1, true);
++        } else {
++            MODULATE_ROWS_LAUNCH(1, false);
++        }
++    }
++#undef MODULATE_ROWS_LAUNCH
++}
++
++bool ggml_cuda_modulate_rows_supported(const ggml_tensor * op) {
++    const int64_t nrows = (int64_t) (ggml_get_op_params_i32(op, 2) - ggml_get_op_params_i32(op, 1)) * op->src[0]->ne[2] * op->src[0]->ne[3];
++    return op->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op) && op->src[0]->ne[0] <= INT_MAX && nrows <= INT_MAX &&
++           ggml_is_contiguous(op->src[ggml_get_op_params_i32(op, 0) == 0 ? 1 : 2]) &&
++           (ggml_get_op_params_i32(op, 0) != 0 || ggml_is_contiguous(op->src[2]));
++}
++
++template <bool has_in, bool has_out>
++static __global__ void swiglu_scaled_kernel(
++        const char * __restrict__ a, const char * __restrict__ b, float * __restrict__ dst,
++        const int nc, const int64_t ne1, const int64_t ne2,
++        const int64_t nba1, const int64_t nba2, const int64_t nba3,
++        const int64_t nbb1, const int64_t nbb2, const int64_t nbb3,
++        const float in_scale, const float out_scale, const float bias) {
++    const int64_t ir = blockIdx.x;
++    const int64_t i1 = ir % ne1;
++    const int64_t i2 = (ir / ne1) % ne2;
++    const int64_t i3 = ir / (ne1 * ne2);
++
++    const float * xa = (const float *) (a + i1 * nba1 + i2 * nba2 + i3 * nba3);
++    const float * xb = (const float *) (b + i1 * nbb1 + i2 * nbb2 + i3 * nbb3);
++    float       * y  = dst + ir * nc;
++
++    for (int i = threadIdx.x; i < nc; i += blockDim.x) {
++        float va = xa[i];
++        float vb = xb[i];
++        if constexpr (has_in) {
++            va = in_scale * va + bias;
++            vb = in_scale * vb + bias;
++        }
++        float v = ggml_cuda_op_silu_single(va) * vb;
++        if constexpr (has_out) {
++            v = out_scale * v + bias;
++        }
++        y[i] = v;
++    }
++}
++
++void ggml_cuda_op_swiglu_scaled(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0];
++    const ggml_tensor * b = dst->src[1];
++
++    const float in_scale  = ggml_get_op_params_f32(dst, 0);
++    const float out_scale = ggml_get_op_params_f32(dst, 1);
++
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    const int64_t nrows = ggml_nrows(a);
++    const int     nc    = (int) a->ne[0];
++    if (nrows == 0) {
++        return;
++    }
++
++    cudaStream_t stream = ctx.stream();
++    const dim3   grid((unsigned int) nrows, 1, 1);
++    const dim3   block(256, 1, 1);
++
++#define SWIGLU_SCALED_LAUNCH(HAS_IN, HAS_OUT)                                                                  \
++    swiglu_scaled_kernel<HAS_IN, HAS_OUT><<<grid, block, 0, stream>>>(                                         \
++        (const char *) a->data, (const char *) b->data, (float *) dst->data, nc, a->ne[1], a->ne[2], a->nb[1], \
++        a->nb[2], a->nb[3], b->nb[1], b->nb[2], b->nb[3], in_scale, out_scale, 0.0f)
++
++    const bool has_in  = in_scale != 1.0f;
++    const bool has_out = out_scale != 1.0f;
++    if (has_in && has_out) {
++        SWIGLU_SCALED_LAUNCH(true, true);
++    } else if (has_in) {
++        SWIGLU_SCALED_LAUNCH(true, false);
++    } else if (has_out) {
++        SWIGLU_SCALED_LAUNCH(false, true);
++    } else {
++        SWIGLU_SCALED_LAUNCH(false, false);
++    }
++#undef SWIGLU_SCALED_LAUNCH
++}
++
++bool ggml_cuda_swiglu_scaled_supported(const ggml_tensor * op) {
++    return op->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= INT_MAX && ggml_nrows(op->src[0]) <= INT_MAX;
++}
+diff --git a/src/ggml-cuda/modulate-rows.cuh b/src/ggml-cuda/modulate-rows.cuh
+new file mode 100644
+index 00000000..216d0767
+--- /dev/null
++++ b/src/ggml-cuda/modulate-rows.cuh
+@@ -0,0 +1,7 @@
++#include "common.cuh"
++
++void ggml_cuda_op_modulate_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_modulate_rows_supported(const ggml_tensor * op);
++
++void ggml_cuda_op_swiglu_scaled(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_swiglu_scaled_supported(const ggml_tensor * op);
+diff --git a/src/ggml-cuda/rope-pe.cu b/src/ggml-cuda/rope-pe.cu
+new file mode 100644
+index 00000000..3afe4423
+--- /dev/null
++++ b/src/ggml-cuda/rope-pe.cu
+@@ -0,0 +1,102 @@
++#include "rope-pe.cuh"
++#include "convert.cuh"
++
++// Fused rotary embedding (precomputed cos/sin table) + head-major relayout + scale + cast.
++// One block per (token, batch); the block walks every head so the table entries are read once.
++// Rounding matches the unfused graph exactly: __fmul_rn/__fadd_rn keep the two products and the
++// sum as separately rounded operations (no FMA contraction), the scale is the same `scale*y + bias`
++// expression the SCALE kernel evaluates, and the conversion uses the same ggml_cuda_cast as CPY.
++template <typename dst_t, bool has_scale>
++static __global__ void rope_pe_permute_kernel(
++        const char * __restrict__ x, const float * __restrict__ pe, dst_t * __restrict__ dst,
++        const int D, const int H, const int64_t L, const int n_rot,
++        const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const float scale, const float bias) {
++    const int64_t l    = blockIdx.x;
++    const int64_t n    = blockIdx.y;
++    const int     half = n_rot / 2;
++
++    for (int i = threadIdx.x; i < D; i += blockDim.x) {
++        const bool rot = i < n_rot;
++        int   j  = i;
++        float c0 = 0.0f;
++        float c1 = 0.0f;
++        if (rot) {
++            const int r = i >= half;
++            j           = i - r * half;
++            const float * t = pe + (l * half + j) * 4 + 2 * r;
++            c0 = t[0];
++            c1 = t[1];
++        }
++        for (int h = 0; h < H; ++h) {
++            const float * xr = (const float *) (x + h * nb01 + l * nb02 + n * nb03);
++            float y;
++            if (rot) {
++                y = __fadd_rn(__fmul_rn(xr[j], c0), __fmul_rn(xr[j + half], c1));
++            } else {
++                y = xr[i];
++            }
++            if constexpr (has_scale) {
++                y = scale * y + bias;
++            }
++            dst[((n * H + h) * L + l) * D + i] = ggml_cuda_cast<dst_t>(y);
++        }
++    }
++}
++
++template <typename dst_t>
++static void rope_pe_permute_cuda(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
++                                 const float scale, cudaStream_t stream) {
++    const int     D = (int) src0->ne[0];
++    const int     H = (int) src0->ne[1];
++    const int64_t L = src0->ne[2];
++    const int64_t N = src0->ne[3];
++
++    const dim3 grid((unsigned int) L, (unsigned int) N, 1);
++    const dim3 block(D >= 128 ? 128 : ((D + 31) / 32) * 32, 1, 1);
++    const char * x = (const char *) src0->data;
++    if (scale != 1.0f) {
++        rope_pe_permute_kernel<dst_t, true><<<grid, block, 0, stream>>>(
++            x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f);
++    } else {
++        rope_pe_permute_kernel<dst_t, false><<<grid, block, 0, stream>>>(
++            x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f);
++    }
++}
++
++void ggml_cuda_op_rope_pe_permute(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * pe   = dst->src[1];
++
++    const int   n_rot = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(n_rot == 0 || (pe != nullptr && ggml_is_contiguous(pe)));
++
++    cudaStream_t  stream = ctx.stream();
++    const float * pe_d   = pe ? (const float *) pe->data : nullptr;
++
++    if (dst->type == GGML_TYPE_F16) {
++        rope_pe_permute_cuda(src0, pe_d, (half *) dst->data, n_rot, scale, stream);
++    } else {
++        GGML_ASSERT(dst->type == GGML_TYPE_F32);
++        rope_pe_permute_cuda(src0, pe_d, (float *) dst->data, n_rot, scale, stream);
++    }
++}
++
++bool ggml_cuda_rope_pe_permute_supported(const ggml_tensor * op) {
++    const ggml_tensor * src0 = op->src[0];
++    const ggml_tensor * pe   = op->src[1];
++    if (src0->type != GGML_TYPE_F32 || src0->nb[0] != sizeof(float)) {
++        return false;
++    }
++    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
++        return false;
++    }
++    if (src0->ne[2] > INT_MAX || src0->ne[3] > 65535 || src0->ne[1] > INT_MAX || src0->ne[0] > INT_MAX) {
++        return false;
++    }
++    return pe == nullptr || (pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
++}
+diff --git a/src/ggml-cuda/rope-pe.cuh b/src/ggml-cuda/rope-pe.cuh
+new file mode 100644
+index 00000000..b68b6af4
+--- /dev/null
++++ b/src/ggml-cuda/rope-pe.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++void ggml_cuda_op_rope_pe_permute(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++bool ggml_cuda_rope_pe_permute_supported(const ggml_tensor * op);
+diff --git a/src/ggml.c b/src/ggml.c
+index dc4a29f9..fec933bf 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1115,9 +1115,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+ 
+     "QUANTIZE_I8_CONVROT",
+     "SAGE_ATTN",
++    "ROPE_PE_PERMUTE",
++    "MODULATE_ROWS",
++    "SWIGLU_SCALED",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1233,9 +1236,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+ 
+     "quantize_i8_convrot(x)",
+     "sage_attn(x,y,z)",
++    "rope_pe_permute(x,pe)",
++    "modulate_rows(x,a,b)",
++    "swiglu_scaled(x,y)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5557,6 +5563,125 @@ struct ggml_tensor * ggml_sage_attn(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_rope_pe_permute(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * pe,
++        int                   n_rot,
++        float                 scale,
++        enum ggml_type        type) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
++    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
++    GGML_ASSERT(n_rot >= 0 && n_rot % 2 == 0 && n_rot <= a->ne[0]);
++    if (n_rot > 0) {
++        GGML_ASSERT(pe != NULL && pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
++        GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2 && pe->ne[2] == n_rot / 2 && pe->ne[3] == a->ne[2]);
++    } else {
++        GGML_ASSERT(pe == NULL);
++    }
++    GGML_ASSERT(isfinite(scale));
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], a->ne[2], a->ne[1], a->ne[3]);
++
++    ggml_set_op_params_i32(result, 0, n_rot);
++    ggml_set_op_params_f32(result, 1, scale);
++
++    result->op     = GGML_OP_ROPE_PE_PERMUTE;
++    result->src[0] = a;
++    result->src[1] = pe;
++
++    return result;
++}
++
++static struct ggml_tensor * ggml_modulate_rows_impl(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * acc,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        struct ggml_tensor  * c,
++        int64_t               row0,
++        int64_t               row1,
++        float                 s,
++        int32_t               mode) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float));
++    GGML_ASSERT(row0 >= 0 && row0 < row1 && row1 <= a->ne[1] && row1 <= INT32_MAX);
++    GGML_ASSERT(isfinite(s));
++    // mode 0: a = x, b = scale, c = shift; mode 1: a = base, b = u, c = gate
++    struct ggml_tensor * vec0 = mode == 0 ? b : c;
++    GGML_ASSERT(vec0->type == GGML_TYPE_F32 && vec0->nb[0] == sizeof(float) && ggml_nelements(vec0) == a->ne[0]);
++    if (mode == 0) {
++        GGML_ASSERT(c->type == GGML_TYPE_F32 && c->nb[0] == sizeof(float) && ggml_nelements(c) == a->ne[0]);
++    } else {
++        GGML_ASSERT(b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float) && ggml_are_same_shape(a, b));
++    }
++    if (acc != NULL) {
++        GGML_ASSERT(acc->type == GGML_TYPE_F32 && ggml_is_contiguous(acc) && ggml_are_same_shape(acc, a));
++    }
++
++    struct ggml_tensor * result = acc != NULL ? ggml_view_tensor(ctx, acc) : ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
++
++    ggml_set_op_params_i32(result, 0, mode);
++    ggml_set_op_params_i32(result, 1, (int32_t) row0);
++    ggml_set_op_params_i32(result, 2, (int32_t) row1);
++    ggml_set_op_params_f32(result, 3, s);
++
++    result->op     = GGML_OP_MODULATE_ROWS;
++    result->src[0] = a;
++    result->src[1] = b;
++    result->src[2] = c;
++    result->src[3] = acc;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_modulate_rows(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * acc,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * scale,
++        struct ggml_tensor  * shift,
++        int64_t               row0,
++        int64_t               row1,
++        float                 out_scale) {
++    return ggml_modulate_rows_impl(ctx, acc, x, scale, shift, row0, row1, out_scale, 0);
++}
++
++struct ggml_tensor * ggml_gated_add_rows(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * acc,
++        struct ggml_tensor  * base,
++        struct ggml_tensor  * u,
++        struct ggml_tensor  * gate,
++        int64_t               row0,
++        int64_t               row1,
++        float                 u_scale) {
++    return ggml_modulate_rows_impl(ctx, acc, base, u, gate, row0, row1, u_scale, 1);
++}
++
++struct ggml_tensor * ggml_swiglu_scaled(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        float                 in_scale,
++        float                 out_scale) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float));
++    GGML_ASSERT(ggml_are_same_shape(a, b));
++    GGML_ASSERT(isfinite(in_scale) && isfinite(out_scale));
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
++
++    ggml_set_op_params_f32(result, 0, in_scale);
++    ggml_set_op_params_f32(result, 1, out_scale);
++
++    result->op     = GGML_OP_SWIGLU_SCALED;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index dd290caf..1e46361c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2125,6 +2125,118 @@ struct test_glu : public test_case {
+     }
+ };
+ 
++// GGML_OP_ROPE_PE_PERMUTE
++struct test_rope_pe_permute : public test_case {
++    const ggml_type type;
++    const std::array<int64_t, 4> ne_a; // [head_dim, n_head, n_tokens, n_batch]
++    const int n_rot;
++    const float scale;
++    const bool view; // a is a strided view (one third of a fused qkv projection)
++
++    std::string vars() override {
++        return VARS_TO_STR5(type, ne_a, n_rot, scale, view);
++    }
++
++    test_rope_pe_permute(ggml_type type = GGML_TYPE_F32,
++            std::array<int64_t, 4> ne_a = {128, 4, 9, 1},
++            int n_rot = 96, float scale = 1.0f, bool view = false)
++        : type(type), ne_a(ne_a), n_rot(n_rot), scale(scale), view(view) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a;
++        if (view) {
++            ggml_tensor * qkv = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3 * ne_a[0] * ne_a[1], ne_a[2], ne_a[3], 1);
++            ggml_set_name(qkv, "qkv");
++            a = ggml_view_4d(ctx, qkv, ne_a[0], ne_a[1], ne_a[2], ne_a[3],
++                             ne_a[0] * sizeof(float), qkv->nb[1], qkv->nb[2], ne_a[0] * ne_a[1] * sizeof(float));
++            ggml_set_name(a, "view_of_qkv");
++        } else {
++            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
++            ggml_set_name(a, "a");
++        }
++        ggml_tensor * pe = nullptr;
++        if (n_rot > 0) {
++            pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, n_rot / 2, ne_a[2]);
++            ggml_set_name(pe, "pe");
++        }
++        ggml_tensor * out = ggml_rope_pe_permute(ctx, a, pe, n_rot, scale, type);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// GGML_OP_MODULATE_ROWS (a chain of segments written in place)
++struct test_modulate_rows : public test_case {
++    const int mode; // 0: modulate, 1: gated add
++    const std::array<int64_t, 4> ne;
++    const float s;
++    const bool view;
++
++    std::string vars() override {
++        return VARS_TO_STR4(mode, ne, s, view);
++    }
++
++    test_modulate_rows(int mode = 0, std::array<int64_t, 4> ne = {64, 12, 2, 1}, float s = 1.0f, bool view = false)
++        : mode(mode), ne(ne), s(s), view(view) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        auto make = [&](const char * name) {
++            ggml_tensor * t;
++            if (view) {
++                ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2 * ne[0], ne[1], ne[2], ne[3]);
++                t = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], big->nb[1], big->nb[2], big->nb[3], ne[0] * sizeof(float));
++            } else {
++                t = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++            }
++            ggml_set_name(t, name);
++            return t;
++        };
++        ggml_tensor * a = make("a");
++        ggml_tensor * u = mode == 1 ? make("u") : nullptr;
++        // modulation table: 3 rows of 2 vectors each, taken as views like an adaLN projection
++        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * ne[0], 3);
++        ggml_set_name(table, "table");
++        const int64_t bounds[4] = {0, ne[1] / 4, ne[1] - 2, ne[1]};
++        ggml_tensor * out = nullptr;
++        for (int seg = 0; seg < 3; ++seg) {
++            const int row = (seg + 1) % 3;
++            ggml_tensor * v0 = ggml_view_1d(ctx, table, ne[0], row * table->nb[1]);
++            ggml_tensor * v1 = ggml_view_1d(ctx, table, ne[0], row * table->nb[1] + ne[0] * sizeof(float));
++            if (mode == 0) {
++                out = ggml_modulate_rows(ctx, out, a, v0, v1, bounds[seg], bounds[seg + 1], s);
++            } else {
++                out = ggml_gated_add_rows(ctx, out, a, u, v0, bounds[seg], bounds[seg + 1], s);
++            }
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// GGML_OP_SWIGLU_SCALED
++struct test_swiglu_scaled : public test_case {
++    const std::array<int64_t, 4> ne;
++    const float in_scale;
++    const float out_scale;
++
++    std::string vars() override {
++        return VARS_TO_STR3(ne, in_scale, out_scale);
++    }
++
++    test_swiglu_scaled(std::array<int64_t, 4> ne = {64, 5, 3, 1}, float in_scale = 1.0f, float out_scale = 1.0f)
++        : ne(ne), in_scale(in_scale), out_scale(out_scale) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * h = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2 * ne[0], ne[1], ne[2], ne[3]);
++        ggml_set_name(h, "h");
++        ggml_tensor * a = ggml_view_4d(ctx, h, ne[0], ne[1], ne[2], ne[3], h->nb[1], h->nb[2], h->nb[3], 0);
++        ggml_tensor * b = ggml_view_4d(ctx, h, ne[0], ne[1], ne[2], ne[3], h->nb[1], h->nb[2], h->nb[3], ne[0] * sizeof(float));
++        ggml_tensor * out = ggml_swiglu_scaled(ctx, a, b, in_scale, out_scale);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ struct test_glu_split : public test_case {
+     const ggml_glu_op op;
+     const ggml_type type;
+@@ -8101,6 +8213,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (bool view : {false, true}) {
++            for (float scale : {1.0f, 1.0f / 128.0f}) {
++                test_cases.emplace_back(new test_rope_pe_permute(type, {128, 4, 9, 1}, 96, scale, view));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {128, 3, 5, 2}, 128, scale, view));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {128, 4, 9, 1}, 0, scale, view));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {64, 3, 7, 2}, 32, scale, view));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {200, 2, 3, 1}, 100, scale, view));
++            }
++        }
++    }
++
++    for (int mode : {0, 1}) {
++        for (bool view : {false, true}) {
++            for (float sc : {1.0f, mode == 0 ? 1.0f / 128.0f : 128.0f}) {
++                test_cases.emplace_back(new test_modulate_rows(mode, {64, 12, 2, 1}, sc, view));
++                test_cases.emplace_back(new test_modulate_rows(mode, {300, 9, 1, 2}, sc, view));
++            }
++        }
++    }
++    for (float in_scale : {1.0f, 128.0f}) {
++        for (float out_scale : {1.0f, 1.0f / 128.0f}) {
++            test_cases.emplace_back(new test_swiglu_scaled({64, 5, 3, 1}, in_scale, out_scale));
++            test_cases.emplace_back(new test_swiglu_scaled({300, 7, 1, 2}, in_scale, out_scale));
++        }
++    }
++
+     for (int v : {0, 1}) {
+         for (float alpha : {.5f, 1.702f}) {
+             for (float limit : {2.0f, 7.0f}) {
+-- 
+2.43.0
+

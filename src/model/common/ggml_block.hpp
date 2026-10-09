@@ -204,6 +204,30 @@ public:
         force_prec_f32 = force_prec_f32_;
     }
 
+    // For callers that fold this layer's input/output scaling into neighbouring fused ops: the
+    // weight when forward() is exactly ggml_ext_linear(x, weight, nullptr, prec_f32(),
+    // effective_scale()) (no bias, weight scale, adapter, INT8 or FP8 path), nullptr otherwise.
+    ggml_tensor* foldable_weight(GGMLRunnerContext* ctx) {
+        ggml_tensor* w = params["weight"];
+        if (bias || has_weight_scale || ctx->weight_adapter || w->type == GGML_TYPE_I8) {
+            return nullptr;
+        }
+#ifndef SD_USE_UPSTREAM_GGML
+        if (w->type == GGML_TYPE_F8_E4M3 || w->type == GGML_TYPE_F8_E5M2) {
+            return nullptr;
+        }
+#endif
+        return w;
+    }
+
+    float effective_scale(GGMLRunnerContext* ctx) const {
+        return ctx->linear_scale > 0.f ? ctx->linear_scale : scale;
+    }
+
+    bool prec_f32() const {
+        return force_prec_f32;
+    }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         ggml_tensor* w            = params["weight"];
         const float scale         = ctx->linear_scale > 0.f ? ctx->linear_scale : this->scale;

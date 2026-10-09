@@ -1,0 +1,994 @@
+From 784b441f8b098863343e69e0345ef62d2ff580af Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Sat, 3 Oct 2026 18:27:29 -0700
+Subject: [PATCH] ggml-cuda: optional cuDNN attention for unmasked
+ FLASH_ATTN_EXT and SAGE_ATTN
+
+GGML_CUDA_CUDNN=ON (default OFF, Linux) builds a cuDNN fused-attention path
+through the header-only cudnn-frontend v1.26.0 (MIT; fetched by CMake or taken
+from GGML_CUDA_CUDNN_FRONTEND_DIR) with NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING:
+only cudnn.h is needed at build time and libcudnn.so.9 is dlopen'ed on first use
+(GGML_CUDA_CUDNN_LIB overrides the name), so the binary has no cuDNN link
+dependency and runs unchanged where cuDNN is missing.
+
+On NVIDIA sm80+ it can take unmasked, sink/ALiBi/softcap-free attention with equal
+Q/K/V head sizes (multiple of 8, up to 256) and at least 2^20 attention scores,
+GQA and batch included, for FLASH_ATTN_EXT and for SAGE_ATTN in AUTO mode (an
+explicitly requested Sage variant keeps its kernel). Q (F32) is narrowed to F16
+into dst's own bytes, F16 K/V are read in place with their strides (F32 K/V are
+narrowed), cuDNN writes F16 O to scratch after dst and one kernel widens it into
+dst. The scratch is part of the op's graph allocation (max with the existing
+kernels' needs). Plans are built once per shape and cached; a shape cuDNN
+declines, a failed build or execute, stream capture, Turing and older, or a
+missing library keep the existing kernels.
+
+By default FLASH_ATTN_EXT takes it on sm89 and sm100 and SAGE_ATTN on sm100,
+where it measured faster; the existing kernels were faster on sm86 (both ops)
+and sm89 (Sage), and other architectures were not measured.
+GGML_CUDA_CUDNN_ATTN=0|1 and GGML_CUDA_CUDNN_SAGE=0|1 turn it off or on for every
+sm80+ GPU, GGML_CUDA_CUDNN_ATTN_BF16=1 runs BF16, GGML_CUDA_CUDNN_ATTN_LOG=1
+logs each call.
+
+test-backend-ops: unmasked cases at the MiniMax-H3 head layout (odd and aligned
+lengths, GQA with batch, F32 K/V, permuted Q) and unmasked perf cases.
+---
+ CMakeLists.txt                     |   3 +
+ src/ggml-cuda/CMakeLists.txt       |  49 ++++
+ src/ggml-cuda/cudnn-attn-graph.cpp | 258 +++++++++++++++++++
+ src/ggml-cuda/cudnn-attn-graph.h   |  31 +++
+ src/ggml-cuda/cudnn-attn.cu        | 384 +++++++++++++++++++++++++++++
+ src/ggml-cuda/cudnn-attn.cuh       |  26 ++
+ src/ggml-cuda/fattn.cu             |   7 +-
+ src/ggml-cuda/ggml-cuda.cu         |   2 +-
+ src/ggml-cuda/sage-attn.cu         |  12 +-
+ src/ggml-cuda/sage-attn.cuh        |   2 +-
+ tests/test-backend-ops.cpp         |  25 ++
+ 11 files changed, 793 insertions(+), 6 deletions(-)
+ create mode 100644 src/ggml-cuda/cudnn-attn-graph.cpp
+ create mode 100644 src/ggml-cuda/cudnn-attn-graph.h
+ create mode 100644 src/ggml-cuda/cudnn-attn.cu
+ create mode 100644 src/ggml-cuda/cudnn-attn.cuh
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b6843578..1c32cf3b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -208,6 +208,9 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
+ option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+ option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+ option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
++option(GGML_CUDA_CUDNN                      "ggml: cuDNN attention (cudnn-frontend, libcudnn opened at run time)" OFF)
++set   (GGML_CUDA_CUDNN_FRONTEND_DIR "" CACHE PATH "ggml: cudnn-frontend checkout for GGML_CUDA_CUDNN (fetched when empty)")
++set   (GGML_CUDA_CUDNN_INCLUDE_DIR  "" CACHE PATH "ggml: directory holding cudnn.h for GGML_CUDA_CUDNN")
+ set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
+                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
+ set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
+diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
+index 05b81487..0ddeb81e 100644
+--- a/src/ggml-cuda/CMakeLists.txt
++++ b/src/ggml-cuda/CMakeLists.txt
+@@ -124,11 +124,60 @@ if (CUDAToolkit_FOUND)
+             template-instances/fattn-vec-instance-bf16-bf16.cu)
+     endif()
+ 
++    if (GGML_CUDA_CUDNN AND WIN32)
++        message(WARNING "GGML_CUDA_CUDNN: the run-time cuDNN loader is Linux only, building without it")
++        set(GGML_CUDA_CUDNN OFF)
++    endif()
++    if (GGML_CUDA_CUDNN)
++        # Headers only at build time: cudnn.h for the types, cudnn-frontend for the graph API.
++        # libcudnn itself is opened with dlopen when the first attention op runs.
++        if (GGML_CUDA_CUDNN_INCLUDE_DIR)
++            # an explicit directory wins over any earlier cached search result
++            set(GGML_CUDNN_HEADER_DIR ${GGML_CUDA_CUDNN_INCLUDE_DIR})
++        else()
++            find_path(GGML_CUDNN_HEADER_DIR cudnn.h
++                      HINTS $ENV{CUDNN_INCLUDE_DIR} $ENV{CUDNN_PATH} ${CUDAToolkit_INCLUDE_DIRS}
++                      PATH_SUFFIXES include)
++        endif()
++        if (NOT GGML_CUDNN_HEADER_DIR OR NOT EXISTS ${GGML_CUDNN_HEADER_DIR}/cudnn.h)
++            message(FATAL_ERROR "GGML_CUDA_CUDNN: cudnn.h not found, set GGML_CUDA_CUDNN_INCLUDE_DIR")
++        endif()
++        if (GGML_CUDA_CUDNN_FRONTEND_DIR)
++            set(GGML_CUDNN_FRONTEND_INCLUDE ${GGML_CUDA_CUDNN_FRONTEND_DIR}/include)
++        else()
++            include(FetchContent)
++            # v1.26.0, the last MIT-licensed release (later ones are Apache-2.0). Only the headers are
++            # used; SOURCE_SUBDIR points at a directory that does not exist so its CMake project stays out.
++            FetchContent_Declare(
++                ggml_cudnn_frontend
++                URL      https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.26.0.tar.gz
++                URL_HASH SHA256=f88361fb714589c970bac2ab56d6a7843722be08ca5ba226484de3fa46fd22cf
++                DOWNLOAD_EXTRACT_TIMESTAMP TRUE
++                SOURCE_SUBDIR ggml-headers-only
++            )
++            FetchContent_MakeAvailable(ggml_cudnn_frontend)
++            set(GGML_CUDNN_FRONTEND_INCLUDE ${ggml_cudnn_frontend_SOURCE_DIR}/include)
++        endif()
++        if (NOT EXISTS ${GGML_CUDNN_FRONTEND_INCLUDE}/cudnn_frontend.h)
++            message(FATAL_ERROR "GGML_CUDA_CUDNN: cudnn_frontend.h not found under ${GGML_CUDNN_FRONTEND_INCLUDE}")
++        endif()
++        message(STATUS "cuDNN attention: cudnn.h in ${GGML_CUDNN_HEADER_DIR}, cudnn-frontend in ${GGML_CUDNN_FRONTEND_INCLUDE}")
++        list(APPEND GGML_SOURCES_CUDA cudnn-attn-graph.cpp)
++    endif()
++
+     ggml_add_backend_library(ggml-cuda
+                              ${GGML_HEADERS_CUDA}
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    if (GGML_CUDA_CUDNN)
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUDNN NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
++        # -isystem: third-party headers, kept out of ggml's warning flags.
++        set_source_files_properties(cudnn-attn-graph.cpp PROPERTIES
++            COMPILE_OPTIONS "-isystem;${GGML_CUDNN_FRONTEND_INCLUDE};-isystem;${GGML_CUDNN_HEADER_DIR}")
++        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
++    endif()
++
+     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
+         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUBLASLT_FP8)
+         if (NOT GGML_STATIC OR WIN32)
+diff --git a/src/ggml-cuda/cudnn-attn-graph.cpp b/src/ggml-cuda/cudnn-attn-graph.cpp
+new file mode 100644
+index 00000000..b0f1dc11
+--- /dev/null
++++ b/src/ggml-cuda/cudnn-attn-graph.cpp
+@@ -0,0 +1,258 @@
++// cuDNN scaled dot product attention through cudnn-frontend (header-only), with libcudnn opened at
++// run time (NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING): a build with GGML_CUDA_CUDNN still starts and
++// runs on hosts without cuDNN, it just keeps the ggml kernels.
++
++#include "cudnn-attn-graph.h"
++
++#include "ggml-impl.h"
++
++#include <cudnn_frontend.h>
++
++#include <dlfcn.h>
++
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <string>
++
++namespace cudnn_frontend {
++// cudnn-frontend resolves every backend call through this handle when dynamic loading is on.
++void * cudnn_dlhandle = nullptr;
++}  // namespace cudnn_frontend
++
++namespace fe = cudnn_frontend;
++
++namespace {
++
++enum : int64_t { UID_Q = 1, UID_K = 2, UID_V = 3, UID_O = 4 };
++
++using plan_key = std::array<int64_t, 25>;
++
++struct plan_entry {
++    std::shared_ptr<fe::graph::Graph> graph;  // null: cuDNN has no plan for this key
++    int64_t                           workspace = 0;
++};
++
++std::mutex                    g_mutex;
++int                           g_load_state = 0;  // 0 not tried, 1 loaded, -1 unavailable
++std::map<int, cudnnHandle_t>  g_handles;
++std::map<plan_key, plan_entry> g_plans;
++
++plan_key make_key(const ggml_cuda_cudnn_sdpa_params & p) {
++    plan_key k{};
++    int      i = 0;
++    k[i++]     = p.device;
++    k[i++]     = p.b;
++    k[i++]     = p.hq;
++    k[i++]     = p.hk;
++    k[i++]     = p.sq;
++    k[i++]     = p.skv;
++    k[i++]     = p.d;
++    for (int j = 0; j < 4; ++j) {
++        k[i++] = p.q_stride[j];
++    }
++    for (int j = 0; j < 4; ++j) {
++        k[i++] = p.k_stride[j];
++    }
++    for (int j = 0; j < 4; ++j) {
++        k[i++] = p.v_stride[j];
++    }
++    for (int j = 0; j < 4; ++j) {
++        k[i++] = p.o_stride[j];
++    }
++    uint32_t scale_bits = 0;
++    std::memcpy(&scale_bits, &p.scale, sizeof(scale_bits));
++    k[i++] = scale_bits;
++    k[i++] = p.bf16 ? 1 : 0;
++    GGML_ASSERT(i == (int) k.size());
++    return k;
++}
++
++bool load_locked() {
++    if (g_load_state != 0) {
++        return g_load_state == 1;
++    }
++    g_load_state = -1;
++
++    // cudnn-frontend opens libcudart itself for a few runtime calls; point it at the runtime major
++    // this backend was built against so it never picks a second, mismatched copy.
++    char cudart_name[32];
++    std::snprintf(cudart_name, sizeof(cudart_name), "libcudart.so.%d", CUDART_VERSION / 1000);
++    setenv("CUDNN_FRONTEND_CUDART_LIB_NAME", cudart_name, 0);
++
++    const char * user = std::getenv("GGML_CUDA_CUDNN_LIB");
++    const char * name = user != nullptr && user[0] != '\0' ? user : "libcudnn.so.9";
++    void *       h    = dlopen(name, RTLD_NOW | RTLD_LOCAL);
++    if (h == nullptr) {
++        GGML_LOG_DEBUG("%s: cuDNN not loaded (%s), attention keeps the ggml kernels\n", __func__, dlerror());
++        return false;
++    }
++    using get_version_t = size_t (*)();
++    auto get_version    = reinterpret_cast<get_version_t>(dlsym(h, "cudnnGetVersion"));
++    const size_t version = get_version != nullptr ? get_version() : 0;
++    if (version < 90000) {
++        GGML_LOG_WARN("%s: %s reports cuDNN %zu, need 9.0 or newer; attention keeps the ggml kernels\n", __func__,
++                      name, version);
++        dlclose(h);
++        return false;
++    }
++    fe::cudnn_dlhandle = h;
++    g_load_state       = 1;
++    GGML_LOG_INFO("%s: cuDNN %zu loaded from %s for attention\n", __func__, version, name);
++    return true;
++}
++
++cudnnHandle_t handle_locked(int device) {
++    auto it = g_handles.find(device);
++    if (it != g_handles.end()) {
++        return it->second;
++    }
++    cudnnHandle_t h = nullptr;
++    if (fe::detail::create_handle(&h) != CUDNN_STATUS_SUCCESS) {
++        h = nullptr;
++    }
++    g_handles[device] = h;
++    return h;
++}
++
++std::shared_ptr<fe::graph::Graph> build_graph(const ggml_cuda_cudnn_sdpa_params & p, cudnnHandle_t handle,
++                                              std::string & why) {
++    auto g = std::make_shared<fe::graph::Graph>();
++    g->set_io_data_type(p.bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF)
++        .set_intermediate_data_type(fe::DataType_t::FLOAT)
++        .set_compute_data_type(fe::DataType_t::FLOAT);
++
++    auto tensor = [&](const char * name, int64_t uid, int64_t h, int64_t s, const int64_t * stride) {
++        return g->tensor(fe::graph::Tensor_attributes()
++                             .set_name(name)
++                             .set_uid(uid)
++                             .set_dim({ p.b, h, s, p.d })
++                             .set_stride({ stride[0], stride[1], stride[2], stride[3] }));
++    };
++    auto Q = tensor("Q", UID_Q, p.hq, p.sq, p.q_stride);
++    auto K = tensor("K", UID_K, p.hk, p.skv, p.k_stride);
++    auto V = tensor("V", UID_V, p.hk, p.skv, p.v_stride);
++
++    auto options = fe::graph::SDPA_attributes().set_name("ggml_sdpa").set_generate_stats(false).set_attn_scale(p.scale);
++    auto [O, stats] = g->sdpa(Q, K, V, options);
++    (void) stats;
++    O->set_output(true)
++        .set_uid(UID_O)
++        .set_dim({ p.b, p.hq, p.sq, p.d })
++        .set_stride({ p.o_stride[0], p.o_stride[1], p.o_stride[2], p.o_stride[3] });
++
++    fe::error_t st = g->validate();
++    if (st.is_good()) {
++        st = g->build_operation_graph(handle);
++    }
++    if (st.is_good()) {
++        st = g->create_execution_plans({ fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK });
++    }
++    if (st.is_good()) {
++        st = g->check_support(handle);
++    }
++    if (st.is_good()) {
++        st = g->build_plans(handle);
++    }
++    if (!st.is_good()) {
++        why = st.get_message();
++        return nullptr;
++    }
++    return g;
++}
++
++}  // namespace
++
++bool ggml_cuda_cudnn_available() {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    try {
++        return load_locked();
++    } catch (const std::exception & e) {
++        GGML_LOG_WARN("%s: %s\n", __func__, e.what());
++        g_load_state = -1;
++        return false;
++    }
++}
++
++bool ggml_cuda_cudnn_sdpa_prepare(const ggml_cuda_cudnn_sdpa_params & p, size_t * workspace_size) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_load_state != 1) {
++        return false;
++    }
++    const plan_key key = make_key(p);
++    auto           it  = g_plans.find(key);
++    if (it == g_plans.end()) {
++        plan_entry  entry;
++        std::string why;
++        const auto  t0 = std::chrono::steady_clock::now();
++        try {
++            cudnnHandle_t handle = handle_locked(p.device);
++            if (handle == nullptr) {
++                why = "cudnnCreate failed";
++            } else {
++                entry.graph = build_graph(p, handle, why);
++                if (entry.graph && !entry.graph->get_workspace_size(entry.workspace).is_good()) {
++                    entry.graph = nullptr;
++                    why         = "workspace query failed";
++                }
++            }
++        } catch (const std::exception & e) {
++            entry.graph = nullptr;
++            why         = e.what();
++        }
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        if (entry.graph) {
++            GGML_LOG_INFO("%s: cuDNN SDPA plan b=%lld hq=%lld hk=%lld sq=%lld skv=%lld d=%lld %s, workspace %lld B, "
++                          "built in %.0f ms\n",
++                          __func__, (long long) p.b, (long long) p.hq, (long long) p.hk, (long long) p.sq,
++                          (long long) p.skv, (long long) p.d, p.bf16 ? "bf16" : "f16", (long long) entry.workspace,
++                          ms);
++        } else {
++            GGML_LOG_INFO("%s: no cuDNN SDPA plan for b=%lld hq=%lld hk=%lld sq=%lld skv=%lld d=%lld, keeping the ggml "
++                          "kernel (%s)\n",
++                          __func__, (long long) p.b, (long long) p.hq, (long long) p.hk, (long long) p.sq,
++                          (long long) p.skv, (long long) p.d, why.c_str());
++        }
++        it = g_plans.emplace(key, std::move(entry)).first;
++    }
++    if (!it->second.graph) {
++        return false;
++    }
++    *workspace_size = (size_t) it->second.workspace;
++    return true;
++}
++
++bool ggml_cuda_cudnn_sdpa_execute(const ggml_cuda_cudnn_sdpa_params & p, cudaStream_t stream, void * q, void * k,
++                                  void * v, void * o, void * workspace) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    auto                        it = g_plans.find(make_key(p));
++    if (it == g_plans.end() || !it->second.graph) {
++        return false;
++    }
++    try {
++        cudnnHandle_t handle = handle_locked(p.device);
++        if (handle == nullptr || fe::detail::set_stream(handle, stream) != CUDNN_STATUS_SUCCESS) {
++            return false;
++        }
++        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> pack = {
++            { UID_Q, q }, { UID_K, k }, { UID_V, v }, { UID_O, o }
++        };
++        fe::error_t st = it->second.graph->execute(handle, pack, workspace);
++        if (!st.is_good()) {
++            GGML_LOG_WARN("%s: cuDNN SDPA execute failed, keeping the ggml kernel for this shape: %s\n", __func__,
++                          st.get_message().c_str());
++            it->second.graph = nullptr;
++            return false;
++        }
++    } catch (const std::exception & e) {
++        GGML_LOG_WARN("%s: cuDNN SDPA execute failed, keeping the ggml kernel for this shape: %s\n", __func__, e.what());
++        it->second.graph = nullptr;
++        return false;
++    }
++    return true;
++}
+diff --git a/src/ggml-cuda/cudnn-attn-graph.h b/src/ggml-cuda/cudnn-attn-graph.h
+new file mode 100644
+index 00000000..9749f2ab
+--- /dev/null
++++ b/src/ggml-cuda/cudnn-attn-graph.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++// Host-side half of the cuDNN attention path (cudnn-attn.cu is the device side). Only compiled
++// with GGML_CUDA_CUDNN. libcudnn is opened at run time, so the binary never links against it.
++
++#include <cstddef>
++#include <cstdint>
++
++#include <cuda_runtime.h>
++
++struct ggml_cuda_cudnn_sdpa_params {
++    int     device;
++    int64_t b, hq, hk, sq, skv, d;  // batch, query heads, key/value heads, query tokens, key tokens, head size
++    int64_t q_stride[4];            // element strides in (b, h, s, d) order
++    int64_t k_stride[4];
++    int64_t v_stride[4];
++    int64_t o_stride[4];
++    float   scale;
++    bool    bf16;                   // io type: BF16 when set, F16 otherwise
++};
++
++// Opens libcudnn once per process. False when it cannot be loaded or is older than cuDNN 9.
++bool ggml_cuda_cudnn_available();
++
++// Builds (or finds) the execution plan for these parameters. False when cuDNN has no plan for
++// them; the result is cached either way, so a rejected shape costs one attempt per process.
++bool ggml_cuda_cudnn_sdpa_prepare(const ggml_cuda_cudnn_sdpa_params & p, size_t * workspace_size);
++
++// Runs a plan built by ggml_cuda_cudnn_sdpa_prepare on the given stream.
++bool ggml_cuda_cudnn_sdpa_execute(const ggml_cuda_cudnn_sdpa_params & p, cudaStream_t stream,
++                                  void * q, void * k, void * v, void * o, void * workspace);
+diff --git a/src/ggml-cuda/cudnn-attn.cu b/src/ggml-cuda/cudnn-attn.cu
+new file mode 100644
+index 00000000..a5b9de14
+--- /dev/null
++++ b/src/ggml-cuda/cudnn-attn.cu
+@@ -0,0 +1,384 @@
++#include "cudnn-attn.cuh"
++
++#if defined(GGML_CUDA_USE_CUDNN) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
++#include "convert.cuh"
++#include "cudnn-attn-graph.h"
++
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++
++static bool cudnn_attn_env_set(const char * name, bool default_value) {
++    const char * v = std::getenv(name);
++    if (v == nullptr || v[0] == '\0') {
++        return default_value;
++    }
++    return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0);
++}
++
++// Where a staged F16 / BF16 tensor lives: inside dst's bytes or in the scratch after dst.
++struct cudnn_attn_slot {
++    bool   in_dst;
++    size_t off;
++};
++
++// Everything the cuDNN path needs to know about one op, from shapes and types alone.
++struct cudnn_attn_plan {
++    ggml_cuda_cudnn_sdpa_params p;
++    bool                        convert_k;
++    bool                        convert_v;
++    cudnn_attn_slot             q, k, v, o;
++    size_t                      scratch;  // scratch bytes after dst
++};
++
++static bool cudnn_attn_strides_ok(const ggml_tensor * t) {
++    // cuDNN wants a unit stride on the head dimension and 16-byte aligned rows.
++    return t->nb[0] == ggml_type_size(t->type) && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
++}
++
++// -1 when unset, otherwise 0 or 1.
++static int cudnn_attn_env_mode(const char * name) {
++    const char * v = std::getenv(name);
++    if (v == nullptr || v[0] == '\0') {
++        return -1;
++    }
++    return cudnn_attn_env_set(name, true) ? 1 : 0;
++}
++
++static bool cudnn_attn_make_plan(int device, const ggml_tensor * dst, cudnn_attn_plan & plan) {
++    static const int  attn_mode = cudnn_attn_env_mode("GGML_CUDA_CUDNN_ATTN");
++    static const int  sage_mode = cudnn_attn_env_mode("GGML_CUDA_CUDNN_SAGE");
++    static const bool want_bf16 = cudnn_attn_env_set("GGML_CUDA_CUDNN_ATTN_BF16", false);
++    if (attn_mode == 0 || (dst->op == GGML_OP_SAGE_ATTN && sage_mode == 0)) {
++        return false;
++    }
++    if (dst->op != GGML_OP_FLASH_ATTN_EXT && dst->op != GGML_OP_SAGE_ATTN) {
++        return false;
++    }
++    // An explicitly requested SageAttention variant keeps its kernel; AUTO takes the cuDNN path.
++    if (dst->op == GGML_OP_SAGE_ATTN && ggml_get_op_params_i32(dst, 1) != GGML_SAGE_ATTN_AUTO) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[device].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
++        return false;
++    }
++    // Unset switches keep the existing kernels except where cuDNN measured faster at H3 shapes: against the flash
++    // attention kernel on sm89 and sm100 (slower on sm86), against the Sage kernel on sm100 (slower on sm86 and
++    // sm89). Other architectures were not measured. =1 opts in on any sm80+ GPU.
++    const bool sm100 = cc >= 1000 && cc < GGML_CUDA_CC_BLACKWELL;
++    const bool sm89  = cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_HOPPER;
++    if (dst->op == GGML_OP_SAGE_ATTN ? sage_mode < 0 && !sm100 : attn_mode < 0 && !sm89 && !sm100) {
++        return false;
++    }
++
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    if (Q == nullptr || K == nullptr || V == nullptr) {
++        return false;
++    }
++    if (dst->op == GGML_OP_FLASH_ATTN_EXT) {
++        float max_bias = 0.0f, softcap = 0.0f;
++        std::memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++        std::memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
++        if (dst->src[3] != nullptr || dst->src[4] != nullptr || max_bias != 0.0f || softcap != 0.0f) {
++            return false;
++        }
++    }
++
++    const ggml_type io = want_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
++    auto kv_type_ok    = [](ggml_type t) {
++        return t == GGML_TYPE_F16 || t == GGML_TYPE_F32 || t == GGML_TYPE_BF16;
++    };
++    if (Q->type != GGML_TYPE_F32 || !kv_type_ok(K->type) || !kv_type_ok(V->type) || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // BF16 -> F16 can overflow, so BF16 K/V only run in BF16 mode. F16 K/V in BF16 mode are narrowed
++    // (3 mantissa bits lost); that mode exists to measure BF16 against the F16 default.
++    if ((K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16) && io != GGML_TYPE_BF16) {
++        return false;
++    }
++
++    const int64_t d = Q->ne[0];
++    if (d % 8 != 0 || d > 256 || K->ne[0] != d || V->ne[0] != d) {
++        return false;
++    }
++    const int64_t sq = Q->ne[1], hq = Q->ne[2], b = Q->ne[3];
++    const int64_t skv = K->ne[1], hk = K->ne[2];
++    if (V->ne[1] != skv || V->ne[2] != hk || K->ne[3] != b || V->ne[3] != b || hk == 0 || hq % hk != 0) {
++        return false;
++    }
++    if (!ggml_is_contiguous(dst) || dst->ne[0] != d || dst->ne[1] != hq || dst->ne[2] != sq || dst->ne[3] != b) {
++        return false;
++    }
++    if (Q->nb[0] != ggml_type_size(Q->type) || !cudnn_attn_strides_ok(K) || !cudnn_attn_strides_ok(V)) {
++        return false;
++    }
++    if (hq * b > INT32_MAX || sq > INT32_MAX || skv > INT32_MAX) {
++        return false;
++    }
++    // Below about 2^20 attention scores the two extra conversion launches cost more than cuDNN saves
++    // (B200: 31 tokens x 56 heads 10.6 -> 14-16 us, one query row x 32 heads x 4096 keys 12.9 -> 20 us,
++    // break-even near 256 x 256 x 16, 2.3x faster at 512 x 512 x 16), so small shapes keep the ggml kernels.
++    if ((double) sq * (double) skv * (double) (hq * b) < (double) (1 << 20)) {
++        return false;
++    }
++    if (!ggml_cuda_cudnn_available()) {
++        return false;
++    }
++
++    plan               = {};
++    plan.p.device      = device;
++    plan.p.b           = b;
++    plan.p.hq          = hq;
++    plan.p.hk          = hk;
++    plan.p.sq          = sq;
++    plan.p.skv         = skv;
++    plan.p.d           = d;
++    plan.p.bf16        = io == GGML_TYPE_BF16;
++    std::memcpy(&plan.p.scale, (const float *) dst->op_params + 0, sizeof(float));
++
++    // Converted tensors are written contiguous: [d, s, h, b], i.e. (b, h, s, d) strides below.
++    auto set_contiguous = [d](int64_t * stride, int64_t s, int64_t h) {
++        stride[3] = 1;
++        stride[2] = d;
++        stride[1] = d * s;
++        stride[0] = d * s * h;
++    };
++    auto set_from = [](int64_t * stride, const ggml_tensor * t) {
++        const size_t ts = ggml_type_size(t->type);
++        stride[3]       = 1;
++        stride[2]       = t->nb[1] / ts;
++        stride[1]       = t->nb[2] / ts;
++        stride[0]       = t->nb[3] / ts;
++    };
++
++    // Q (and K/V when they need converting) are staged in dst's own bytes: dst is F32 and at least
++    // twice the size of F16 Q, and it is only written after cuDNN has read them. O and whatever does
++    // not fit go to scratch after dst.
++    const size_t es       = 2;  // F16 / BF16
++    const size_t dst_size = ggml_nbytes(dst);
++    size_t       dst_off  = 0;
++    size_t       off      = 0;
++    auto         take     = [&](size_t bytes, cudnn_attn_slot & slot, bool allow_dst) {
++        if (allow_dst && dst_off + bytes <= dst_size) {
++            slot = { true, dst_off };
++            dst_off += GGML_PAD(bytes, 256);
++        } else {
++            slot = { false, off };
++            off += GGML_PAD(bytes, 256);
++        }
++    };
++
++    take(ggml_nelements(Q) * es, plan.q, true);
++    set_contiguous(plan.p.q_stride, sq, hq);
++
++    plan.convert_k = K->type != io;
++    if (plan.convert_k) {
++        take(ggml_nelements(K) * es, plan.k, true);
++        set_contiguous(plan.p.k_stride, skv, hk);
++    } else {
++        set_from(plan.p.k_stride, K);
++    }
++    plan.convert_v = V->type != io;
++    if (plan.convert_v) {
++        take(ggml_nelements(V) * es, plan.v, true);
++        set_contiguous(plan.p.v_stride, skv, hk);
++    } else {
++        set_from(plan.p.v_stride, V);
++    }
++
++    // O is written in dst's layout, [d, hq, sq, b], then widened to F32 into dst.
++    take(ggml_nelements(dst) * es, plan.o, false);
++    plan.p.o_stride[3] = 1;
++    plan.p.o_stride[1] = d;
++    plan.p.o_stride[2] = d * hq;
++    plan.p.o_stride[0] = d * hq * sq;
++    plan.scratch       = off;
++    return true;
++}
++
++size_t ggml_cuda_cudnn_attn_alloc_size(int device, const ggml_tensor * dst) {
++    cudnn_attn_plan plan;
++    if (!cudnn_attn_make_plan(device, dst, plan)) {
++        return 0;
++    }
++    // dst (which also stages Q), up to 256 bytes to align the scratch start, then the scratch.
++    return ggml_nbytes(dst) + 256 + plan.scratch;
++}
++
++// F32 rows of 8-element groups (strided rows, 16-byte aligned) -> contiguous F16 / BF16, 8 per thread.
++template <typename dst_t>
++static __global__ void cudnn_attn_narrow_f32(const char * __restrict__ x, dst_t * __restrict__ y, const int64_t n8,
++                                             const int64_t g0, const int64_t ne1, const int64_t ne2, const int64_t nb1,
++                                             const int64_t nb2, const int64_t nb3) {
++    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
++        const int64_t g   = i % g0;
++        const int64_t row = i / g0;
++        const int64_t i1  = row % ne1;
++        const int64_t i2  = (row / ne1) % ne2;
++        const int64_t i3  = row / (ne1 * ne2);
++        const float4 * src = (const float4 *) (x + i3 * nb3 + i2 * nb2 + i1 * nb1) + 2 * g;
++        const float4   a   = src[0];
++        const float4   b   = src[1];
++        union {
++            dst_t h[8];
++            uint4 u;
++        } out;
++        out.h[0] = ggml_cuda_cast<dst_t>(a.x);
++        out.h[1] = ggml_cuda_cast<dst_t>(a.y);
++        out.h[2] = ggml_cuda_cast<dst_t>(a.z);
++        out.h[3] = ggml_cuda_cast<dst_t>(a.w);
++        out.h[4] = ggml_cuda_cast<dst_t>(b.x);
++        out.h[5] = ggml_cuda_cast<dst_t>(b.y);
++        out.h[6] = ggml_cuda_cast<dst_t>(b.z);
++        out.h[7] = ggml_cuda_cast<dst_t>(b.w);
++        ((uint4 *) y)[i] = out.u;
++    }
++}
++
++// Contiguous F16 / BF16 -> contiguous F32, 8 per thread.
++template <typename src_t>
++static __global__ void cudnn_attn_widen(const src_t * __restrict__ x, float * __restrict__ y, const int64_t n8) {
++    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
++        union {
++            src_t h[8];
++            uint4 u;
++        } in;
++        in.u = ((const uint4 *) x)[i];
++        float4 a, b;
++        a.x = ggml_cuda_cast<float>(in.h[0]);
++        a.y = ggml_cuda_cast<float>(in.h[1]);
++        a.z = ggml_cuda_cast<float>(in.h[2]);
++        a.w = ggml_cuda_cast<float>(in.h[3]);
++        b.x = ggml_cuda_cast<float>(in.h[4]);
++        b.y = ggml_cuda_cast<float>(in.h[5]);
++        b.z = ggml_cuda_cast<float>(in.h[6]);
++        b.w = ggml_cuda_cast<float>(in.h[7]);
++        ((float4 *) y)[2 * i]     = a;
++        ((float4 *) y)[2 * i + 1] = b;
++    }
++}
++
++static int cudnn_attn_grid(int64_t n) {
++    return (int) std::min<int64_t>((n + 255) / 256, 65535LL * 8);
++}
++
++static void cudnn_attn_convert(const ggml_tensor * src, void * dst, bool bf16, cudaStream_t stream) {
++    const size_t ts = ggml_type_size(src->type);
++    const bool   vec_ok = src->type == GGML_TYPE_F32 && src->ne[0] % 8 == 0 && (uintptr_t) src->data % 16 == 0 &&
++                        src->nb[1] % 16 == 0 && src->nb[2] % 16 == 0 && src->nb[3] % 16 == 0;
++    if (vec_ok) {
++        const int64_t n8 = ggml_nelements(src) / 8;
++        if (bf16) {
++            cudnn_attn_narrow_f32<nv_bfloat16><<<cudnn_attn_grid(n8), 256, 0, stream>>>(
++                (const char *) src->data, (nv_bfloat16 *) dst, n8, src->ne[0] / 8, src->ne[1], src->ne[2], src->nb[1],
++                src->nb[2], src->nb[3]);
++        } else {
++            cudnn_attn_narrow_f32<half><<<cudnn_attn_grid(n8), 256, 0, stream>>>(
++                (const char *) src->data, (half *) dst, n8, src->ne[0] / 8, src->ne[1], src->ne[2], src->nb[1],
++                src->nb[2], src->nb[3]);
++        }
++        return;
++    }
++    if (bf16) {
++        to_bf16_nc_cuda_t f = ggml_get_to_bf16_nc_cuda(src->type);
++        GGML_ASSERT(f != nullptr);
++        f(src->data, (nv_bfloat16 *) dst, src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1] / ts,
++          src->nb[2] / ts, src->nb[3] / ts, stream);
++    } else {
++        to_fp16_nc_cuda_t f = ggml_get_to_fp16_nc_cuda(src->type);
++        GGML_ASSERT(f != nullptr);
++        f(src->data, (half *) dst, src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1] / ts, src->nb[2] / ts,
++          src->nb[3] / ts, stream);
++    }
++}
++
++bool ggml_cuda_cudnn_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    static const bool log_calls = cudnn_attn_env_set("GGML_CUDA_CUDNN_ATTN_LOG", false);
++    static std::atomic<long long> n_calls{ 0 };
++
++    cudnn_attn_plan plan;
++    if (!cudnn_attn_make_plan(ctx.device, dst, plan)) {
++        return false;
++    }
++    cudaStream_t stream = ctx.stream();
++
++    // Plans are built outside stream capture only; a captured graph keeps the ggml kernels.
++    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
++    if (capture != cudaStreamCaptureStatusNone) {
++        return false;
++    }
++
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++    if ((uintptr_t) dst->data % 16 != 0 || (!plan.convert_k && (uintptr_t) K->data % 16 != 0) ||
++        (!plan.convert_v && (uintptr_t) V->data % 16 != 0)) {
++        return false;
++    }
++
++    size_t workspace_size = 0;
++    if (!ggml_cuda_cudnn_sdpa_prepare(plan.p, &workspace_size)) {
++        if (log_calls) {
++            GGML_LOG_INFO("%s: %s %s -> ggml kernel (no cuDNN plan)\n", __func__, ggml_op_desc(dst), dst->name);
++        }
++        return false;
++    }
++
++    char * base    = (char *) dst->data;
++    char * scratch = (char *) GGML_PAD((uintptr_t) dst->data + ggml_nbytes(dst), 256);
++    auto   where   = [&](const cudnn_attn_slot & slot) -> void * {
++        return (slot.in_dst ? base : scratch) + slot.off;
++    };
++    void * q = where(plan.q);
++    void * k = plan.convert_k ? where(plan.k) : K->data;
++    void * v = plan.convert_v ? where(plan.v) : V->data;
++    void * o = where(plan.o);
++
++    cudnn_attn_convert(Q, q, plan.p.bf16, stream);
++    if (plan.convert_k) {
++        cudnn_attn_convert(K, k, plan.p.bf16, stream);
++    }
++    if (plan.convert_v) {
++        cudnn_attn_convert(V, v, plan.p.bf16, stream);
++    }
++
++    ggml_cuda_pool_alloc<char> workspace(ctx.pool());
++    if (workspace_size > 0) {
++        workspace.alloc(workspace_size);
++    }
++    if (!ggml_cuda_cudnn_sdpa_execute(plan.p, stream, q, k, v, o, workspace_size > 0 ? workspace.get() : nullptr)) {
++        return false;
++    }
++
++    // dst holds d * hq * sq * b values with d % 8 == 0, and both buffers are 256-byte aligned.
++    const int64_t n8 = ggml_nelements(dst) / 8;
++    if (plan.p.bf16) {
++        cudnn_attn_widen<<<cudnn_attn_grid(n8), 256, 0, stream>>>((const nv_bfloat16 *) o, (float *) dst->data, n8);
++    } else {
++        cudnn_attn_widen<<<cudnn_attn_grid(n8), 256, 0, stream>>>((const half *) o, (float *) dst->data, n8);
++    }
++    CUDA_CHECK(cudaGetLastError());
++
++    const long long n = ++n_calls;
++    if (log_calls) {
++        GGML_LOG_INFO("%s: %s %s -> cuDNN (call %lld)\n", __func__, ggml_op_desc(dst), dst->name, n);
++    }
++    return true;
++}
++
++#else
++
++size_t ggml_cuda_cudnn_attn_alloc_size(int, const ggml_tensor *) {
++    return 0;
++}
++
++bool ggml_cuda_cudnn_attn(ggml_backend_cuda_context &, ggml_tensor *) {
++    return false;
++}
++
++#endif
+diff --git a/src/ggml-cuda/cudnn-attn.cuh b/src/ggml-cuda/cudnn-attn.cuh
+new file mode 100644
+index 00000000..067bea63
+--- /dev/null
++++ b/src/ggml-cuda/cudnn-attn.cuh
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include "common.cuh"
++
++// cuDNN scaled dot product attention for GGML_OP_FLASH_ATTN_EXT and GGML_OP_SAGE_ATTN on NVIDIA
++// sm80+ when the backend is built with GGML_CUDA_CUDNN and libcudnn 9 loads at run time.
++// Only unmasked, sink-free, ALiBi-free, softcap-free attention with equal Q/K/V head sizes and at
++// least 2^20 attention scores is taken; everything else, and every shape cuDNN rejects, keeps the
++// existing kernels.
++//
++// By default FLASH_ATTN_EXT takes it on sm89 and sm100 and SAGE_ATTN on sm100, where it measured faster.
++// Environment:
++//   GGML_CUDA_CUDNN_ATTN=0|1     never use cuDNN for attention / use it on every sm80+ GPU
++//   GGML_CUDA_CUDNN_SAGE=0|1     keep the SageAttention kernels for GGML_OP_SAGE_ATTN / use cuDNN on every
++//                                sm80+ GPU (AUTO mode; an explicitly requested Sage variant keeps its kernel)
++//   GGML_CUDA_CUDNN_ATTN_BF16=1  run cuDNN in BF16 instead of F16 (F16 K/V are narrowed)
++//   GGML_CUDA_CUDNN_LIB=path     library to open instead of libcudnn.so.9
++//   GGML_CUDA_CUDNN_ATTN_LOG=1   log every call that takes (or falls back from) the cuDNN path
++
++// Bytes the op needs from the graph allocation when the cuDNN path can run, 0 otherwise. The
++// region starts at dst->data and includes dst itself.
++size_t ggml_cuda_cudnn_attn_alloc_size(int device, const ggml_tensor * dst);
++
++// Runs dst through cuDNN. Returns false without touching dst when the cuDNN path does not apply,
++// so the caller runs its own kernel.
++bool ggml_cuda_cudnn_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
+index b8be30a0..ddc93e30 100644
+--- a/src/ggml-cuda/fattn.cu
++++ b/src/ggml-cuda/fattn.cu
+@@ -4,6 +4,7 @@
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
++#include "cudnn-attn.cuh"
+ 
+ template <int DKQ, int DV, int ncols2>
+ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -573,11 +574,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+ 
+-    return f16_extra.end - (uintptr_t) dst->data;
++    // The cuDNN path, when it can run, uses the same region after dst for its own scratch.
++    return std::max<size_t>(f16_extra.end - (uintptr_t) dst->data, ggml_cuda_cudnn_attn_alloc_size(device, dst));
+ }
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    if (ggml_cuda_cudnn_attn(ctx, dst)) {
++        return;
++    }
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 86a6cc5b..749aead9 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -919,7 +919,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+         : ggml_nbytes(tensor);
+     if (tensor->op == GGML_OP_SAGE_ATTN) {
+-        size = ggml_cuda_sage_attn_get_alloc_size(tensor);
++        size = ggml_cuda_sage_attn_get_alloc_size(buft_ctx->device, tensor);
+     }
+     int64_t ne0 = tensor->ne[0];
+ 
+diff --git a/src/ggml-cuda/sage-attn.cu b/src/ggml-cuda/sage-attn.cu
+index 2c103eb0..ceb29ed2 100644
+--- a/src/ggml-cuda/sage-attn.cu
++++ b/src/ggml-cuda/sage-attn.cu
+@@ -1,4 +1,5 @@
+ #include "sage-attn.cuh"
++#include "cudnn-attn.cuh"
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDACC_VER_MAJOR__ >= 12
+ 
+@@ -332,13 +333,18 @@ bool ggml_cuda_sage_attn_supported(int device, const ggml_tensor* op) {
+            op->ne[2] == q->ne[1] && op->ne[3] == q->ne[3];
+ }
+ 
+-size_t ggml_cuda_sage_attn_get_alloc_size(const ggml_tensor* op) {
++size_t ggml_cuda_sage_attn_get_alloc_size(int device, const ggml_tensor* op) {
+     // Scratch belongs to the graph allocation, so graph capture and VRAM planning see its full lifetime.
+-    return SageWorkspace(op).size;
++    // The cuDNN path, when it can run, reuses the same region for its own scratch.
++    return std::max<size_t>(SageWorkspace(op).size, ggml_cuda_cudnn_attn_alloc_size(device, op));
+ }
+ 
+ void ggml_cuda_sage_attn(ggml_backend_cuda_context& ctx, ggml_tensor* dst) {
+     GGML_ASSERT(ggml_cuda_sage_attn_supported(ctx.device, dst));
++    ggml_cuda_set_device(ctx.device);
++    if (ggml_cuda_cudnn_attn(ctx, dst)) {
++        return;
++    }
+     if (dst->src[0]->ne[0] == 64) {
+         sage_attn<64>(ctx, dst);
+     } else {
+@@ -352,7 +358,7 @@ bool ggml_cuda_sage_attn_supported(int, const ggml_tensor*) {
+     return false;
+ }
+ 
+-size_t ggml_cuda_sage_attn_get_alloc_size(const ggml_tensor* op) {
++size_t ggml_cuda_sage_attn_get_alloc_size(int, const ggml_tensor* op) {
+     return ggml_nbytes(op);
+ }
+ 
+diff --git a/src/ggml-cuda/sage-attn.cuh b/src/ggml-cuda/sage-attn.cuh
+index 126c7a74..e2648857 100644
+--- a/src/ggml-cuda/sage-attn.cuh
++++ b/src/ggml-cuda/sage-attn.cuh
+@@ -4,7 +4,7 @@
+ #include "common.cuh"
+ 
+ bool ggml_cuda_sage_attn_supported(int device, const ggml_tensor* op);
+-size_t ggml_cuda_sage_attn_get_alloc_size(const ggml_tensor* op);
++size_t ggml_cuda_sage_attn_get_alloc_size(int device, const ggml_tensor* op);
+ void ggml_cuda_sage_attn(ggml_backend_cuda_context& ctx, ggml_tensor* dst);
+ 
+ #endif
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b58c815c..55db14a0 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9773,6 +9773,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     }
+ 
++    // unmasked F16 K/V with the MiniMax-H3 DiT head layout (42 heads x 128), the shape class the CUDA
++    // cuDNN attention path takes: odd and tile-aligned lengths, GQA with batch, F32 K/V, head size 64.
++    for (int64_t n : { 1023, 4096 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 42, {1, 1}, n, n, false, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 42, {1, 1}, 4096, 333, false, false, 0, 0,
++                                                    GGML_PREC_DEFAULT, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {4, 2}, 777, 333, false, false, 0, 0,
++                                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 512, false, false, 0, 0,
++                                                    GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 42, {1, 1}, 1023, 1023, false, false, 0, 0,
++                                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++
+     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
+     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
+     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
+@@ -10124,6 +10139,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
+     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // unmasked diffusion attention: MiniMax-H3 DiT (19315 tokens x 56 heads at 960x544x124; 22440 x 42),
++    // its token refiner (31 tokens) and video VAE decoder (1797 x 32 x 64), FLUX-class 1024px (4096 x 24),
++    // and a single-query row
++    for (auto [hs, nh, n] : std::vector<std::array<int64_t, 3>>{ { 128, 56, 19315 }, { 128, 42, 22440 }, { 128, 56, 31 },
++                                                                 { 64, 32, 1797 }, { 128, 24, 4096 }, { 128, 16, 256 },
++                                                                 { 128, 16, 512 }, { 128, 16, 1024 } }) {
++        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {1, 1}, n, n, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+-- 
+2.43.0
+

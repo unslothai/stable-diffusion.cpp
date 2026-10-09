@@ -207,15 +207,10 @@ ggml_tensor* ggml_ext_gelu_quick(ggml_context* ctx,
     return x;
 }
 
-ggml_tensor* ggml_ext_linear(ggml_context* ctx,
-                             ggml_tensor* x,
-                             ggml_tensor* w,
-                             ggml_tensor* b,
-                             bool force_prec_f32,
-                             float scale) {
-    if (scale != 1.f) {
-        x = ggml_ext_scale(ctx, x, scale);
-    }
+ggml_tensor* ggml_ext_linear_matmul(ggml_context* ctx,
+                                    ggml_tensor* x,
+                                    ggml_tensor* w,
+                                    bool force_prec_f32) {
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
@@ -232,6 +227,19 @@ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
             ggml_mul_mat_set_prec(x, GGML_PREC_F32);
         }
     }
+    return x;
+}
+
+ggml_tensor* ggml_ext_linear(ggml_context* ctx,
+                             ggml_tensor* x,
+                             ggml_tensor* w,
+                             ggml_tensor* b,
+                             bool force_prec_f32,
+                             float scale) {
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, scale);
+    }
+    x = ggml_ext_linear_matmul(ctx, x, w, force_prec_f32);
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, 1.f / scale);
     }
@@ -793,6 +801,47 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     kqv = ggml_ext_cont(ctx, kqv);
     kqv = ggml_reshape_3d(ctx, kqv, d_head * n_head, L_q, N);  // [N, L_q, C]
 
+    return kqv;
+}
+
+ggml_tensor* ggml_ext_attention_prepared(ggml_context* ctx,
+                                         ggml_backend_t backend,
+                                         ggml_tensor* q,
+                                         ggml_tensor* k,
+                                         ggml_tensor* v,
+                                         int64_t n_head,
+                                         int64_t N,
+                                         float kv_scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    const int64_t L_q    = q->ne[1];
+    const int64_t d_head = v->ne[0];
+    if (backend == nullptr || d_head < 64) {
+        return nullptr;
+    }
+
+    // Same expressions as ggml_ext_attention_ext so the softmax scale rounds identically.
+    float scale = (1.0f / sqrt((float)d_head));
+
+    auto kqv = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale / kv_scale, 0, 0);
+    if (!ggml_backend_supports_op(backend, kqv)) {
+        return nullptr;
+    }
+    ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
+    if (kv_scale != 1.0f) {
+        kqv = ggml_ext_scale(ctx, kqv, 1.0f / kv_scale);
+    }
+    kqv = ggml_view_4d(ctx,
+                       kqv,
+                       d_head,
+                       n_head,
+                       L_q,
+                       N,
+                       kqv->nb[1],
+                       kqv->nb[2],
+                       kqv->nb[1] * n_head,
+                       0);
+    kqv = ggml_ext_cont(ctx, kqv);
+    kqv = ggml_reshape_3d(ctx, kqv, d_head * n_head, L_q, N);  // [N, L_q, C]
     return kqv;
 }
 
