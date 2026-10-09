@@ -94,6 +94,7 @@ private:
     std::vector<std::unique_ptr<TensorState>> tensor_states_;
     std::map<const ggml_tensor*, TensorState*> tensor_states_by_tensor_;
     mutable std::list<ResolvedTensorStates> resolved_tensor_states_;
+    mutable std::map<std::pair<uintptr_t, ggml_backend_dev_t>, std::pair<size_t, size_t>> device_query_cache_;
     std::vector<std::unique_ptr<ParamsStorageBlock>> params_storage_blocks_;
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;

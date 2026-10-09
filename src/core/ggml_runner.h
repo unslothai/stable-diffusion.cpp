@@ -156,6 +156,7 @@ protected:
     bool graph_active_        = false;
 
     size_t max_graph_vram_bytes        = 0;
+    bool reuse_device_query_           = false;
     bool graph_cut_layer_split_enabled = false;
     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
 
@@ -367,6 +368,11 @@ public:
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
         weight_adapter = adapter;
+    }
+
+    // See DeviceMemoryRequest::reuse_device_query; runner_end() drops the saved reading.
+    void set_reuse_device_query(bool enabled) {
+        reuse_device_query_ = enabled;
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) {

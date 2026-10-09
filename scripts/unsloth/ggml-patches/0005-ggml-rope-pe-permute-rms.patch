@@ -1,0 +1,304 @@
+From 092f5d51d0844f7cf282ca115a81fccdde9fafad Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 1 Oct 2026 23:16:25 -0700
+Subject: [PATCH] ggml : rope_pe_permute with the per-head RMS norm folded in
+
+ggml_rope_pe_permute_rms(a, pe, n_rot, scale, type, eps) is ggml_rope_pe_permute of
+ggml_rms_norm(a, eps) without a weight. CPU uses rms_norm's arithmetic (double sum,
+1/sqrtf, vec scale); CUDA normalises each head row with the block size and block
+reduction rms_norm_f32_cuda's small-row path uses for that row length, so both match
+the two-op chain bit for bit. CUDA supports it for head_dim <= 128 when that small-row
+path is active (not HIP/MUSA, GGML_CUDA_NORM_SMALL_ROWS not 0); elsewhere the op is
+reported unsupported and callers keep the separate norm. test-backend-ops cases added.
+---
+ include/ggml.h             |  12 ++++
+ src/ggml-cpu/ops.cpp       |  17 +++++-
+ src/ggml-cuda/rope-pe.cu   | 120 +++++++++++++++++++++++++++++++++++++
+ src/ggml.c                 |  15 +++++
+ tests/test-backend-ops.cpp |  15 +++--
+ 5 files changed, 174 insertions(+), 5 deletions(-)
+
+diff --git a/include/ggml.h b/include/ggml.h
+index 153eed2a..8134626f 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2483,6 +2483,18 @@ extern "C" {
+             float                 scale,
+             enum ggml_type        type);
+ 
++    // ggml_rope_pe_permute of ggml_rms_norm(a, eps) (no weight): every head row of `a` is
++    // RMS-normalised first, with the same arithmetic as GGML_OP_RMS_NORM on the same backend, so
++    // the result matches the two-op chain bit for bit where the backend supports it.
++    GGML_API struct ggml_tensor * ggml_rope_pe_permute_rms(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * pe,
++            int                   n_rot,
++            float                 scale,
++            enum ggml_type        type,
++            float                 eps);
++
+     // Row-range modulation for adaLN-style blocks whose sequence is split into segments that use
+     // different modulation vectors. Writes rows [row0, row1) along dim 1 (all of dims 2 and 3) of the
+     // result and leaves every other row as it is in `acc`: chain one call per segment, passing the
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 40fe1949..1d67b482 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -12151,6 +12151,8 @@ void ggml_compute_forward_rope_pe_permute(
+ 
+     const int   n_rot = ggml_get_op_params_i32(dst, 0);
+     const float scale = ggml_get_op_params_f32(dst, 1);
++    const bool  norm  = ggml_get_op_params_i32(dst, 2) != 0;
++    const float eps   = ggml_get_op_params_f32(dst, 3);
+     const int   half  = n_rot / 2;
+ 
+     const int64_t D = src0->ne[0];
+@@ -12165,7 +12167,7 @@ void ggml_compute_forward_rope_pe_permute(
+ 
+     // Same rounding points as the unfused graph: each product, the sum, the scale and the
+     // conversion are separate passes, so no contraction into fused multiply-adds can happen.
+-    std::vector<float> p0(n_rot), p1(n_rot), y(D);
++    std::vector<float> p0(n_rot), p1(n_rot), y(D), xn(norm ? D : 0);
+ 
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t h = ir % H;
+@@ -12174,6 +12176,19 @@ void ggml_compute_forward_rope_pe_permute(
+ 
+         const float * x = (const float *) ((const char *) src0->data + h * src0->nb[1] + l * src0->nb[2] + n * src0->nb[3]);
+ 
++        if (norm) {
++            // ggml_compute_forward_rms_norm_f32 without a weight
++            ggml_float sum = 0.0;
++            for (int64_t i = 0; i < D; i++) {
++                sum += (ggml_float)(x[i] * x[i]);
++            }
++            const float mean = sum/D;
++            const float s    = 1.0f/sqrtf(mean + eps);
++            memcpy(xn.data(), x, D * sizeof(float));
++            ggml_vec_scale_f32((int) D, xn.data(), s);
++            x = xn.data();
++        }
++
+         if (n_rot > 0) {
+             const float * t = (const float *) pe->data + l * (int64_t) half * 4;
+             for (int i = 0; i < n_rot; ++i) {
+diff --git a/src/ggml-cuda/rope-pe.cu b/src/ggml-cuda/rope-pe.cu
+index 3afe4423..b6dd7a69 100644
+--- a/src/ggml-cuda/rope-pe.cu
++++ b/src/ggml-cuda/rope-pe.cu
+@@ -44,6 +44,112 @@ static __global__ void rope_pe_permute_kernel(
+     }
+ }
+ 
++// Same op with every head row RMS-normalised first (no weight). One block of block_size threads
++// per (token, batch), the size and reduction rms_norm_f32_cuda's small-row path uses for this row
++// length, so each normalised value is bit-identical to GGML_OP_RMS_NORM's; the normalised row is
++// staged in shared memory for the RoPE partner reads.
++template <typename dst_t, bool has_scale, int block_size>
++static __global__ void rope_pe_permute_rms_kernel(
++        const char * __restrict__ x, const float * __restrict__ pe, dst_t * __restrict__ dst,
++        const int D, const int H, const int64_t L, const int n_rot,
++        const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const float scale, const float bias, const float eps) {
++    const int64_t l    = blockIdx.x;
++    const int64_t n    = blockIdx.y;
++    const int     half = n_rot / 2;
++    const int     i    = threadIdx.x;
++
++    __shared__ float s_sum[32];
++    __shared__ float xs[block_size];
++
++    const bool rot = i < n_rot;
++    int   j  = i;
++    float c0 = 0.0f;
++    float c1 = 0.0f;
++    if (rot) {
++        const int r = i >= half;
++        j           = i - r * half;
++        const float * t = pe + (l * half + j) * 4 + 2 * r;
++        c0 = t[0];
++        c1 = t[1];
++    }
++    for (int h = 0; h < H; ++h) {
++        const float * xr = (const float *) (x + h * nb01 + l * nb02 + n * nb03);
++        float xi  = 0.0f;
++        float tmp = 0.0f;
++        if (i < D) {
++            xi = xr[i];
++            tmp += xi * xi;
++        }
++        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++        const float mean = tmp / D;
++        const float sc   = rsqrtf(mean + eps);
++        if (i < D) {
++            xs[i] = sc * xi;
++        }
++        __syncthreads();
++        if (i < D) {
++            float y;
++            if (rot) {
++                y = __fadd_rn(__fmul_rn(xs[j], c0), __fmul_rn(xs[j + half], c1));
++            } else {
++                y = xs[i];
++            }
++            if constexpr (has_scale) {
++                y = scale * y + bias;
++            }
++            dst[((n * H + h) * L + l) * D + i] = ggml_cuda_cast<dst_t>(y);
++        }
++        __syncthreads();
++    }
++}
++
++// rms_norm_f32_cuda takes its small-row path (and so its reduction order) only here.
++static bool rope_pe_rms_small_rows_enabled() {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    return false;
++#else
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_NORM_SMALL_ROWS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled && WARP_SIZE == 32;
++#endif
++}
++
++template <typename dst_t, int block_size>
++static void rope_pe_permute_rms_launch(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
++                                       const float scale, const float eps, cudaStream_t stream) {
++    const int     D = (int) src0->ne[0];
++    const int     H = (int) src0->ne[1];
++    const int64_t L = src0->ne[2];
++    const int64_t N = src0->ne[3];
++    const dim3 grid((unsigned int) L, (unsigned int) N, 1);
++    const dim3 block(block_size, 1, 1);
++    const char * x = (const char *) src0->data;
++    if (scale != 1.0f) {
++        rope_pe_permute_rms_kernel<dst_t, true, block_size><<<grid, block, 0, stream>>>(
++            x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f, eps);
++    } else {
++        rope_pe_permute_rms_kernel<dst_t, false, block_size><<<grid, block, 0, stream>>>(
++            x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f, eps);
++    }
++}
++
++template <typename dst_t>
++static void rope_pe_permute_rms_cuda(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
++                                     const float scale, const float eps, cudaStream_t stream) {
++    const int D = (int) src0->ne[0];
++    GGML_ASSERT(D <= 128);
++    if (D <= 32) {
++        rope_pe_permute_rms_launch<dst_t, 32>(src0, pe, dst, n_rot, scale, eps, stream);
++    } else if (D <= 64) {
++        rope_pe_permute_rms_launch<dst_t, 64>(src0, pe, dst, n_rot, scale, eps, stream);
++    } else {
++        rope_pe_permute_rms_launch<dst_t, 128>(src0, pe, dst, n_rot, scale, eps, stream);
++    }
++}
++
+ template <typename dst_t>
+ static void rope_pe_permute_cuda(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
+                                  const float scale, cudaStream_t stream) {
+@@ -78,6 +184,17 @@ void ggml_cuda_op_rope_pe_permute(ggml_backend_cuda_context & ctx, ggml_tensor *
+     cudaStream_t  stream = ctx.stream();
+     const float * pe_d   = pe ? (const float *) pe->data : nullptr;
+ 
++    if (ggml_get_op_params_i32(dst, 2) != 0) {
++        const float eps = ggml_get_op_params_f32(dst, 3);
++        if (dst->type == GGML_TYPE_F16) {
++            rope_pe_permute_rms_cuda(src0, pe_d, (half *) dst->data, n_rot, scale, eps, stream);
++        } else {
++            GGML_ASSERT(dst->type == GGML_TYPE_F32);
++            rope_pe_permute_rms_cuda(src0, pe_d, (float *) dst->data, n_rot, scale, eps, stream);
++        }
++        return;
++    }
++
+     if (dst->type == GGML_TYPE_F16) {
+         rope_pe_permute_cuda(src0, pe_d, (half *) dst->data, n_rot, scale, stream);
+     } else {
+@@ -98,5 +215,8 @@ bool ggml_cuda_rope_pe_permute_supported(const ggml_tensor * op) {
+     if (src0->ne[2] > INT_MAX || src0->ne[3] > 65535 || src0->ne[1] > INT_MAX || src0->ne[0] > INT_MAX) {
+         return false;
+     }
++    if (ggml_get_op_params_i32(op, 2) != 0 && (src0->ne[0] > 128 || !rope_pe_rms_small_rows_enabled())) {
++        return false;
++    }
+     return pe == nullptr || (pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
+ }
+diff --git a/src/ggml.c b/src/ggml.c
+index fec933bf..62a157c6 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -5594,6 +5594,21 @@ struct ggml_tensor * ggml_rope_pe_permute(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_rope_pe_permute_rms(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * pe,
++        int                   n_rot,
++        float                 scale,
++        enum ggml_type        type,
++        float                 eps) {
++    GGML_ASSERT(eps >= 0.0f);
++    struct ggml_tensor * result = ggml_rope_pe_permute(ctx, a, pe, n_rot, scale, type);
++    ggml_set_op_params_i32(result, 2, 1);
++    ggml_set_op_params_f32(result, 3, eps);
++    return result;
++}
++
+ static struct ggml_tensor * ggml_modulate_rows_impl(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * acc,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1e46361c..b58c815c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2132,15 +2132,16 @@ struct test_rope_pe_permute : public test_case {
+     const int n_rot;
+     const float scale;
+     const bool view; // a is a strided view (one third of a fused qkv projection)
++    const float eps; // >= 0: ggml_rope_pe_permute_rms (rows RMS-normalised first)
+ 
+     std::string vars() override {
+-        return VARS_TO_STR5(type, ne_a, n_rot, scale, view);
++        return VARS_TO_STR6(type, ne_a, n_rot, scale, view, eps);
+     }
+ 
+     test_rope_pe_permute(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {128, 4, 9, 1},
+-            int n_rot = 96, float scale = 1.0f, bool view = false)
+-        : type(type), ne_a(ne_a), n_rot(n_rot), scale(scale), view(view) {}
++            int n_rot = 96, float scale = 1.0f, bool view = false, float eps = -1.0f)
++        : type(type), ne_a(ne_a), n_rot(n_rot), scale(scale), view(view), eps(eps) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a;
+@@ -2159,7 +2160,8 @@ struct test_rope_pe_permute : public test_case {
+             pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, n_rot / 2, ne_a[2]);
+             ggml_set_name(pe, "pe");
+         }
+-        ggml_tensor * out = ggml_rope_pe_permute(ctx, a, pe, n_rot, scale, type);
++        ggml_tensor * out = eps >= 0.0f ? ggml_rope_pe_permute_rms(ctx, a, pe, n_rot, scale, type, eps)
++                                        : ggml_rope_pe_permute(ctx, a, pe, n_rot, scale, type);
+         ggml_set_name(out, "out");
+         return out;
+     }
+@@ -8221,6 +8223,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                 test_cases.emplace_back(new test_rope_pe_permute(type, {128, 4, 9, 1}, 0, scale, view));
+                 test_cases.emplace_back(new test_rope_pe_permute(type, {64, 3, 7, 2}, 32, scale, view));
+                 test_cases.emplace_back(new test_rope_pe_permute(type, {200, 2, 3, 1}, 100, scale, view));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {64, 32, 37, 1}, 48, scale, view, 1e-5f));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {64, 3, 7, 2}, 0, scale, view, 1e-5f));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {128, 4, 9, 1}, 96, scale, view, 1e-6f));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {32, 2, 5, 1}, 16, scale, view, 1e-5f));
++                test_cases.emplace_back(new test_rope_pe_permute(type, {48, 2, 5, 1}, 32, scale, view, 1e-5f));
+             }
+         }
+     }
+-- 
+2.43.0
+

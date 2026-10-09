@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <memory>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -329,6 +333,26 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
         LOG_VERBOSE("processing %i tiles", num_tiles);
         pretty_progress(0, num_tiles, 0.0f);
     }
+    // Blend on a worker while the next batch computes, still in tile order; SD_TILE_ASYNC_MERGE=0 blends inline.
+    static const bool async_merge = []() {
+        const char* value = getenv("SD_TILE_ASYNC_MERGE");
+        return value == nullptr || value[0] == '\0' || atoi(value) != 0;
+    }();
+    std::thread merger;
+    bool merge_failed = false;
+    auto join_merger  = [&]() {
+        if (merger.joinable()) {
+            merger.join();
+        }
+    };
+    struct MergerGuard {
+        std::thread& thread;
+        ~MergerGuard() {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    } merger_guard{merger};
     std::vector<sd::Tensor<float>> input_tiles;
     for (size_t first = 0; first < placements.size();) {
         const int remaining = static_cast<int>(placements.size() - first);
@@ -351,29 +375,56 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
         std::vector<int64_t> tile_shape = batch.data.shape();
         tile_shape[batch.stack_dim] /= batch_tiles;
         GGML_ASSERT(tile_shape[0] == output_tile_size_x && tile_shape[1] == output_tile_size_y);
-        const int64_t tile_numel  = batch.data.numel() / batch_tiles;
-        const int64_t plane_count = tile_numel / (tile_shape[0] * tile_shape[1]);
-        if (output.empty()) {
-            std::vector<int64_t> output_shape = tile_shape;
-            output_shape[0]                   = output_width;
-            output_shape[1]                   = output_height;
-            output                            = sd::Tensor<float>::zeros(std::move(output_shape));
+        auto merge_batch = [&, first, last, tile_shape](const sd::Tensor<float>& data) {
+            const int64_t tile_numel  = data.numel() / static_cast<int64_t>(last - first);
+            const int64_t plane_count = tile_numel / (tile_shape[0] * tile_shape[1]);
+            if (output.empty()) {
+                std::vector<int64_t> output_shape = tile_shape;
+                output_shape[0]                   = output_width;
+                output_shape[1]                   = output_height;
+                output                            = sd::Tensor<float>::zeros(std::move(output_shape));
+            }
+            for (size_t i = first; i < last; ++i) {
+                const auto& placement = placements[i];
+                sd_tensor_merge_2d(data.data() + static_cast<int64_t>(i - first) * tile_numel,
+                                   tile_shape[0],
+                                   tile_shape[1],
+                                   plane_count,
+                                   &output,
+                                   placement.x_out,
+                                   placement.y_out,
+                                   overlap_x_out,
+                                   overlap_y_out,
+                                   circular_x,
+                                   circular_y,
+                                   placement.dx,
+                                   placement.dy);
+            }
+        };
+        join_merger();
+        if (merge_failed) {
+            return {};
         }
-        for (size_t i = first; i < last; ++i) {
-            const auto& placement = placements[i];
-            sd_tensor_merge_2d(batch.data.data() + static_cast<int64_t>(i - first) * tile_numel,
-                               tile_shape[0],
-                               tile_shape[1],
-                               plane_count,
-                               &output,
-                               placement.x_out,
-                               placement.y_out,
-                               overlap_x_out,
-                               overlap_y_out,
-                               circular_x,
-                               circular_y,
-                               placement.dx,
-                               placement.dy);
+        bool merged_async = false;
+        if (async_merge && last < placements.size()) {
+            auto data = std::make_shared<sd::Tensor<float>>(std::move(batch.data));
+            try {
+                merger = std::thread([&merge_failed, merge_batch, data]() {
+                    try {
+                        merge_batch(*data);
+                    } catch (const std::exception& error) {
+                        LOG_ERROR("tile merge failed: %s", error.what());
+                        merge_failed = true;
+                    }
+                });
+                merged_async = true;
+            } catch (const std::system_error&) {
+                merge_batch(*data);  // no thread available: merge inline
+                merged_async = true;
+            }
+        }
+        if (!merged_async) {
+            merge_batch(batch.data);
         }
 
         if (!silent) {
@@ -387,6 +438,10 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
             tile_count += static_cast<int>(last - first);
         }
         first = last;
+    }
+    join_merger();
+    if (merge_failed) {
+        return {};
     }
     if (!silent && tile_count < num_tiles) {
         pretty_progress(num_tiles, num_tiles, last_time);

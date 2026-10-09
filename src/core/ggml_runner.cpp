@@ -725,7 +725,7 @@ std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
             }
         }
         requests.push_back({size.backend, reinterpret_cast<uintptr_t>(this), pending,
-                            retained, limit});
+                            retained, limit, reuse_device_query_});
     }
     return requests;
 }

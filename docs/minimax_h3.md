@@ -58,21 +58,47 @@ shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0
 stock kernel. `GGML_CUDA_FA_LONGSEQ_NCOLS=128` opts into a wider tile that is faster on A100 and L4
 but not bit-identical.
 
-The video VAE decodes one 16x16 latent tile per decoder graph by default.
+The video VAE decodes one 16x16 latent tile per decoder graph by default. `SD_H3_VAE_TILE=N`
+uses N x N latent tiles instead (20 decodes about 0.7 s faster at 960x544x124 on B200); the tile
+seams move, so the frames differ from the default (36 dB PSNR at 20) and it is opt-in.
 `SD_H3_VAE_TILE_BATCH=auto` puts several tiles into one graph, sized from free device memory (at
 most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it), and `SD_H3_VAE_TILE_BATCH=N` forces N; the
 batched projections can round differently from the per-tile decode on some GPUs, so it is
 opt-in. The decoder weights stay on the device across temporal chunks
 (`SD_H3_VAE_KEEP_RESIDENT=0` releases them after every chunk), and the decoder blocks use a
 table-based rotary embedding and a fused SwiGLU (`SD_H3_VAE_GRAPH_OPT=0` restores the previous
-graph). Each batched tile still goes through its own attention call.
+graph). Each batched tile still goes through its own attention call. With one tile per graph and
+flash attention, each decoder attention normalises q/k in place on the projection and one fused
+RoPE op per tensor writes the head-major Q (F32) and K/V (F16) that the attention kernel reads,
+replacing the table RoPE, chunk copies, permutes and casts; the frames are bit-identical
+(`SD_H3_VAE_FUSED_QKV=0` restores the unfused graph). On CUDA the q/k RMS norm runs inside that
+RoPE op with the same reduction as the standalone norm (`SD_H3_VAE_FUSED_QK_NORM=0` keeps it
+separate).
+
+The host side of the decode overlaps the device: each tile's blend into the frame runs on a
+worker thread while the next tile computes (`SD_TILE_ASYNC_MERGE=0` blends inline; this applies
+to every tiled VAE decode), each temporal chunk is trimmed, cross-faded and copied into the final
+frames on a worker thread while the next chunk decodes (`SD_H3_VAE_ASYNC_ASSEMBLY=0` restores
+the concatenate-at-the-end path), the rotary tables are built once per tile shape, and a tile
+that allocates nothing new reuses the device free-memory reading taken earlier in the decode
+instead of querying the device for every capacity check (`SD_H3_VAE_REUSE_MEMQUERY=0`). The
+decoded frames are bit-identical either way.
 
 The DiT blocks use fused ggml ops (CPU and CUDA) for the work around the matmuls and attention:
 partial RoPE with the attention relayout and the K/V scale and F16 cast, per-segment adaLN
 modulation and gated residuals written in place, and the MLP Linear scales folded into those ops
 and the swiglu. The result is bit-identical to the unfused graph. `SD_H3_GRAPH_FAST=0` restores
 the unfused graph; `SD_H3_FAST_QKV=0`, `SD_H3_FAST_MLP=0`, `SD_H3_FAST_SEGMENTS=0` and
-`SD_H3_FAST_VIEWS=0` turn off one part each.
+`SD_H3_FAST_VIEWS=0` turn off one part each. With `--sage-attn` the same fused RoPE op writes the
+F32 Q/K and F16 V layout the sage kernel reads (K and V carry the kv scale), so the sage path no
+longer pays for the chunk / slice / rope / concat / scale / cast chain; the output is bit-identical
+to the unfused sage graph. `SD_H3_FAST_SAGE_QKV=0` restores that chain.
+
+The audio VAE's anti-aliased activations run their up/down-sampling filters as direct F32
+depthwise convolutions (`CONV_2D_DW`) instead of an F16 im2col plus a matrix-vector product,
+which makes the audio decode several times faster. The input is no longer rounded to F16, so
+the waveform differs slightly from the previous graph (about 41 dB SNR on a 5 s clip).
+`SD_H3_AUDIO_DIRECT_DW=0` restores the previous graph; backends without `CONV_2D_DW` keep it.
 
 The long-sequence flash attention kernel, the fused cuBLAS epilogues and the fused DiT ops come from
 the ggml patches in `scripts/unsloth/ggml-patches`, which the Unsloth prebuilt binaries carry. A

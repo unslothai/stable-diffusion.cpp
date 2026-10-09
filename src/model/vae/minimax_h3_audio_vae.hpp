@@ -2,6 +2,7 @@
 #define __SD_MODEL_VAE_MINIMAX_H3_AUDIO_VAE_HPP__
 
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,15 @@
 #include "model/vae/ltx_audio_vae.hpp"
 
 namespace MiniMaxH3 {
+
+    // SD_H3_AUDIO_DIRECT_DW=0: anti-aliased activations go back to the im2col + mat-vec depthwise convs.
+    static bool audio_direct_dw() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("SD_H3_AUDIO_DIRECT_DW");
+            return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+        }();
+        return enabled;
+    }
 
     struct AudioSnake1D : public UnaryBlock {
         int64_t channels;
@@ -229,9 +239,9 @@ namespace MiniMaxH3 {
             : channels(channels) {
             for (int i = 0; i < 3; ++i) {
                 blocks["activations." + std::to_string(i * 2)] =
-                    std::make_shared<LTXV::Activation1D>(channels);
+                    std::make_shared<LTXV::Activation1D>(channels, audio_direct_dw());
                 blocks["activations." + std::to_string(i * 2 + 1)] =
-                    std::make_shared<LTXV::Activation1D>(channels);
+                    std::make_shared<LTXV::Activation1D>(channels, audio_direct_dw());
                 blocks["convs1." + std::to_string(i)] =
                     std::make_shared<LTXV::Conv1D>(channels,
                                                    channels,
@@ -298,7 +308,7 @@ namespace MiniMaxH3 {
                 }
                 channels = next_channels;
             }
-            blocks["activation_post"] = std::make_shared<LTXV::Activation1D>(channels);
+            blocks["activation_post"] = std::make_shared<LTXV::Activation1D>(channels, audio_direct_dw());
             blocks["conv_post"]       = std::make_shared<LTXV::Conv1D>(channels,
                                                                  1,
                                                                  7,
