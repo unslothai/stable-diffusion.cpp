@@ -761,9 +761,12 @@ jobs:
           $cuda = Join-Path $bin 'ggml-cuda.dll'
           if (-not (Test-Path $cuda)) { throw 'ggml-cuda.dll was not built' }
           $imports = (& dumpbin /dependents $cuda) -join "`n"
-          foreach ($dll in @("cudart64_$major.dll", "cublas64_$major.dll")) {
-            if ($imports -notmatch [regex]::Escape($dll)) { throw "ggml-cuda.dll does not import $dll" }
-          }
+          $imports
+          # cublas is always the host's. cudart is too on CUDA 12; CUDA 13 links it statically, as in
+          # unslothai/llama.cpp's cuda13 build, which imports cublas64_13.dll alone.
+          if ($imports -notmatch [regex]::Escape("cublas64_$major.dll")) { throw "ggml-cuda.dll does not import cublas64_$major.dll" }
+          $other = [regex]::Matches($imports, '(?i)(cudart|cublas)64_(\d+)\.dll') | Where-Object { $_.Groups[2].Value -ne $major }
+          if ($other) { throw "ggml-cuda.dll imports another CUDA major: $($other.Value -join ', ')" }
 
       - name: Sign Windows binaries
         uses: ./tooling/.github/actions/sign-windows
