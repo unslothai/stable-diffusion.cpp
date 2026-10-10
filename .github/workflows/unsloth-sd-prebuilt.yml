@@ -9,18 +9,19 @@ name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan)
 # rather than sending AMD hosts to an older upstream fallback binary.
 #
 # Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 7-way
-# CPU/Apple/Vulkan matrix plus one best-effort CUDA leg:
+# CPU/Apple/Vulkan matrix plus best-effort CUDA legs:
 #   resolve      -- take THIS repository at the requested ref, merge the pinned PR set
 #                   in scripts/unsloth/pr-set.json, stamp a source tarball, name it
 #                   after the upstream release the tree descends from (supply-chain
 #                   aged), decide if our release already exists.
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64, Linux Vulkan.
 #   build-windows-- Windows x64 CPU + Vulkan (MSVC + Ninja).
-#   build-linux-cuda -- Linux x64, CUDA 12.8, best effort (continue-on-error).
+#   build-linux-cuda / build-windows-cuda -- x64, CUDA 12.8 and 13.3, best effort
+#                   (continue-on-error); the CUDA runtime is not bundled, see build-linux-cuda.
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
 #                   draft->publish. If any CPU/Apple/Vulkan leg fails, assemble
 #                   is skipped and nothing is published (the Studio needs the full
-#                   asset set). The CUDA leg is exempt: it ships when it built and is
+#                   asset set). The CUDA legs are exempt: each ships when it built and is
 #                   absent when it did not, so it can never hold back the fallbacks.
 #
 # Asset names match the Studio installer's resolve_release_asset.
@@ -374,21 +375,38 @@ jobs:
   # against 21.5 s/step at 960x544 from a CUDA build. That is the difference between a render
   # taking four hours and taking eleven minutes.
   #
+  # One bundle per CUDA major, and no CUDA runtime in any of them. Studio always installs
+  # unslothai/llama.cpp, whose CUDA build links the same cudart / cublas / cublasLt and already
+  # resolves them on every CUDA host (the venv's torch and nvidia-* wheels, CUDA_PATH, the paired
+  # cudart archive on Windows). Studio picks the bundle whose major matches that llama.cpp build
+  # and hands sd-cli the same directories, so the toolkits here match llama.cpp's cuda12 / cuda13
+  # lines. ggml is a shared library so sd-cli and sd-server share one copy of the CUDA kernels.
+  #
   # continue-on-error, and deliberately so. The CPU and Apple assets are what Studio falls back
   # to, and a CUDA toolchain failure must never stop them publishing. assemble collects bundles
   # by the sd-*-bin-* pattern, so this asset appears when it built and is simply absent when it
   # did not; the coverage gate requires CPU/Apple/Vulkan assets but leaves CUDA optional.
   build-linux-cuda:
-    name: Linux-Ubuntu-22.04-x86_64-cuda12
+    name: Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}
     needs: resolve
     continue-on-error: true
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
-    # One source of truth for both: the ccache key has to track whatever changes
-    # the objects, and these two do.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - line: cuda12
+            cuda: "12.8.0"
+            archs: "70;75;80;86;89;90;100;120"
+          # CUDA 13 dropped Volta.
+          - line: cuda13
+            cuda: "13.3"
+            archs: "75;80;86;89;90;100;120"
+    # The ccache key tracks both, since both change the objects.
     env:
-      CUDA_VERSION: "12.8.1"
-      CUDA_ARCHS: "70;75;80;86;89;90;100;120"
+      CUDA_VERSION: ${{ matrix.cuda }}
+      CUDA_ARCHS: ${{ matrix.archs }}
     steps:
       - name: Checkout mirror (tooling)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -415,19 +433,36 @@ jobs:
           mkdir -p src
           tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
 
-      - name: Install CUDA toolkit
-        id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@95b5a29a2823ef87666dcd45ec236fc4f82498d0  # v0.2.22
-        with:
-          cuda: ${{ env.CUDA_VERSION }}
-          method: "network"
-          # sub-packages are installed as cuda-<name>-12-8. cuBLAS is not under that
-          # prefix (it ships as libcublas / libcublas-dev), so it has to go in the
-          # other list or apt cannot find it. cudart-dev is what carries the headers;
-          # cudart alone is the runtime and does not compile anything.
-          # nvrtc-dev: cudnn-frontend's headers include nvrtc.h (it dlopens libnvrtc itself, so nothing links it).
-          sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust", "nvrtc-dev"]'
-          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+      # Component tables copied from unslothai/llama.cpp's unsloth-cuda-linux-setup, so both projects
+      # link the sonames Studio already resolves for llama-server. nvrtc: cudnn-frontend's headers
+      # include nvrtc.h (it dlopens libnvrtc itself, so nothing links it).
+      - name: Install CUDA toolkit ${{ env.CUDA_VERSION }} (NVIDIA redist)
+        run: |
+          set -eux
+          case "$CUDA_VERSION" in
+            12.8.0) COMPONENTS="cuda_cudart:12.8.90 cuda_nvcc:12.8.93 cuda_nvrtc:12.8.93 libcublas:12.8.4.1 cuda_nvtx:12.8.90 cuda_profiler_api:12.8.90 cuda_cccl:12.8.90" ;;
+            13.3)   COMPONENTS="cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1" ;;
+            *) echo "no redist component table for CUDA $CUDA_VERSION" >&2; exit 1 ;;
+          esac
+          PREFIX="$HOME/cuda-$CUDA_VERSION"
+          mkdir -p "$PREFIX"
+          BASE="https://developer.download.nvidia.com/compute/cuda/redist"
+          for cv in $COMPONENTS; do
+            comp="${cv%:*}"; ver="${cv#*:}"
+            name="${comp}-linux-x86_64-${ver}-archive"
+            curl -fsSL --retry 3 -o comp.tar.xz "$BASE/${comp}/linux-x86_64/${name}.tar.xz"
+            tar -xf comp.tar.xz
+            cp -a "${name}/." "$PREFIX"/
+            rm -rf comp.tar.xz "${name}"
+          done
+          ln -sfn lib "$PREFIX/lib64"
+          {
+            echo "CUDA_PATH=$PREFIX"
+            echo "CUDA_HOME=$PREFIX"
+            echo "LD_LIBRARY_PATH=$PREFIX/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+          "$PREFIX/bin/nvcc" --version
 
       # This leg rebuilt every object on every run: 3903 s of the 4121 s job on
       # 2026-08-09, and 4942 s on the run before it, with no speedup between the
@@ -484,13 +519,13 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # Volta through Blackwell. V100 can run H3 with quantized weights and CPU offload,
-          # but a device probe succeeds even when the binary has no sm_70 kernels. Include
-          # sm_70 so generation does not fail at the first CUDA kernel launch.
+          # cuda12 covers Volta through Blackwell. V100 can run H3 with quantized weights and CPU
+          # offload, but a device probe succeeds even when the binary has no sm_70 kernels, so
+          # sm_70 stays in the list.
           #
-          # The CUDA launcher matters more than the other two here: Jimver installs nvcc outside
-          # the default search, and nvcc is nearly the whole build, so caching only C/CXX would
-          # leave the expensive half uncached.
+          # The CUDA launcher matters more than the other two here: nvcc lives outside the default
+          # search, and nvcc is nearly the whole build, so caching only C/CXX would leave the
+          # expensive half uncached.
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DSD_BUILD_EXAMPLES=ON \
@@ -498,6 +533,9 @@ jobs:
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
             -DSD_CUDA=ON \
+            -DSD_BUILD_SHARED_GGML_LIB=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc" \
             -DGGML_CUDA_CUDNN=ON \
             -DGGML_CUDA_CUDNN_INCLUDE_DIR="$CUDNN_INCLUDE_DIR" \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
@@ -508,31 +546,34 @@ jobs:
           # Diagnostic only, under set -e: never fail a good build over stats.
           ccache --show-stats || true
 
-      - name: Bundle the CUDA runtime beside the binaries
+      - name: Pin the bundle's own ggml; leave the CUDA runtime to the host
         run: |
           set -euo pipefail
-          # A Studio host has an NVIDIA driver but not necessarily a CUDA runtime, and Studio's
-          # torch install keeps its own copies somewhere we must not depend on. Ship ours and
-          # point the binaries at their own directory, or sd-cli dies on a missing libcublas.
           BIN="${GITHUB_WORKSPACE}/src/build/bin"
-          CUDA_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          MAJOR="${CUDA_VERSION%%.*}"
           sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
-          # cudart lands under the toolkit root; the libcublas debs land in the system
-          # multiarch dir. Search both rather than guess which is which.
-          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-            src="$(find "$CUDA_ROOT" /usr/lib/x86_64-linux-gnu -name "${so}*" -type f 2>/dev/null | sort | tail -1)"
-            [ -n "$src" ] || { echo "ERROR: $so not found under $CUDA_ROOT or /usr/lib/x86_64-linux-gnu" >&2; exit 1; }
-            cp -L "$src" "$BIN/$so"
+          # DT_RPATH, not RUNPATH: it is searched before LD_LIBRARY_PATH and covers the whole
+          # dependency chain, so this bundle's libggml*.so win over llama.cpp's same-named ones
+          # when Studio puts both directories on the loader path.
+          for f in "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/libggml*.so* "$BIN"/libstable-diffusion*.so*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            patchelf --force-rpath --set-rpath '$ORIGIN' "$f"
           done
-          for exe in sd-cli sd-server; do
-            patchelf --set-rpath '$ORIGIN' "$BIN/$exe"
+          ls -la "$BIN"
+          if ls "$BIN" | grep -qE '^lib(cudart|cublas|cublasLt)\.so'; then
+            echo "ERROR: a CUDA runtime library is in the bundle; the host provides it" >&2
+            exit 1
+          fi
+          cuda_lib="$(ls "$BIN"/libggml-cuda.so* | head -1)"
+          for so in "libcudart.so.${MAJOR}" "libcublas.so.${MAJOR}"; do
+            readelf -d "$cuda_lib" | grep -qF "[${so}]" \
+              || { echo "ERROR: $(basename "$cuda_lib") does not link ${so}" >&2; exit 1; }
           done
-          ldd "$BIN/sd-cli" | sed -n '1,40p'
-          # cuDNN and NVRTC are opened at run time only; a link-time dependency would stop the binaries
-          # loading on every host without it.
-          for exe in sd-cli sd-server; do
-            if readelf -d "$BIN/$exe" | grep -qE 'NEEDED.*(cudnn|nvrtc)'; then
-              echo "ERROR: $exe links libcudnn or libnvrtc; they must stay run-time dlopens" >&2
+          # cuDNN and NVRTC are opened at run time only; a link-time dependency would stop the
+          # binaries loading on every host without them.
+          for f in "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/libggml*.so*; do
+            if readelf -d "$f" | grep -qE 'NEEDED.*(cudnn|nvrtc)'; then
+              echo "ERROR: $(basename "$f") links libcudnn or libnvrtc; they must stay run-time dlopens" >&2
               exit 1
             fi
           done
@@ -542,7 +583,7 @@ jobs:
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ needs.resolve.outputs.tag }}
-          LABEL: Linux-Ubuntu-22.04-x86_64-cuda12
+          LABEL: Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ runner.temp }}/LICENSE
@@ -559,8 +600,8 @@ jobs:
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12
-          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -585,6 +626,192 @@ jobs:
           # Trailing dash keeps this distinct from the key the ccache action
           # restored from, so the save is never a no-op against itself.
           key: ccache-sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
+
+  # Windows CUDA, same runtime policy as build-linux-cuda: the ggml*.dll ship beside the executables
+  # (Windows searches the executable's own directory first, so llama.cpp's same-named DLLs elsewhere
+  # on PATH never win), and cudart64 / cublas64 / cublasLt64 come from the host exactly as they do
+  # for unslothai/llama.cpp's Windows CUDA build. No cuDNN attention path: the ggml kernels serve.
+  build-windows-cuda:
+    name: win-${{ matrix.line }}-x64
+    needs: resolve
+    continue-on-error: true
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: windows-2022
+    timeout-minutes: 300
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - line: cuda12
+            cuda: "12.8.0"
+            archs: "70;75;80;86;89;90;100;120"
+          - line: cuda13
+            cuda: "13.3"
+            archs: "75;80;86;89;90;100;120"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+
+      # Component tables copied from unslothai/llama.cpp's unsloth-cuda-windows-setup.
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (NVIDIA redist)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch ("${{ matrix.cuda }}") {
+            '12.8.0' { $components = @('cuda_cudart:12.8.57', 'cuda_nvcc:12.8.61', 'cuda_nvrtc:12.8.61', 'libcublas:12.8.3.14', 'cuda_nvtx:12.8.55', 'cuda_profiler_api:12.8.55', 'cuda_cccl:12.8.55', 'visual_studio_integration:12.8.55') }
+            '13.3'   { $components = @('cuda_crt:13.3.33', 'cuda_cudart:13.3.29', 'cuda_nvcc:13.3.33', 'cuda_nvrtc:13.3.33', 'libcublas:13.5.1.27', 'libnvvm:13.3.33', 'cuda_nvtx:13.3.29', 'cuda_profiler_api:13.3.27', 'cccl:13.3.3.3.1', 'visual_studio_integration:13.3.27') }
+            default  { throw "no redist component table for CUDA ${{ matrix.cuda }}" }
+          }
+          $line = "${{ matrix.cuda }}" -replace '^(\d+\.\d+).*$', '$1'
+          $prefix = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$line"
+          $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+          New-Item -ItemType Directory -Force -Path $prefix, $stage | Out-Null
+          foreach ($cv in $components) {
+            $comp, $ver = $cv.Split(':')
+            $name = "$comp-windows-x86_64-$ver-archive"
+            $zip = Join-Path $stage "$name.zip"
+            curl.exe -fsSL --retry 3 -o $zip "https://developer.download.nvidia.com/compute/cuda/redist/$comp/windows-x86_64/$name.zip"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $name" }
+            tar.exe -xf $zip -C $stage
+            if ($LASTEXITCODE -ne 0) { throw "extract failed: $name" }
+            robocopy (Join-Path $stage $name) $prefix /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copy failed: $name ($LASTEXITCODE)" }
+            Remove-Item -Recurse -Force $zip, (Join-Path $stage $name)
+          }
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_HOME=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V$($line.Replace('.', '_'))=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+
+      - name: ccache key
+        id: cckey
+        shell: bash
+        run: echo "archs=$(echo '${{ matrix.archs }}' | tr ';' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          restore-keys: |
+            sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}
+          append-timestamp: false
+          variant: ccache
+          max-size: 3G
+          save: false
+
+      - name: Build sd-cli + sd-server (CUDA)
+        working-directory: src
+        run: |
+          nvcc --version
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_FLAGS='/bigobj' `
+            -DSD_BUILD_EXAMPLES=ON `
+            -DSD_SERVER_BUILD_FRONTEND=OFF `
+            -DSD_WEBP=OFF -DSD_WEBM=OFF `
+            -DGGML_NATIVE=OFF `
+            -DSD_CUDA=ON `
+            -DSD_BUILD_SHARED_GGML_LIB=ON `
+            -DBUILD_SHARED_LIBS=ON `
+            -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.archs }}' `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # -j 3: a multi-arch nvcc TU peaks near 3 GB RSS on the 16 GB hosted runner.
+          cmake --build build --config Release -j 3 --target sd-cli sd-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ccache -s
+          exit 0
+
+      - name: Leave the CUDA runtime to the host
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'src/build/bin'
+          $major = "${{ matrix.cuda }}".Split('.')[0]
+          Get-ChildItem $bin | Format-Table Name, Length
+          $bundled = @(Get-ChildItem $bin -Filter *.dll | Where-Object { $_.Name -match '^(cudart|cublas|cublasLt)64_' })
+          if ($bundled.Count -gt 0) { throw "CUDA runtime DLLs in the bundle: $($bundled.Name -join ', ')" }
+          $cuda = Join-Path $bin 'ggml-cuda.dll'
+          if (-not (Test-Path $cuda)) { throw 'ggml-cuda.dll was not built' }
+          $imports = (& dumpbin /dependents $cuda) -join "`n"
+          foreach ($dll in @("cudart64_$major.dll", "cublas64_$major.dll")) {
+            if ($imports -notmatch [regex]::Escape($dll)) { throw "ggml-cuda.dll does not import $dll" }
+          }
+
+      - name: Sign Windows binaries
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: src/build/bin
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: win-${{ matrix.line }}-x64
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: ${{ github.repository }}
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python tooling/scripts/unsloth/package_bundle.py
+
+      - name: Verify every PE in the bundle is signed
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $zips = @(Get-ChildItem dist -Filter *.zip -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+          if ($zips.Count -eq 0) {
+            Write-Host '::error::no bundle in dist/; packaging produced nothing to verify'
+            exit 1
+          }
+          & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
+          exit $LASTEXITCODE
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-win-${{ matrix.line }}-x64
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-${{ matrix.line }}-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save ccache
+        # always(): a job killed by the cap takes the cancellation path, the most expensive case to lose.
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   build-windows:
     name: ${{ matrix.label }}
@@ -719,7 +946,7 @@ jobs:
 
   assemble:
     name: Assemble + publish
-    needs: [resolve, build-unix, build-windows, build-linux-cuda]
+    needs: [resolve, build-unix, build-windows, build-linux-cuda, build-windows-cuda]
     # Consumed by `reclaim` to tell "these bundles are now release assets" from
     # "nothing will ever read these". Set only after draft=false lands.
     outputs:
@@ -824,7 +1051,7 @@ jobs:
           AHEAD='${{ needs.resolve.outputs.ahead }}'
           COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux CUDA when its build succeeds."
+          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux/Windows CUDA 12 and 13 when those builds succeed. The CUDA bundles carry no CUDA runtime: Studio supplies the one its llama.cpp build already uses."
           PINS='${{ needs.resolve.outputs.pins }}'
           if [ "${AHEAD:-0}" -gt 0 ]; then
             NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
