@@ -1,4 +1,4 @@
-From 784b441f8b098863343e69e0345ef62d2ff580af Mon Sep 17 00:00:00 2001
+From 1602a3095b12f20b584066ac88c37a9b2ad07f1d Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Sat, 3 Oct 2026 18:27:29 -0700
 Subject: [PATCH] ggml-cuda: optional cuDNN attention for unmasked
@@ -50,11 +50,11 @@ lengths, GQA with batch, F32 K/V, permuted Q) and unmasked perf cases.
  create mode 100644 src/ggml-cuda/cudnn-attn.cuh
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b6843578..1c32cf3b 100644
+index 752dabbb..91e94ba3 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -208,6 +208,9 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
- option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+@@ -208,6 +208,9 @@ set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
+                                             "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
  option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
  option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 +option(GGML_CUDA_CUDNN                      "ggml: cuDNN attention (cudnn-frontend, libcudnn opened at run time)" OFF)
@@ -64,12 +64,12 @@ index b6843578..1c32cf3b 100644
                                              "ggml: cuda link binary compression mode; requires cuda 12.8+")
  set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
-index 05b81487..0ddeb81e 100644
+index d272f6f7..ba2a2080 100644
 --- a/src/ggml-cuda/CMakeLists.txt
 +++ b/src/ggml-cuda/CMakeLists.txt
-@@ -124,11 +124,60 @@ if (CUDAToolkit_FOUND)
-             template-instances/fattn-vec-instance-bf16-bf16.cu)
-     endif()
+@@ -115,11 +115,60 @@ if (CUDAToolkit_FOUND)
+     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
  
 +    if (GGML_CUDA_CUDNN AND WIN32)
 +        message(WARNING "GGML_CUDA_CUDNN: the run-time cuDNN loader is Linux only, building without it")
@@ -852,7 +852,7 @@ index 00000000..067bea63
 +// so the caller runs its own kernel.
 +bool ggml_cuda_cudnn_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index b8be30a0..ddc93e30 100644
+index f0fe5577..2eda0ccd 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
 @@ -4,6 +4,7 @@
@@ -861,9 +861,9 @@ index b8be30a0..ddc93e30 100644
  #include "fattn.cuh"
 +#include "cudnn-attn.cuh"
  
- template <int DKQ, int DV, int ncols2>
- static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-@@ -573,11 +574,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ // one list per group of ncols1 queries: a column is selected if any query of the group can see it
+@@ -758,11 +759,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
          ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
  
@@ -881,18 +881,18 @@ index b8be30a0..ddc93e30 100644
          case BEST_FATTN_KERNEL_NONE:
              GGML_ABORT("fatal error");
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 86a6cc5b..749aead9 100644
+index 7e98d729..831d0de8 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -919,7 +919,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+@@ -922,7 +922,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
          ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
          : ggml_nbytes(tensor);
      if (tensor->op == GGML_OP_SAGE_ATTN) {
 -        size = ggml_cuda_sage_attn_get_alloc_size(tensor);
 +        size = ggml_cuda_sage_attn_get_alloc_size(buft_ctx->device, tensor);
      }
-     int64_t ne0 = tensor->ne[0];
- 
+     if (tensor->op == GGML_OP_SOL_ATTN) {
+         size = ggml_cuda_sol_attn_get_alloc_size(tensor);
 diff --git a/src/ggml-cuda/sage-attn.cu b/src/ggml-cuda/sage-attn.cu
 index 2c103eb0..ceb29ed2 100644
 --- a/src/ggml-cuda/sage-attn.cu
@@ -947,12 +947,12 @@ index 126c7a74..e2648857 100644
  
  #endif
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b58c815c..55db14a0 100644
+index af772ae9..778bed20 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9773,6 +9773,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
-                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-     }
+@@ -11099,6 +11099,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
 +    // unmasked F16 K/V with the MiniMax-H3 DiT head layout (42 heads x 128), the shape class the CUDA
 +    // cuDNN attention path takes: odd and tile-aligned lengths, GQA with batch, F32 K/V, head size 64.
@@ -972,9 +972,9 @@ index b58c815c..55db14a0 100644
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
      test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
-@@ -10124,6 +10139,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
-     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -11527,6 +11542,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+     }
  
 +    // unmasked diffusion attention: MiniMax-H3 DiT (19315 tokens x 56 heads at 960x544x124; 22440 x 42),
 +    // its token refiner (31 tokens) and video VAE decoder (1797 x 32 x 64), FLUX-class 1024px (4096 x 24),

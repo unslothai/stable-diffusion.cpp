@@ -67,6 +67,7 @@ struct WeightAdapter {
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
+    ggml_cgraph* graph                                               = nullptr;
     bool flash_attn_enabled                                          = false;
     bool sage_attn_enabled                                           = false;
     float linear_scale                                               = 0.f;
@@ -102,6 +103,12 @@ struct GGMLRunnerContext {
         return get_cache_tensor(name);
     }
 
+    void expand_graph(ggml_tensor* tensor) const {
+        if (graph != nullptr && tensor != nullptr) {
+            ggml_build_forward_expand(graph, tensor);
+        }
+    }
+
     void persist_cache_tensor(const std::string& name, ggml_tensor* tensor) const {
         if (!cache_tensor || tensor == nullptr) {
             return;
@@ -122,15 +129,17 @@ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* ctx,
                                     ggml_tensor* k,
                                     ggml_tensor* v,
                                     int64_t n_head,
-                                    ggml_tensor* mask = nullptr,
-                                    bool skip_reshape = false,
-                                    bool flash_attn   = false,
-                                    float kv_scale    = 1.f);
+                                    ggml_tensor* mask     = nullptr,
+                                    bool skip_reshape     = false,
+                                    bool flash_attn       = false,
+                                    float kv_scale        = 1.f,
+                                    bool* used_flash_attn = nullptr);
 
 struct GGMLRunner {
 private:
     std::map<ggml_backend_t, size_t> logged_compute_bytes_;
-    size_t logged_segment_count_ = 0;
+    size_t logged_segment_count_     = 0;
+    ggml_status last_compute_status_ = GGML_STATUS_SUCCESS;
 
     sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
     std::vector<DeviceMemoryRequest> memory_requests(const std::vector<sd::BackendBufferSize>& sizes,
@@ -289,7 +298,8 @@ public:
 
     virtual ~GGMLRunner();
 
-    virtual GGMLRunnerContext get_context();
+    // Binding a graph schedules cache outputs at registration instead of graph end.
+    virtual GGMLRunnerContext get_context(ggml_cgraph* graph = nullptr);
 
     void reset_compute_ctx();
 
@@ -324,7 +334,7 @@ public:
 
     ggml_tensor* to_backend(ggml_tensor* tensor);
 
-    void cache(const std::string name, ggml_tensor* tensor);
+    void cache(const std::string name, ggml_tensor* tensor, ggml_cgraph* graph = nullptr);
 
     ggml_tensor* get_cache_tensor_by_name(const std::string& name) {
         return cache_.get(name);
@@ -335,6 +345,8 @@ public:
                                              bool auto_runner_end                      = true,
                                              bool no_return                            = false,
                                              const std::function<bool()>& read_outputs = {});
+
+    ggml_status last_compute_status() const { return last_compute_status_; }
 
     void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;

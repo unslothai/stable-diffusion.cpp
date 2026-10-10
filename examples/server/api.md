@@ -37,6 +37,7 @@ Current generation-related endpoints include:
 
 - `POST /sdapi/v1/txt2img`
 - `POST /sdapi/v1/img2img`
+- `GET /sdapi/v1/progress`
 - `GET /sdapi/v1/loras`
 - `GET /sdapi/v1/upscalers`
 - `GET /sdapi/v1/latent-upscale-modes`
@@ -56,6 +57,7 @@ Current endpoints include:
 - `GET /sdcpp/v1/jobs/{id}`
 - `POST /sdcpp/v1/jobs/{id}/cancel`
 - `POST /sdcpp/v1/vid_gen`
+- `POST /sdcpp/v1/upscale`
 
 ## `sd_cpp_extra_args`
 
@@ -147,6 +149,19 @@ Currently supported multipart form fields:
 Native extension fields:
 
 - any `sdcpp API` fields embedded through `sd_cpp_extra_args` inside `prompt`
+
+Uploaded images are decoded at their original dimensions. The first decoded
+image establishes the generation dimensions if `size` is omitted. Input
+geometry follows `image_preprocess`: references preserve their dimensions by
+default, while init and mask use the generation canvas preset.
+
+Reference encoding then follows model presets and `ref_image_args`. To skip
+input geometry for references and disable resizing before VAE encoding, include
+this in `prompt`:
+
+```text
+edit this image <sd_cpp_extra_args>{"image_preprocess":"target=ref,mode=none","ref_image_args":"resize_before_vae=false"}</sd_cpp_extra_args>
+```
 
 Response fields:
 
@@ -263,6 +278,26 @@ Response fields:
 | `images` | `array<string>` | Base64-encoded PNG images |
 | `parameters` | `object` | Echo of the parsed outer request body |
 | `info` | `string` | Currently empty string |
+
+#### `GET /sdapi/v1/progress`
+
+Poll this endpoint while a synchronous SDAPI generation request is running.
+An optional `id_task` query parameter selects the task with the same `id_task`
+provided in the generation request (default: `"sdapi"`). Set
+`skip_current_image=true` or `1` to omit the preview image.
+
+`current_image` contains the latest base64 JPEG latent projection, or `null`
+when unavailable. `state.sampling_step` is the positive logical step and
+`state.sampling_steps` is the actual step count for the current sampling pass,
+including schedule and img2img strength adjustments. `state.job_no` is the
+zero-based pass index; `state.job_count` includes one pass per batch image and
+an additional pass per image when highres fix is enabled. `progress` weights
+these passes equally. Sampling progress can reach `1` before final decoding
+finishes; `eta_relative` is currently always `0`.
+
+When no SDAPI task is active, or `id_task` does not match, the endpoint returns
+`progress=0`, `state.job=""`, zero job/step counts, and `current_image=null`.
+Completed and failed requests do not retain an active preview.
 
 #### Discovery / Compatibility Endpoints
 
@@ -396,6 +431,20 @@ Field types:
 | `queue_position` | `integer` |
 | `result` | `object \| null` |
 | `error` | `object \| null` |
+| `preview` | `object \| null` |
+
+`preview` sub-fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `preview.pass` | `integer` | Sampling pass number, starting at 1 within the job |
+| `preview.step` | `integer` | Positive logical sample step within this pass |
+| `preview.total_steps` | `integer` | Actual sample steps in this pass, after schedule and strength adjustments |
+| `preview.b64_json` | `string` | Base64-encoded PNG of the current preview frame |
+
+The preview is updated in place as sampling progresses; poll `GET /sdcpp/v1/jobs/{id}` to retrieve the latest frame. Only the most recent preview is retained.
+
+`step / total_steps` describes the current sampling pass, not overall job completion. A new batch item, high/low-noise stage, or highres pass increments `pass` and restarts `step`. Samplers with multiple denoiser evaluations per logical step may update a preview more than once at the same step. The frame and its pass/step metadata are published together.
 
 ### Endpoints
 
@@ -421,7 +470,9 @@ Top-level fields:
 | `samplers` | `array<string>` | Available sampling methods |
 | `schedulers` | `array<string>` | Available schedulers |
 | `loras` | `array<object>` | Available LoRA entries |
-| `upscalers` | `array<object>` | Available model-backed highres upscalers |
+| `upscalers` | `array<object>` | Available highres upscalers, built-in and model-backed |
+| `upscale` | `boolean` | Whether a compatible RGB ESRGAN model is available for `POST /sdcpp/v1/upscale` |
+| `preview_modes` | `array<string>` | Available preview modes, e.g. `["none", "proj", "tae", "vae"]` |
 | `limits` | `object` | Shared queue and size limits |
 
 `model`
@@ -463,6 +514,8 @@ Shared nested fields:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `upscalers[].name` | `string` | Built-in name or model stem; use this value in `hires.upscaler` |
+| `upscalers[].model` | `boolean` | True for a model-backed upscaler, false for a built-in scaling filter |
+| `upscalers[].image_upscale` | `boolean` | Whether this model can be selected by `POST /sdcpp/v1/upscale`; false for latent upscalers and built-in filters |
 
 Built-in entries include `None`, `Lanczos`, `Nearest`, `Latent`, `Latent (nearest)`, `Latent (nearest-exact)`, `Latent (antialiased)`, `Latent (bicubic)`, and `Latent (bicubic antialiased)`. Model-backed entries are scanned from the top level of `--hires-upscalers-dir`; subdirectories are not scanned.
 
@@ -476,6 +529,8 @@ Built-in entries include `None`, `Lanczos`, `Nearest`, `Latent`, `Latent (neares
 | `limits.max_height` | `integer` |
 | `limits.max_batch_count` | `integer` |
 | `limits.max_queue_size` | `integer` |
+| `limits.max_upscale_width` | `integer` |
+| `limits.max_upscale_height` | `integer` |
 
 Shared default fields used by both `img_gen` and `vid_gen`:
 
@@ -505,11 +560,11 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
-| `vae_tiling_params.tile_size_x` | `integer` |
-| `vae_tiling_params.tile_size_y` | `integer` |
+| `vae_tiling_params.tile_size_w` | `integer` |
+| `vae_tiling_params.tile_size_h` | `integer` |
 | `vae_tiling_params.target_overlap` | `number` |
-| `vae_tiling_params.rel_size_x` | `number` |
-| `vae_tiling_params.rel_size_y` | `number` |
+| `vae_tiling_params.rel_size_w` | `number` |
+| `vae_tiling_params.rel_size_h` | `number` |
 | `vae_tiling_params.extra_tiling_args` | `string` |
 | `cache_mode` | `string` |
 | `cache_option` | `string` |
@@ -517,6 +572,8 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `scm_policy_dynamic` | `boolean` |
 | `output_format` | `string` |
 | `output_compression` | `integer` |
+
+`vae_tiling_params.tile_size_w` and `tile_size_h` are in **image pixels**, with `0` selecting the 256-pixel default. Both encode and decode use these sizes without an encoding multiplier. Positive `rel_size_w`/`rel_size_h` values override the corresponding absolute size: values up to 1 are dimension fractions, and values greater than 1 are target tile counts. Set `enabled` to use spatial tiling. Sizes are aligned down to the VAE scale factor and capped at the input dimensions; explicit sizes below the minimum supported tile size are rejected. These fields previously used latent units; see [VAE tiling](../../docs/performance.md#use-vae-tiling-to-reduce-encode-and-decode-memory-usage) for migration and OOM retry behavior.
 
 `vae_tiling_params.extra_tiling_args` accepts a key=value list. Supported video VAEs accept `temporal_tile_frames` (alias `temporal_tile_size`, default `4`) and `temporal_tile_overlap` (default `1`).
 LTX and Wan preserve causal state between temporal tiles. Hunyuan Video and TAEHV use overlap blending. MiniMax H3 keeps its model-specific fixed temporal windows because its latent-to-frame mapping is non-linear.
@@ -526,7 +583,7 @@ LTX and Wan preserve causal state between temporal tiles. Hunyuan Video and TAEH
 | Field | Type |
 | --- | --- |
 | `batch_count` | `integer` |
-| `auto_resize_ref_image` | `boolean` |
+| `ref_image_args` | `string` |
 | `increase_ref_index` | `boolean` |
 | `control_strength` | `number` |
 | `ip_adapter_strength` | `number` |
@@ -577,6 +634,7 @@ Fields returned in `features_by_mode.img_gen`:
 - `cache`
 - `cancel_queued`
 - `cancel_generating`
+- `preview`
 
 Fields returned in `features_by_mode.vid_gen`:
 
@@ -589,6 +647,7 @@ Fields returned in `features_by_mode.vid_gen`:
 - `cache`
 - `cancel_queued`
 - `cancel_generating`
+- `preview`
 
 #### `POST /sdcpp/v1/img_gen`
 
@@ -628,6 +687,52 @@ Typical status codes:
 - `404 Not Found`
 - `410 Gone`
 
+#### `POST /sdcpp/v1/upscale`
+
+Runs one RGB ESRGAN upscaler over an image, with no generation involved. Latent upscaler models remain available for hires generation but cannot be used here.
+
+This is the HTTP equivalent of `sd-cli -M upscale`: no diffusion model, text
+encoder or sampling is used, so it is fast enough to answer synchronously and
+does not create a job.
+
+Request fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `image` | `string` | Required. Base64 or data URL image |
+| `upscaler` | `string` | A name from `upscalers` with `image_upscale: true`; the first compatible entry when omitted |
+| `repeats` | `integer` | Run the upscaler this many times, 1 to 4 (default `1`) |
+| `tile_size` | `integer` | Tile size, defaulting to the server's `--upscale-tile-size` |
+| `output_format` | `string` | `png`, `jpeg`, or `webp` when built with WebP support (default `png`); unsupported formats return 400 |
+| `output_compression` | `integer` | Range is clamped to `0..100` |
+
+Response fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `images` | `array<object>` | One image |
+| `images[].index` | `integer` | |
+| `images[].b64_json` | `string` | Base64-encoded image bytes |
+| `upscaler` | `string` | The upscaler actually used |
+| `scale` | `integer` | The model's scale factor |
+| `repeats` | `integer` | How many times it was run |
+| `width` | `integer` | Result width |
+| `height` | `integer` | Result height |
+| `output_format` | `string` | Final encoded image format |
+
+Typical status codes:
+
+- `200 OK`
+- `400 Bad Request` (invalid request, unsupported output format, unreadable image, incompatible upscaler, or output dimensions exceeding the limit)
+- `500 Internal Server Error`
+
+Notes:
+
+- Final output dimensions, including all repeats, must not exceed 8192 pixels on either axis (`limits.max_upscale_width` and `limits.max_upscale_height`). Requests exceeding this bound are rejected before upscaling.
+- The upscaler models are three-channel; alpha is not preserved.
+- The request holds the generation context lock, so an upscale and a
+  generation never run on the device at the same time.
+
 #### `POST /sdcpp/v1/jobs/{id}/cancel`
 
 Attempts to cancel an accepted job.
@@ -653,7 +758,7 @@ Example:
   "strength": 0.75,
   "seed": -1,
   "batch_count": 1,
-  "auto_resize_ref_image": true,
+  "ref_image_args": "",
   "increase_ref_index": false,
   "control_strength": 0.9,
   "ip_adapter_strength": 1.0,
@@ -702,11 +807,11 @@ Example:
   "vae_tiling_params": {
     "enabled": false,
     "temporal_tiling": false,
-    "tile_size_x": 0,
-    "tile_size_y": 0,
+    "tile_size_w": 0,
+    "tile_size_h": 0,
     "target_overlap": 0.5,
-    "rel_size_x": 0.0,
-    "rel_size_y": 0.0,
+    "rel_size_w": 0.0,
+    "rel_size_h": 0.0,
     "extra_tiling_args": ""
   },
 
@@ -714,6 +819,9 @@ Example:
   "cache_option": "",
   "scm_mask": "",
   "scm_policy_dynamic": true,
+
+  "preview": "none",
+  "preview_interval": 1,
 
   "output_format": "png",
   "output_compression": 100
@@ -728,6 +836,17 @@ Example:
 
 ### Image Encoding Rules
 
+Native image/video requests and SDAPI accept `image_preprocess` as a rule string
+or array of rule strings. OpenAI-compatible requests can supply it in
+`sd_cpp_extra_args`. See [Image preprocessing](../../docs/image_preprocessing.md)
+for one-time input geometry, native-resolution decoding, mask alignment, and
+`canny=true` for edge detection on any supported image input.
+
+Image generation also accepts `ref_image_args` as a string (for example,
+`"resize_before_vae=false"`) in native and SDAPI requests, or through
+`sd_cpp_extra_args` in OpenAI-compatible requests. It controls downstream
+reference encoding and is independent of input geometry rules.
+
 Any image field accepts:
 
 - a raw base64 string, or
@@ -735,11 +854,14 @@ Any image field accepts:
 
 Channel expectations:
 
-- `init_image`: 3 channels
-- `ref_images[]`: 3 channels
+- `init_image`: native channels (3 or 4); alpha is preserved and applied per model
+- `ref_images[]`: native channels (3 or 4); alpha is preserved and applied per model
 - `control_image`: 3 channels
 - `ip_adapter_image`: 3 channels
 - `mask_image`: 1 channel
+
+Models that support RGBA (e.g. Qwen-Image 2.1) use the alpha channel of `init_image`
+and `ref_images[]`. RGB-only models drop it, so sending RGBA is safe for every model.
 
 If omitted or null:
 
@@ -760,11 +882,14 @@ Top-level scalar fields:
 | `strength` | `number` |
 | `seed` | `integer` |
 | `batch_count` | `integer` |
-| `auto_resize_ref_image` | `boolean` |
+| `ref_image_args` | `string` |
+| `image_preprocess` | `string \| array<string>` |
 | `increase_ref_index` | `boolean` |
 | `control_strength` | `number` |
 | `ip_adapter_strength` | `number` |
 | `embed_image_metadata` | `boolean` |
+| `preview` | `string` |
+| `preview_interval` | `integer` |
 
 Image fields:
 
@@ -820,11 +945,11 @@ Other native fields:
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
-| `vae_tiling_params.tile_size_x` | `integer` |
-| `vae_tiling_params.tile_size_y` | `integer` |
+| `vae_tiling_params.tile_size_w` | `integer` |
+| `vae_tiling_params.tile_size_h` | `integer` |
 | `vae_tiling_params.target_overlap` | `number` |
-| `vae_tiling_params.rel_size_x` | `number` |
-| `vae_tiling_params.rel_size_y` | `number` |
+| `vae_tiling_params.rel_size_w` | `number` |
+| `vae_tiling_params.rel_size_h` | `number` |
 | `vae_tiling_params.extra_tiling_args` | `string` |
 | `cache_mode` | `string` |
 | `cache_option` | `string` |
@@ -851,6 +976,10 @@ When omitted, backend defaults apply to these fields:
 - `sample_params.eta`
 - `sample_params.flow_shift`
 - `sample_params.guidance.img_cfg`
+
+### Preview Interval Semantics
+
+`preview_interval` controls the period (in sample steps) at which preview frames are generated. The default is `1` (every step). Any non-positive values will be clamped to `1`. Note that if `preview` is set to `"none"`, no previews are produced regardless of the interval.
 
 ### Completion Result
 
@@ -966,7 +1095,8 @@ Response fields:
 Compared with `img_gen`, the `vid_gen` request body:
 
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
-- `ref_images`, `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
+- `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
+- `ref_images` is accepted for MiniMax-H3 Ref2VA conditioning; other video model families currently ignore it
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, and `vace_strength`
 
 Example:
@@ -987,6 +1117,7 @@ Example:
 
   "init_image": null,
   "end_image": null,
+  "ref_images": [],
   "control_frames": [],
 
   "sample_params": {
@@ -1035,11 +1166,11 @@ Example:
   "vae_tiling_params": {
     "enabled": false,
     "temporal_tiling": false,
-    "tile_size_x": 0,
-    "tile_size_y": 0,
+    "tile_size_w": 0,
+    "tile_size_h": 0,
     "target_overlap": 0.5,
-    "rel_size_x": 0.0,
-    "rel_size_y": 0.0,
+    "rel_size_w": 0.0,
+    "rel_size_h": 0.0,
     "extra_tiling_args": ""
   },
 
@@ -1048,10 +1179,24 @@ Example:
   "scm_mask": "",
   "scm_policy_dynamic": true,
 
+  "preview": "none",
+  "preview_interval": 1,
+
   "output_format": "webm",
   "output_compression": 100
 }
 ```
+
+### Reference Image Rules
+
+- `ref_images` contains reference images for MiniMax-H3 Ref2VA conditioning.
+- Images retain request order and correspond to `<Picture 1>`, `<Picture 2>`, and so on in the prompt.
+- For MiniMax-H3, non-empty `ref_images` cannot be combined with `init_image` or `end_image`. A conflicting API request fails during generation; the WebUI checks this before submission.
+- MiniMax-H3 does not support `control_frames`; leave that array empty.
+- Other video model families currently ignore `ref_images`.
+- `features_by_mode.vid_gen` does not currently advertise `ref_images`; its absence is not an indication that MiniMax-H3 reference images are unsupported.
+
+See [MiniMax-H3 reference conditioning](../../docs/minimax_h3.md#reference-to-audio-video-conditioning) for model requirements and prompt examples.
 
 ### LoRA Rules
 
@@ -1070,6 +1215,7 @@ Channel expectations:
 
 - `init_image`: 3 channels
 - `end_image`: 3 channels
+- `ref_images[]`: decoded with native channels, then converted to RGB by MiniMax-H3
 - `control_frames[]`: 3 channels
 
 Frame ordering rules:
@@ -1099,6 +1245,8 @@ Top-level scalar fields:
 | `fps` | `integer` |
 | `moe_boundary` | `number` |
 | `vace_strength` | `number` |
+| `preview` | `string` |
+| `preview_interval` | `integer` |
 
 Image and frame fields:
 
@@ -1106,6 +1254,7 @@ Image and frame fields:
 | --- | --- |
 | `init_image` | `string \| null` |
 | `end_image` | `string \| null` |
+| `ref_images` | `array<string>` |
 | `control_frames` | `array<string>` |
 
 LoRA fields:
@@ -1160,11 +1309,11 @@ Other native fields:
 | `vae_tiling_params` | `object` |
 | `vae_tiling_params.enabled` | `boolean` |
 | `vae_tiling_params.temporal_tiling` | `boolean` |
-| `vae_tiling_params.tile_size_x` | `integer` |
-| `vae_tiling_params.tile_size_y` | `integer` |
+| `vae_tiling_params.tile_size_w` | `integer` |
+| `vae_tiling_params.tile_size_h` | `integer` |
 | `vae_tiling_params.target_overlap` | `number` |
-| `vae_tiling_params.rel_size_x` | `number` |
-| `vae_tiling_params.rel_size_y` | `number` |
+| `vae_tiling_params.rel_size_w` | `number` |
+| `vae_tiling_params.rel_size_h` | `number` |
 | `vae_tiling_params.extra_tiling_args` | `string` |
 | `cache_mode` | `string` |
 | `cache_option` | `string` |

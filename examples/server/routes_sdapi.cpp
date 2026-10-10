@@ -80,17 +80,6 @@ static enum sample_method_t get_sdapi_sample_method(std::string name) {
     return it != hardcoded.end() ? it->second : SAMPLE_METHOD_COUNT;
 }
 
-static void assign_solid_mask(SDImageOwner& mask_owner, int width, int height) {
-    const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
-    uint8_t* raw_mask        = static_cast<uint8_t*>(malloc(pixel_count));
-    if (raw_mask == nullptr) {
-        mask_owner.reset({0, 0, 1, nullptr});
-        return;
-    }
-    std::memset(raw_mask, 255, pixel_count);
-    mask_owner.reset({(uint32_t)width, (uint32_t)height, 1, raw_mask});
-}
-
 static bool build_sdapi_img_gen_request(const json& j,
                                         ServerRuntime& runtime,
                                         bool img2img,
@@ -193,15 +182,25 @@ static bool build_sdapi_img_gen_request(const json& j,
         }
     }
 
-    if (img2img) {
-        const int expected_width  = request.gen_params.width_and_height_are_set() ? request.gen_params.width : 0;
-        const int expected_height = request.gen_params.width_and_height_are_set() ? request.gen_params.height : 0;
+    if (j.contains("ref_image_args")) {
+        if (!j["ref_image_args"].is_string()) {
+            error_message = "ref_image_args must be a string";
+            return false;
+        }
+        request.gen_params.ref_image_args = j["ref_image_args"].get<std::string>();
+    }
 
+    if (j.contains("image_preprocess") && !request.gen_params.parse_image_preprocess_json(j["image_preprocess"].dump())) {
+        error_message = "invalid image_preprocess";
+        return false;
+    }
+
+    if (img2img) {
         if (j.contains("init_images") && j["init_images"].is_array() && !j["init_images"].empty()) {
             if (decode_base64_image(j["init_images"][0].get<std::string>(),
-                                    3,
-                                    expected_width,
-                                    expected_height,
+                                    0,
+                                    0,
+                                    0,
                                     request.gen_params.init_image)) {
                 const sd_image_t& image = request.gen_params.init_image.get();
                 request.gen_params.set_width_and_height_if_unset(image.width, image.height);
@@ -211,8 +210,8 @@ static bool build_sdapi_img_gen_request(const json& j,
         if (j.contains("mask") && j["mask"].is_string()) {
             if (decode_base64_image(j["mask"].get<std::string>(),
                                     1,
-                                    expected_width,
-                                    expected_height,
+                                    0,
+                                    0,
                                     request.gen_params.mask_image)) {
                 const sd_image_t& image = request.gen_params.mask_image.get();
                 request.gen_params.set_width_and_height_if_unset(image.width, image.height);
@@ -225,9 +224,7 @@ static bool build_sdapi_img_gen_request(const json& j,
                 }
             }
         } else {
-            const int resolved_width  = request.gen_params.get_resolved_width();
-            const int resolved_height = request.gen_params.get_resolved_height();
-            assign_solid_mask(request.gen_params.mask_image, resolved_width, resolved_height);
+            request.gen_params.mask_image.reset({0, 0, 1, nullptr});
         }
 
         float denoising_strength = j.value("denoising_strength", -1.f);
@@ -243,9 +240,8 @@ static bool build_sdapi_img_gen_request(const json& j,
             }
             SDImageOwner image_owner;
             if (decode_base64_image(extra_image.get<std::string>(),
-                                    3,
-                                    request.gen_params.width_and_height_are_set() ? request.gen_params.width : 0,
-                                    request.gen_params.width_and_height_are_set() ? request.gen_params.height : 0,
+                                    0,
+                                    0, 0,
                                     image_owner)) {
                 const sd_image_t& image = image_owner.get();
                 request.gen_params.set_width_and_height_if_unset(image.width, image.height);
@@ -305,6 +301,76 @@ static nlohmann::json prepare_info_field(const SDContextParams& ctx_params,
     return jsoninfo;
 }
 
+struct SDAPIPreviewState {
+    std::mutex mutex;
+    std::string b64;
+    std::string id_task;
+    std::string job_type;
+    int step          = 0;
+    int total         = 0;
+    bool active       = false;
+    int64_t job_count = 0;
+    int job_no        = 0;
+};
+
+static SDAPIPreviewState g_preview;
+
+static void preview_callback(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data) {
+    (void)is_noisy;
+    (void)data;
+    if (frame_count <= 0 || frames == nullptr || frames[0].data == nullptr) {
+        return;
+    }
+
+    const sd_image_t& frame      = frames[0];
+    const sd_preview_info_t info = sd_get_preview_info();
+
+    auto image_bytes = encode_image_to_vector(EncodedImageFormat::JPEG,
+                                              frame.data,
+                                              frame.width,
+                                              frame.height,
+                                              frame.channel,
+                                              "",
+                                              80);
+    if (image_bytes.empty()) {
+        return;
+    }
+
+    std::string b64 = base64_encode(image_bytes);
+    std::lock_guard<std::mutex> lock(g_preview.mutex);
+    g_preview.b64    = std::move(b64);
+    g_preview.step   = static_cast<int>(std::min<int64_t>(step < 0 ? -static_cast<int64_t>(step) : step,
+                                                        std::max(0, info.total_steps)));
+    g_preview.total  = std::max(0, info.total_steps);
+    g_preview.job_no = std::max(0, info.sample_pass - 1);
+}
+
+struct SDAPIPreviewGuard {
+    SDAPIPreviewGuard(const std::string& id_task, const sd_img_gen_params_t& params, const std::string& job_type) {
+        std::lock_guard<std::mutex> lock(g_preview.mutex);
+        g_preview.id_task  = id_task;
+        g_preview.total    = 0;
+        g_preview.job_type = job_type;
+        g_preview.b64.clear();
+        g_preview.step   = 0;
+        g_preview.active = true;
+        // Each batch item has a base pass and, when enabled, a hires pass.
+        g_preview.job_count = static_cast<int64_t>(std::max(1, params.batch_count)) * (params.hires.enabled ? 2 : 1);
+        g_preview.job_no    = 0;
+        sd_set_preview_callback(preview_callback, PREVIEW_PROJ, 1, true, false, nullptr);
+    }
+
+    ~SDAPIPreviewGuard() {
+        sd_set_preview_callback(nullptr, PREVIEW_NONE, 1, false, false, nullptr);
+        std::lock_guard<std::mutex> lock(g_preview.mutex);
+        g_preview.active = false;
+        g_preview.b64.clear();
+    }
+
+    SDAPIPreviewGuard(const SDAPIPreviewGuard&)            = delete;
+    SDAPIPreviewGuard& operator=(const SDAPIPreviewGuard&) = delete;
+};
+
 void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
 
@@ -321,7 +387,9 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            json j = json::parse(req.body);
+            std::string id_task = "sdapi";
+            json j              = json::parse(req.body);
+            id_task             = j.value("id_task", id_task);
             ImgGenJobRequest request;
             std::string error_message;
             if (!build_sdapi_img_gen_request(j, *runtime, img2img, request, error_message)) {
@@ -338,6 +406,7 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
             {
                 std::lock_guard<std::mutex> lock(*runtime->sd_ctx_mutex);
+                SDAPIPreviewGuard preview_guard(id_task, img_gen_params, img2img ? "img2img" : "txt2img");
                 sd_image_t* raw_results = nullptr;
                 if (!generate_image(runtime->sd_ctx, &img_gen_params, &raw_results, &num_results)) {
                     raw_results = nullptr;
@@ -530,6 +599,64 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         json r;
         r["samples_format"]      = "png";
         r["sd_model_checkpoint"] = model_path.stem();
+        res.set_content(r.dump(), "application/json");
+    });
+
+    svr.Get("/sdapi/v1/progress", [](const httplib::Request& req, httplib::Response& res) {
+        bool skip_current_image = false;
+        bool has_id_param       = req.has_param("id_task");
+        std::string req_id_task = has_id_param ? req.get_param_value("id_task") : "";
+
+        if (req.has_param("skip_current_image")) {
+            std::string skip_str = req.get_param_value("skip_current_image");
+            skip_current_image   = (skip_str == "true" || skip_str == "1");
+        }
+
+        json r;
+        r["eta_relative"] = 0.0f;
+        json state;
+        state["skipped"]       = false;
+        state["interrupted"]   = false;
+        state["job_timestamp"] = "0";
+        r["textinfo"]          = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(g_preview.mutex);
+
+            bool is_matching_task = g_preview.active && (!has_id_param || req_id_task == g_preview.id_task);
+
+            int step             = is_matching_task ? g_preview.step : 0;
+            int steps            = is_matching_task ? g_preview.total : 0;
+            std::string b64      = is_matching_task ? g_preview.b64 : "";
+            std::string job_type = is_matching_task ? g_preview.job_type : "";
+            int64_t job_count    = is_matching_task ? g_preview.job_count : 0;
+            int job_no           = is_matching_task ? g_preview.job_no : 0;
+
+            float batch_progress = (steps > 0) ? (static_cast<float>(step) / static_cast<float>(steps)) : 0.0f;
+            if (batch_progress > 1.0f)
+                batch_progress = 1.0f;
+
+            float overall_progress = job_count > 0
+                                         ? (static_cast<float>(job_no) + batch_progress) / static_cast<float>(job_count)
+                                         : 0.0f;
+            if (overall_progress > 1.0f)
+                overall_progress = 1.0f;
+
+            r["progress"]           = overall_progress;
+            state["job"]            = job_type;
+            state["sampling_step"]  = step;
+            state["sampling_steps"] = steps;
+            state["job_count"]      = job_count;
+            state["job_no"]         = job_no;
+            r["state"]              = state;
+
+            if (!skip_current_image && !b64.empty()) {
+                r["current_image"] = b64;
+            } else {
+                r["current_image"] = nullptr;
+            }
+        }
+
         res.set_content(r.dump(), "application/json");
     });
 }

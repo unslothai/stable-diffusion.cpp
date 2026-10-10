@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -43,6 +44,9 @@ struct UpscalerEntry {
     std::string fullpath;
     std::string model_name;
     int scale = 4;
+    int image_upscale_factor = 0;
+    uintmax_t file_size      = 0;
+    std::filesystem::file_time_type last_modified;
 };
 
 struct ServerRuntime {
@@ -62,6 +66,8 @@ struct ImgGenJobRequest {
     SDGenerationParams gen_params;
     std::string output_format = "png";
     int output_compression    = 100;
+    std::string preview_mode  = "none";
+    int preview_interval      = 1;
 
     sd_img_gen_params_t to_sd_img_gen_params_t() {
         return gen_params.to_sd_img_gen_params_t();
@@ -72,6 +78,8 @@ struct VidGenJobRequest {
     SDGenerationParams gen_params;
     std::string output_format = "webm";
     int output_compression    = 100;
+    std::string preview_mode  = "none";
+    int preview_interval      = 1;
 
     sd_vid_gen_params_t to_sd_vid_gen_params_t() {
         return gen_params.to_sd_vid_gen_params_t();

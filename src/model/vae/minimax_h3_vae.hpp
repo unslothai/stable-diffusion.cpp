@@ -233,11 +233,12 @@ namespace MiniMaxH3VAE {
         return ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2] * x->ne[3]);
     }
 
-    static ggml_tensor* apply_partial_rope(ggml_context* ctx,
+    static ggml_tensor* apply_partial_rope(GGMLRunnerContext* runner_ctx,
                                            ggml_tensor* x,
                                            ggml_tensor* pe) {
+        auto ctx        = runner_ctx->ggml_ctx;
         int64_t rot_dim = pe->ne[2] * 2;
-        auto rotated    = Rope::apply_rope(ctx,
+        auto rotated    = Rope::apply_rope(runner_ctx,
                                            ggml_ext_slice(ctx, x, 0, 0, rot_dim),
                                            pe,
                                            false);
@@ -404,8 +405,8 @@ namespace MiniMaxH3VAE {
                 q = apply_partial_rope_tables(ctx->ggml_ctx, q, rope_a, rope_b, pe->ne[2] * 2);
                 k = apply_partial_rope_tables(ctx->ggml_ctx, k, rope_a, rope_b, pe->ne[2] * 2);
             } else {
-                q = apply_partial_rope(ctx->ggml_ctx, q, pe);
-                k = apply_partial_rope(ctx->ggml_ctx, k, pe);
+                q = apply_partial_rope(ctx, q, pe);
+                k = apply_partial_rope(ctx, k, pe);
             }
             const int64_t tiles = v->ne[3];
             if (tiles > 1) {
@@ -739,17 +740,25 @@ namespace MiniMaxH3VAE {
                                    tensor.shape()[3]});
         }
 
-        static sd_tiling_params_t h3_tiling(sd_tiling_params_t params) {
+        sd_tiling_params_t resolve_tiling_params(sd_tiling_params_t params) const override {
+            if (!params.enabled) {
+                params.target_overlap = 0.25f;
+            }
+            if (params.tile_size_w == 0 && params.rel_size_w == 0.f) {
+                params.tile_size_w = 256;
+            }
+            if (params.tile_size_h == 0 && params.rel_size_h == 0.f) {
+                params.tile_size_h = 256;
+            }
             params.enabled         = true;
             params.temporal_tiling = false;
-            params.tile_size_x     = 16;
-            params.tile_size_y     = 16;
-            params.target_overlap  = 0.25f;
-            // SD_H3_VAE_TILE=N: opt-in N x N latent tiles; the seams move, so frames differ from the default
+            // SD_H3_VAE_TILE=N: opt-in N x N latent tiles (N * 16 image pixels); the seams move, so frames differ
+            // from the default
             if (const char* tile = getenv("SD_H3_VAE_TILE")) {
                 const int n = atoi(tile);
                 if (n >= 8) {
-                    params.tile_size_x = params.tile_size_y = n;
+                    params.tile_size_w = params.tile_size_h = n * 16;
+                    params.rel_size_w = params.rel_size_h = 0.f;
                 }
             }
             return params;
@@ -799,7 +808,7 @@ namespace MiniMaxH3VAE {
                                  bool circular_x = false,
                                  bool circular_y = false) override {
             auto input  = ensure_video_shape(x);
-            auto tiling = h3_tiling(tiling_params);
+            auto tiling = resolve_tiling_params(tiling_params);
             if (input.shape()[2] == 1) {
                 auto encoded = VAE::encode(n_threads, input, tiling, circular_x, circular_y);
                 if (!encoded.empty() && encoded.shape()[2] > 1) {
@@ -821,8 +830,11 @@ namespace MiniMaxH3VAE {
             auto plan   = make_vae_temporal_tile_plan(input.shape()[2], {17, 0});
             auto result = process_vae_temporal_tiles(input, plan, [&](const sd::Tensor<float>& chunk, const VAETemporalTile& tile) {
                 SD_UNUSED(tile);
-                return VAE::encode(n_threads, chunk, tiling, circular_x, circular_y);
+                // keep the runner alive across chunks; ending it here would
+                // evict and reload the encoder weights every chunk
+                return VAE::encode(n_threads, chunk, tiling, circular_x, circular_y, false);
             });
+            runner_end();
             if (result.empty()) {
                 return {};
             }
@@ -840,7 +852,7 @@ namespace MiniMaxH3VAE {
                                  bool circular_y   = false,
                                  bool silent       = false) override {
             auto input  = ensure_video_shape(x);
-            auto tiling = h3_tiling(tiling_params);
+            auto tiling = resolve_tiling_params(tiling_params);
             if (input.shape()[2] == 1) {
                 auto decoded = VAE::decode(n_threads,
                                            input,
@@ -1134,18 +1146,36 @@ namespace MiniMaxH3VAE {
                                                bool silent) {
             const int scale_factor = get_scale_factor();
             float tile_overlap;
-            int tile_size_x, tile_size_y;
-            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling, chunk.shape()[0], chunk.shape()[1]);
+            int tile_size_w, tile_size_h;
+            if (!get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling, chunk.shape()[0], chunk.shape()[1], circular_x, circular_y)) {
+                return {};
+            }
+            // Same circular handling as VAE::tiled_compute: full-width axes wrap in convolutions, split axes wrap
+            // between tiles.
+            const bool original_circular_x = circular_x_enabled;
+            const bool original_circular_y = circular_y_enabled;
+            circular_x                     = circular_x || original_circular_x;
+            circular_y                     = circular_y || original_circular_y;
+            set_circular_axes(circular_x && tile_size_w >= chunk.shape()[0],
+                              circular_y && tile_size_h >= chunk.shape()[1]);
+            struct CircularAxesGuard {
+                VAE& vae;
+                bool x;
+                bool y;
+                ~CircularAxesGuard() {
+                    vae.set_circular_axes(x, y);
+                }
+            } circular_axes_guard{*this, original_circular_x, original_circular_y};
             return process_tiles_2d_batched(
                 chunk,
                 static_cast<int>(chunk.shape()[0] * scale_factor),
                 static_cast<int>(chunk.shape()[1] * scale_factor),
                 scale_factor,
-                tile_size_x,
-                tile_size_y,
+                tile_size_w,
+                tile_size_h,
                 tile_overlap,
-                circular_x,
-                circular_y,
+                circular_x && tile_size_w < chunk.shape()[0],
+                circular_y && tile_size_h < chunk.shape()[1],
                 [&](int) { return resolve_tile_batch(); },
                 [&](const std::vector<sd::Tensor<float>>& tiles) {
                     auto output = compute_tile_batch(n_threads, tiles);

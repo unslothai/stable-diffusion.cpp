@@ -160,7 +160,8 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                               int d1              = 1,
                               int d2              = 1,
                               bool force_prec_f32 = false,
-                              bool direct         = false);
+                              bool direct         = false,
+                              float scale         = 1.f);
 
 // w: [OC，IC, KD, 1 * 1]
 // x: [N, IC, ID, IH*IW]
@@ -223,11 +224,12 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     ggml_tensor* k,
                                     ggml_tensor* v,
                                     int64_t n_head,
-                                    ggml_tensor* mask = nullptr,
-                                    bool skip_reshape = false,
-                                    bool flash_attn   = false,
-                                    float kv_scale    = 1.0f,
-                                    bool sage_attn    = false);
+                                    ggml_tensor* mask     = nullptr,
+                                    bool skip_reshape     = false,
+                                    bool flash_attn       = false,
+                                    float kv_scale        = 1.0f,
+                                    bool sage_attn        = false,
+                                    bool* used_flash_attn = nullptr);
 
 // Flash attention on inputs that are already in the head-major layout the kernel reads:
 // q: F32 [d_head, L_q, n_head * N], k/v: F16 [d_head, L_k, n_kv_head * N] with the kv_scale

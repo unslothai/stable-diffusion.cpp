@@ -80,9 +80,10 @@ and audio differ slightly from the previous kernels. `GGML_CUDA_CUDNN_ATTN=0` re
 `GGML_CUDA_CUDNN_SAGE=0` / `=1` does the same for the sage op only, and
 `GGML_CUDA_CUDNN_ATTN_BF16=1` runs cuDNN in BF16 (less accurate, same speed).
 
-The video VAE decodes one 16x16 latent tile per decoder graph by default. `SD_H3_VAE_TILE=N`
-uses N x N latent tiles instead (20 decodes about 0.7 s faster at 960x544x124 on B200); the tile
-seams move, so the frames differ from the default (36 dB PSNR at 20) and it is opt-in.
+The video VAE decodes one 16x16 latent tile (256x256 pixels) per decoder graph by default.
+`SD_H3_VAE_TILE=N` uses N x N latent tiles instead, overriding `--vae-tile-size` (20 decodes
+about 0.7 s faster at 960x544x124 on B200); the tile seams move, so the frames differ from the
+default (36 dB PSNR at 20) and it is opt-in.
 `SD_H3_VAE_TILE_BATCH=auto` puts several tiles into one graph, sized from free device memory (at
 most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it), and `SD_H3_VAE_TILE_BATCH=N` forces N; the
 batched projections can round differently from the per-tile decode on some GPUs, so it is

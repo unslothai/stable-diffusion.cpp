@@ -13,73 +13,70 @@
 #include "core/util.h"
 #include "ggml.h"
 
-static void sd_tiling_calc_tiles(int& num_tiles_dim,
-                                 float& tile_overlap_factor_dim,
-                                 int small_dim,
-                                 int tile_size,
-                                 const float tile_overlap_factor,
-                                 bool circular) {
-    int tile_overlap     = static_cast<int>(tile_size * tile_overlap_factor);
-    int non_tile_overlap = tile_size - tile_overlap;
+struct TileSpan {
+    int offset;
+    int overlap_before;
+    int overlap_after;
+};
 
-    if (circular) {
-        // circular means the last and first tile are overlapping (wraping around)
-        num_tiles_dim = small_dim / non_tile_overlap;
-
-        if (num_tiles_dim < 1) {
-            num_tiles_dim = 1;
-        }
-
-        tile_overlap_factor_dim = (tile_size - small_dim / num_tiles_dim) / (float)tile_size;
-
-        // if single tile and tile_overlap_factor is not 0, add one to ensure we have at least two overlapping tiles
-        if (num_tiles_dim == 1 && tile_overlap_factor_dim > 0) {
-            num_tiles_dim++;
-            tile_overlap_factor_dim = 0.5;
-        }
-
-        return;
-    }
-    // else, non-circular means the last and first tile are not overlapping
-
-    num_tiles_dim     = (small_dim - tile_overlap) / non_tile_overlap;
-    int overshoot_dim = ((num_tiles_dim + 1) * non_tile_overlap + tile_overlap) % small_dim;
-
-    if ((overshoot_dim != non_tile_overlap) && (overshoot_dim <= num_tiles_dim * (tile_size / 2 - tile_overlap))) {
-        // if tiles don't fit perfectly using the desired overlap
-        // and there is enough room to squeeze an extra tile without overlap becoming >0.5
-        num_tiles_dim++;
+static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
+                                                 int tile_size,
+                                                 float target_overlap,
+                                                 bool circular) {
+    if (tile_size >= dimension) {
+        return {{0, 0, 0}};
     }
 
-    tile_overlap_factor_dim = (float)(tile_size * num_tiles_dim - small_dim) / (float)(tile_size * (num_tiles_dim - 1));
-    if (num_tiles_dim <= 2) {
-        if (small_dim <= tile_size) {
-            num_tiles_dim           = 1;
-            tile_overlap_factor_dim = 0;
-        } else {
-            num_tiles_dim           = 2;
-            tile_overlap_factor_dim = (2 * tile_size - small_dim) / (float)tile_size;
-        }
+    const int extent = circular ? dimension : dimension - tile_size;
+    int intervals    = extent;
+    if (tile_size > 1) {
+        const float target = extent / ((1.0f - target_overlap) * tile_size);
+        // Adjacent tiles must overlap, but three tiles must not cover the same point.
+        const int min_intervals = 1 + (extent - 1) / (tile_size - 1);
+        const int max_intervals = std::max(1, static_cast<int>(2LL * extent / tile_size));
+        const int lower         = std::clamp(static_cast<int>(std::floor(target)), min_intervals, max_intervals);
+        const int upper         = std::clamp(static_cast<int>(std::ceil(target)), min_intervals, max_intervals);
+        auto error              = [&](int count) {
+            return std::abs(1.0f / count - 1.0f / target);
+        };
+        intervals = error(upper) < error(lower) ? upper : lower;
     }
+
+    const int num_tiles = circular ? intervals : intervals + 1;
+    auto position       = [&](int index) -> int {
+        return static_cast<int>(int64_t(index) * extent / intervals);
+    };
+    std::vector<TileSpan> tiles;
+    tiles.reserve(num_tiles);
+    for (int i = 0; i < num_tiles; ++i) {
+        const int offset = position(i);
+        // Keep wrapped neighbors in the same unwrapped coordinate space.
+        const int previous = i > 0 ? position(i - 1) : position(num_tiles - 1) - dimension;
+        const int next     = i + 1 < num_tiles ? position(i + 1) : dimension;
+        const int before   = i > 0 || circular ? previous + tile_size - offset : 0;
+        const int after    = i + 1 < num_tiles || circular ? offset + tile_size - next : 0;
+        tiles.push_back({offset, before, after});
+    }
+    return tiles;
 }
 
 int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor) {
-    // sd_tiling_calc_tiles lets the real overlap fall well below the target for some sizes. The worst case is a
-    // tile a little over half of the axis (e.g. round(dim / 2)): it falls back to two tiles overlapping by
-    // 2 * tile_size - small_dim, which is 0 or 1 latent, so the cross-fade has nothing to blend over and the tile
-    // edge shows as a line. Pick the nearest tile size (smaller first; a larger one only up to twice the request,
-    // so an explicitly small tile cannot balloon) whose tiles overlap by at least half the target and by 2+ latents.
+    // A tile a little over half the axis (32 of 62 latents) gets two tiles overlapping by 1-2 latents, which shows
+    // as a seam. Pick the nearest size (smaller first, larger only up to 2x) whose overlaps are >= half the target
+    // and >= 2 latents.
     const int min_tile_size = 4;
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;
     }
     auto overlaps_enough = [&](int size) {
-        int num_tiles;
-        float overlap_factor;
-        sd_tiling_calc_tiles(num_tiles, overlap_factor, small_dim, size, tile_overlap_factor, false);
-        const int overlap     = static_cast<int>(size * overlap_factor);
         const int min_overlap = std::max(2, static_cast<int>(size * tile_overlap_factor * 0.5f));
-        return num_tiles < 2 || overlap >= min_overlap;
+        const auto tiles      = sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false);
+        for (size_t i = 0; i + 1 < tiles.size(); ++i) {
+            if (tiles[i].overlap_after < min_overlap) {
+                return false;
+            }
+        }
+        return true;
     };
     for (int size = tile_size; size >= min_tile_size; --size) {
         if (overlaps_enough(size)) {
@@ -152,70 +149,69 @@ static void sd_parallel_for_planes(int64_t plane_count, int64_t plane_elements, 
 }
 
 static void sd_tensor_merge_2d(const float* input_data,
-                               int64_t width,
-                               int64_t height,
+                               int64_t in_width,
+                               int64_t in_height,
                                int64_t plane_count,
                                sd::Tensor<float>* output,
                                int x,
                                int y,
-                               int overlap_x,
-                               int overlap_y,
-                               bool circular_x,
-                               bool circular_y,
-                               int x_skip,
-                               int y_skip) {
+                               int overlap_left,
+                               int overlap_right,
+                               int overlap_top,
+                               int overlap_bottom) {
     GGML_ASSERT(output != nullptr);
-    int64_t img_width    = output->shape()[0];
-    int64_t img_height   = output->shape()[1];
-    int64_t input_plane  = width * height;
-    int64_t output_plane = sd_tensor_plane_size(*output);
-    GGML_ASSERT(output->numel() / output_plane == plane_count);
 
-    // unclamped -> expects x in the range [0-1]
+    int64_t out_width  = output->shape()[0];
+    int64_t out_height = output->shape()[1];
+    int64_t in_size    = in_width * in_height;
+    int64_t out_size   = sd_tensor_plane_size(*output);
+
+    GGML_ASSERT(output->numel() == plane_count * out_size);
+    GGML_ASSERT(x >= 0 && y >= 0);
+    GGML_ASSERT(x < out_width && in_width <= out_width);
+    GGML_ASSERT(y < out_height && in_height <= out_height);
+    GGML_ASSERT(overlap_left >= 0 && overlap_right >= 0);
+    GGML_ASSERT(overlap_top >= 0 && overlap_bottom >= 0);
+
     auto smootherstep_f32 = [](const float x) -> float {
-        GGML_ASSERT(x >= 0.f && x <= 1.f);
         return x * x * x * (x * (6.0f * x - 15.0f) + 10.0f);
     };
-
-    // Same per-element arithmetic as the per-pixel form, so the result stays bit-identical.
-    const bool blend = overlap_x > 0 || overlap_y > 0;
-    std::vector<float> wx, wy;
-    std::vector<int64_t> dst_x(static_cast<size_t>(width));
-    for (int64_t ix = x_skip; ix < width; ix++) {
-        dst_x[ix] = (x + ix) % img_width;
+    // Weights depend only on the column or row; the per-element arithmetic order is unchanged.
+    std::vector<float> x_weights(static_cast<size_t>(in_width));
+    std::vector<float> y_weights(static_cast<size_t>(in_height));
+    std::vector<int64_t> dst_x(static_cast<size_t>(in_width));
+    for (int ix = 0; ix < in_width; ++ix) {
+        float x_f = 1.0f;
+        if (ix < overlap_left) {
+            x_f = static_cast<float>(ix) / overlap_left;
+        }
+        if (ix >= in_width - overlap_right) {
+            x_f = static_cast<float>(in_width - ix) / overlap_right;
+        }
+        x_weights[ix] = smootherstep_f32(std::clamp(x_f, 0.0f, 1.0f));
+        dst_x[ix]     = (x + ix) % out_width;
     }
-    if (blend) {
-        wx.resize(static_cast<size_t>(width));
-        wy.resize(static_cast<size_t>(height));
-        for (int64_t ix = x_skip; ix < width; ix++) {
-            const float x_f_0 = (circular_x || (overlap_x > 0 && x > 0)) ? (ix - x_skip) / float(overlap_x) : 1.f;
-            const float x_f_1 = (circular_x || (overlap_x > 0 && x < (img_width - width))) ? (width - ix) / float(overlap_x) : 1.f;
-            wx[ix]            = smootherstep_f32(std::min(std::min(x_f_0, x_f_1), 1.f));
+    for (int iy = 0; iy < in_height; ++iy) {
+        float y_f = 1.0f;
+        if (iy < overlap_top) {
+            y_f = static_cast<float>(iy) / overlap_top;
         }
-        for (int64_t iy = y_skip; iy < height; iy++) {
-            const float y_f_0 = (circular_y || (overlap_y > 0 && y > 0)) ? (iy - y_skip) / float(overlap_y) : 1.f;
-            const float y_f_1 = (circular_y || (overlap_y > 0 && y < (img_height - height))) ? (height - iy) / float(overlap_y) : 1.f;
-            wy[iy]            = smootherstep_f32(std::min(std::min(y_f_0, y_f_1), 1.f));
+        if (iy >= in_height - overlap_bottom) {
+            y_f = static_cast<float>(in_height - iy) / overlap_bottom;
         }
+        y_weights[iy] = smootherstep_f32(std::clamp(y_f, 0.0f, 1.0f));
     }
     float* output_data = output->data();
-    sd_parallel_for_planes(plane_count, input_plane, [&](int64_t first_plane, int64_t last_plane) {
+    sd_parallel_for_planes(plane_count, in_size, [&](int64_t first_plane, int64_t last_plane) {
         for (int64_t plane = first_plane; plane < last_plane; ++plane) {
-            const float* src = input_data + plane * input_plane;
-            float* dst       = output_data + plane * output_plane;
-            for (int64_t iy = y_skip; iy < height; iy++) {
-                const float* src_row = src + width * iy;
-                float* dst_row       = dst + img_width * ((y + iy) % img_height);
-                if (blend) {
-                    const float sy = wy[iy];
-                    for (int64_t ix = x_skip; ix < width; ix++) {
-                        float& out = dst_row[dst_x[ix]];
-                        out        = out + src_row[ix] * sy * wx[ix];
-                    }
-                } else {
-                    for (int64_t ix = x_skip; ix < width; ix++) {
-                        dst_row[dst_x[ix]] = src_row[ix];
-                    }
+            const float* src = input_data + plane * in_size;
+            float* dst       = output_data + plane * out_size;
+            for (int iy = 0; iy < in_height; ++iy) {
+                const float y_weight = y_weights[iy];
+                const float* src_row = src + in_width * iy;
+                float* dst_row       = dst + out_width * ((y + iy) % out_height);
+                for (int ix = 0; ix < in_width; ++ix) {
+                    dst_row[dst_x[ix]] += x_weights[ix] * y_weight * src_row[ix];
                 }
             }
         }
@@ -226,8 +222,8 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
                                    int output_width,
                                    int output_height,
                                    int scale,
-                                   int p_tile_size_x,
-                                   int p_tile_size_y,
+                                   int p_tile_size_w,
+                                   int p_tile_size_h,
                                    float tile_overlap_factor,
                                    bool circular_x,
                                    bool circular_y,
@@ -238,8 +234,8 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
         output_width,
         output_height,
         scale,
-        p_tile_size_x,
-        p_tile_size_y,
+        p_tile_size_w,
+        p_tile_size_h,
         tile_overlap_factor,
         circular_x,
         circular_y,
@@ -259,8 +255,8 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
                                            int output_width,
                                            int output_height,
                                            int scale,
-                                           int p_tile_size_x,
-                                           int p_tile_size_y,
+                                           int p_tile_size_w,
+                                           int p_tile_size_h,
                                            float tile_overlap_factor,
                                            bool circular_x,
                                            bool circular_y,
@@ -271,96 +267,40 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
     int input_width  = static_cast<int>(input.shape()[0]);
     int input_height = static_cast<int>(input.shape()[1]);
 
-    GGML_ASSERT(((input_width / output_width) == (input_height / output_height)) &&
-                ((output_width / input_width) == (output_height / input_height)));
     GGML_ASSERT(((input_width / output_width) == scale) ||
                 ((output_width / input_width) == scale));
 
-    int small_width  = output_width;
-    int small_height = output_height;
-    bool decode      = output_width > input_width;
-    if (decode) {
-        small_width  = input_width;
-        small_height = input_height;
-    }
+    bool decode      = output_width > input_width;  // scale up
+    int small_width  = decode ? input_width : output_width;
+    int small_height = decode ? input_height : output_height;
+    int scale_in     = decode ? 1 : scale;
+    int scale_out    = decode ? scale : 1;
 
-    int num_tiles_x;
-    float tile_overlap_factor_x;
-    sd_tiling_calc_tiles(num_tiles_x, tile_overlap_factor_x, small_width, p_tile_size_x, tile_overlap_factor, circular_x);
+    const auto tiles_x = sd_tiling_plan_axis(small_width, p_tile_size_w, tile_overlap_factor, circular_x);
+    const auto tiles_y = sd_tiling_plan_axis(small_height, p_tile_size_h, tile_overlap_factor, circular_y);
 
-    int num_tiles_y;
-    float tile_overlap_factor_y;
-    sd_tiling_calc_tiles(num_tiles_y, tile_overlap_factor_y, small_height, p_tile_size_y, tile_overlap_factor, circular_y);
-
-    int tile_overlap_x     = static_cast<int32_t>(p_tile_size_x * tile_overlap_factor_x);
-    int non_tile_overlap_x = p_tile_size_x - tile_overlap_x;
-    int tile_overlap_y     = static_cast<int32_t>(p_tile_size_y * tile_overlap_factor_y);
-    int non_tile_overlap_y = p_tile_size_y - tile_overlap_y;
-    int tile_size_x        = p_tile_size_x < small_width ? p_tile_size_x : small_width;
-    int tile_size_y        = p_tile_size_y < small_height ? p_tile_size_y : small_height;
-    int input_tile_size_x  = tile_size_x;
-    int input_tile_size_y  = tile_size_y;
-    int output_tile_size_x = tile_size_x;
-    int output_tile_size_y = tile_size_y;
-    if (decode) {
-        output_tile_size_x *= scale;
-        output_tile_size_y *= scale;
-    } else {
-        input_tile_size_x *= scale;
-        input_tile_size_y *= scale;
-    }
+    int tile_width         = std::min(p_tile_size_w, small_width);
+    int tile_height        = std::min(p_tile_size_h, small_height);
+    int input_tile_width   = tile_width * scale_in;
+    int input_tile_height  = tile_height * scale_in;
+    int output_tile_width  = tile_width * scale_out;
+    int output_tile_height = tile_height * scale_out;
 
     struct TilePlacement {
-        int x_in;
-        int y_in;
-        int x_out;
-        int y_out;
-        int dx;
-        int dy;
+        const TileSpan* x;
+        const TileSpan* y;
     };
     std::vector<TilePlacement> placements;
-    bool last_y = false;
-    bool last_x = false;
-    for (int y = 0; y < small_height && !last_y; y += non_tile_overlap_y) {
-        int dy = 0;
-        if (!circular_y && y + tile_size_y >= small_height) {
-            int original_y = y;
-            y              = small_height - tile_size_y;
-            dy             = original_y - y;
-            if (decode) {
-                dy *= scale;
-            }
-            last_y = true;
+    for (const auto& y : tiles_y) {
+        for (const auto& x : tiles_x) {
+            placements.push_back({&x, &y});
         }
-        for (int x = 0; x < small_width && !last_x; x += non_tile_overlap_x) {
-            int dx = 0;
-            if (!circular_x && x + tile_size_x >= small_width) {
-                int original_x = x;
-                x              = small_width - tile_size_x;
-                dx             = original_x - x;
-                if (decode) {
-                    dx *= scale;
-                }
-                last_x = true;
-            }
-            placements.push_back({decode ? x : scale * x,
-                                  decode ? y : scale * y,
-                                  decode ? x * scale : x,
-                                  decode ? y * scale : y,
-                                  dx,
-                                  dy});
-        }
-        last_x = false;
     }
 
-    int overlap_x_out = decode ? tile_overlap_x * scale : tile_overlap_x;
-    int overlap_y_out = decode ? tile_overlap_y * scale : tile_overlap_y;
-    int num_tiles     = num_tiles_x * num_tiles_y;
-    int tile_count    = 1;
-    float last_time   = 0.0f;
+    const int num_tiles = static_cast<int>(placements.size());
+    int tile_count      = 0;
     if (!silent) {
-        LOG_VERBOSE("num tiles : %d, %d ", num_tiles_x, num_tiles_y);
-        LOG_VERBOSE("optimal overlap : %f, %f (targeting %f)", tile_overlap_factor_x, tile_overlap_factor_y, tile_overlap_factor);
+        LOG_VERBOSE("num tiles : %d, %d ", static_cast<int>(tiles_x.size()), static_cast<int>(tiles_y.size()));
         LOG_VERBOSE("processing %i tiles", num_tiles);
         pretty_progress(0, num_tiles, 0.0f);
     }
@@ -392,7 +332,11 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
         int64_t t1          = ggml_time_ms();
         input_tiles.clear();
         for (size_t i = first; i < last; ++i) {
-            input_tiles.push_back(sd_tensor_split_2d(input, input_tile_size_x, input_tile_size_y, placements[i].x_in, placements[i].y_in));
+            input_tiles.push_back(sd_tensor_split_2d(input,
+                                                     input_tile_width,
+                                                     input_tile_height,
+                                                     placements[i].x->offset * scale_in,
+                                                     placements[i].y->offset * scale_in));
         }
         auto batch = on_processing(input_tiles);
         if (batch.data.empty()) {
@@ -405,7 +349,7 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
         }
         std::vector<int64_t> tile_shape = batch.data.shape();
         tile_shape[batch.stack_dim] /= batch_tiles;
-        GGML_ASSERT(tile_shape[0] == output_tile_size_x && tile_shape[1] == output_tile_size_y);
+        GGML_ASSERT(tile_shape[0] == output_tile_width && tile_shape[1] == output_tile_height);
         auto merge_batch = [&, first, last, tile_shape](const sd::Tensor<float>& data) {
             const int64_t tile_numel  = data.numel() / static_cast<int64_t>(last - first);
             const int64_t plane_count = tile_numel / (tile_shape[0] * tile_shape[1]);
@@ -416,20 +360,19 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
                 output                            = sd::Tensor<float>::zeros(std::move(output_shape));
             }
             for (size_t i = first; i < last; ++i) {
-                const auto& placement = placements[i];
+                const auto& x = *placements[i].x;
+                const auto& y = *placements[i].y;
                 sd_tensor_merge_2d(data.data() + static_cast<int64_t>(i - first) * tile_numel,
                                    tile_shape[0],
                                    tile_shape[1],
                                    plane_count,
                                    &output,
-                                   placement.x_out,
-                                   placement.y_out,
-                                   overlap_x_out,
-                                   overlap_y_out,
-                                   circular_x,
-                                   circular_y,
-                                   placement.dx,
-                                   placement.dy);
+                                   x.offset * scale_out,
+                                   y.offset * scale_out,
+                                   x.overlap_before * scale_out,
+                                   x.overlap_after * scale_out,
+                                   y.overlap_before * scale_out,
+                                   y.overlap_after * scale_out);
             }
         };
         join_merger();
@@ -458,26 +401,17 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
             merge_batch(batch.data);
         }
 
-        if (!silent) {
-            int64_t t2 = ggml_time_ms();
-            last_time  = (t2 - t1) / 1000.0f / static_cast<float>(last - first);
-            for (size_t i = first; i < last; ++i) {
-                pretty_progress(tile_count, num_tiles, last_time);
-                tile_count++;
+        const float tile_time = (ggml_time_ms() - t1) / 1000.0f / static_cast<float>(last - first);
+        for (size_t i = first; i < last; ++i) {
+            ++tile_count;
+            if (!silent) {
+                pretty_progress(tile_count, num_tiles, tile_time);
             }
-        } else {
-            tile_count += static_cast<int>(last - first);
         }
         first = last;
     }
     join_merger();
     if (merge_failed) {
-        return {};
-    }
-    if (!silent && tile_count < num_tiles) {
-        pretty_progress(num_tiles, num_tiles, last_time);
-    }
-    if (output.empty()) {
         return {};
     }
     return output;

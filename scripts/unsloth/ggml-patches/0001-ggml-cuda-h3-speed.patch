@@ -1,4 +1,4 @@
-From 22b560daa5e90bdb72c492f0b55667468ad3fd6b Mon Sep 17 00:00:00 2001
+From fa18cddc3f2a87bec12af3a00d4be0e28f9d514b Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Wed, 30 Sep 2026 22:28:21 -0700
 Subject: [PATCH 1/2] ggml-cuda: BF16 cuBLAS for large-batch quantized matmul,
@@ -21,10 +21,10 @@ in one tiled H3 VAE decode. The flag is now read once at registration.
  1 file changed, 47 insertions(+), 8 deletions(-)
 
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index e15fdc5e..517d0894 100644
+index 5e9c323b..a153de57 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2427,6 +2427,25 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+@@ -2431,6 +2431,25 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      return use_mul_mat_vec_q;
  }
  
@@ -50,7 +50,7 @@ index e15fdc5e..517d0894 100644
  static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_TENSOR_BINARY_OP_LOCALS
  
-@@ -2492,6 +2511,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2496,6 +2515,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
          return;
      }
@@ -74,7 +74,7 @@ index e15fdc5e..517d0894 100644
      if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
          ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
          return;
-@@ -5200,6 +5236,10 @@ struct ggml_backend_cuda_device_context {
+@@ -5593,6 +5629,10 @@ struct ggml_backend_cuda_device_context {
      std::string description;
      std::string pci_bus_id;
      int op_offload_min_batch_size;
@@ -85,9 +85,9 @@ index e15fdc5e..517d0894 100644
  };
  
  static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
-@@ -5303,12 +5343,9 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
+@@ -5696,12 +5736,9 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
  // ref: https://github.com/ggml-org/llama.cpp/pull/17368
- #if defined(__linux__)
+ #if defined(__linux__) && !defined(GGML_USE_HIP)
      // Check if this is a UMA (Unified Memory Architecture) system
 -    cudaDeviceProp prop;
 -    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
@@ -99,7 +99,7 @@ index e15fdc5e..517d0894 100644
  
      if (is_uma) {
          // For UMA systems (like DGX Spark), use system memory info
-@@ -5332,10 +5369,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
+@@ -5725,10 +5762,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
  static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
  
@@ -111,7 +111,7 @@ index e15fdc5e..517d0894 100644
          ? GGML_BACKEND_DEVICE_TYPE_IGPU
          : GGML_BACKEND_DEVICE_TYPE_GPU;
  }
-@@ -6095,6 +6129,11 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
+@@ -6503,6 +6537,11 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                  dev_ctx->device = i;
                  dev_ctx->name = GGML_CUDA_NAME + std::to_string(i);
                  dev_ctx->description = ggml_cuda_device_description(i);
@@ -127,7 +127,7 @@ index e15fdc5e..517d0894 100644
 2.43.0
 
 
-From 0bf02a4e324ef837685c63ebaeddf2b4a4c0f317 Mon Sep 17 00:00:00 2001
+From 09f9ed593f044105ff5e206b1003327275c08b9b Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Wed, 30 Sep 2026 22:54:01 -0700
 Subject: [PATCH 2/2] ggml-cuda: vectorized row copy for strided F32->F32/F16
@@ -145,7 +145,7 @@ cpy_scalar.
  1 file changed, 83 insertions(+)
 
 diff --git a/src/ggml-cuda/cpy.cu b/src/ggml-cuda/cpy.cu
-index 4c6fb4a2..c26a081c 100644
+index c32bb36b..4aa183af 100644
 --- a/src/ggml-cuda/cpy.cu
 +++ b/src/ggml-cuda/cpy.cu
 @@ -1,4 +1,5 @@

@@ -21,6 +21,60 @@ CPU fallback. It excludes weights and cache buffers. Within a runner lifecycle,
 the summary is printed only on the first graph or when backend capacities or the
 segment count change.
 
+## Use VAE tiling to reduce encode and decode memory usage.
+
+`--vae-tiling` enables spatial tiling for both VAE encoding and decoding. The
+default tile size is 256x256 **image pixels**, independent of the VAE scale factor:
+
+```shell
+--vae-tiling --vae-tile-size 256x256 --vae-tile-overlap 0.5
+```
+
+`--vae-tile-size` accepts one size or `WIDTHxHEIGHT`. A zero dimension uses the
+256-pixel default. Sizes are rounded down to a multiple of the VAE scale factor
+and capped at the current input dimensions. Explicit sizes below four latent
+pixels per axis (or the full axis when it is smaller) are rejected. Encoding and
+decoding use the same spatial sizes, without an additional encoding multiplier.
+Inputs that fit within a tile are processed as one tile.
+
+For a 512x512 image with the default 50% overlap, both encoding and decoding use
+3x3 tiles. A 256-pixel tile corresponds to 32 latent pixels for an 8x VAE, 16 for
+a 16x VAE, and 8 for a 32x VAE. Smaller tiles reduce each graph's memory demand,
+but overlapping work can increase processing time and tiling can affect image
+quality, especially during encoding. Use larger tiles when more context is needed.
+
+`--vae-relative-tile-size` overrides the absolute size on each axis with a positive
+value. Values up to and including 1 specify a fraction of the current input size;
+values greater than 1 specify a target number of tiles per axis, accounting for
+overlap. For example, `0.5x0.5` uses half the width and height in both encode and
+decode. The target overlap is clamped to 0 through 0.5 and the actual overlap is
+adjusted to fit the image. On an axis that does not wrap, a tile size that would leave
+neighboring tiles overlapping by less than half the target (or by fewer than 2 latent
+pixels) is adjusted to the nearest size that does not: smaller first, larger only up to
+twice the requested size. Without it, a tile a little over half of the axis gives two
+tiles that barely overlap and the tile edge shows as a line. Size and overlap options
+require `--vae-tiling`.
+
+**Migration:** `--vae-tile-size` and the C/JSON fields `tile_size_w` and
+`tile_size_h` now use image pixels instead of latent units. The C/JSON fields
+`tile_size_x/y` have been renamed to `tile_size_w/h`, and `rel_size_x/y` to
+`rel_size_w/h`. The command-line option names are unchanged. For example, an old
+decode tile size of 32 corresponds to 256 pixels for an 8x VAE or 512 pixels for a
+16x VAE. Encoding no longer enlarges explicit or relative tile sizes.
+
+The main VAE decode and encode paths retry allocation failures with smaller tiles,
+even without `--vae-tiling`. Supported video VAEs first try temporal tiling; spatial
+retries use at most 256-pixel tiles initially and then halve the effective tile
+dimensions down to the minimum size. Each spatial retry must reduce the effective
+tile size. These runtime adjustments do not change the caller's parameters.
+Execution failures are not retried. Encoding retries the same way, without the
+temporal step.
+
+`--temporal-tiling` remains independent of spatial tiling. MiniMax H3 always uses
+spatial tiling (256x256 pixels and 25% overlap by default) and its own temporal
+windows. With `--vae-tiling`, its overlap follows `--vae-tile-overlap`; explicit
+spatial sizes are honored.
+
 ## Offload weights to the CPU to save VRAM without reducing generation speed.
 
 Using `--offload-to-cpu` allows you to offload weights to the CPU, saving VRAM without reducing generation speed.
@@ -62,6 +116,12 @@ See [backend selection](./backend.md) for full syntax.
 `--offload-to-cpu` keeps the source parameters in system RAM and creates compute-side GPU replicas on demand. Unpinned replicas remain resident for reuse, but automatic graph-cut execution evicts them from the last segment backward when the next weight or compute allocation needs space. Disk-backed parameters follow the same policy without retaining a RAM source copy.
 
 When a graph has cut markers and its missing weights plus incremental compute workspace exceed the available device headroom, it runs its fixed segment list in order. A reusable monolithic compute buffer is not counted as a new allocation. An explicit `--max-vram` budget deducts already-resident managed weights and compute/cache buffers registered by every runner sharing the device, so later graph runs remain segmented when the full graph exceeds the budget. The current segment's weights are pinned during compute, and the next parameter-bearing segment is prefetched when the device supports asynchronous transfer. No opt-in streaming flag is required.
+
+When choosing between monolithic and segmented execution, the runner requires
+an additional 128 MiB of headroom in both available device memory and any explicit
+managed budget. This planning headroom absorbs small allocation estimate changes;
+subsequent capacity checks can consume it while still preserving the 512 MiB device
+scratch reserve and respecting the managed budget.
 
 - `--max-vram <GiB>` optionally lowers the live-memory limit. A positive value is a managed per-device budget, `0` uses the device's current free memory without an explicit budget, and a negative value snapshots free memory at startup while reserving that many GiB (`--max-vram -1` reserves about 1 GiB). Driver contexts and unrelated external allocations remain outside the managed budget.
 - `--disable-prefetch` disables asynchronous next-segment prefetch while retaining synchronous loading, eviction, and segmented execution.

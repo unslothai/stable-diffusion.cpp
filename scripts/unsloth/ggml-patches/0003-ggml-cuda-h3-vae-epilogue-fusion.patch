@@ -1,4 +1,4 @@
-From 76b49e564c23b99758642d5bc5013d09774a1e24 Mon Sep 17 00:00:00 2001
+From 54d3121a3e39ddf79c025a87271c9e349fb76b5d Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Thu, 1 Oct 2026 05:46:18 -0700
 Subject: [PATCH] ggml-cuda: fuse bias epilogues into F16 cuBLAS matmuls,
@@ -24,10 +24,10 @@ the 256-thread launch.
  2 files changed, 262 insertions(+), 1 deletion(-)
 
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 517d089..0e61996 100644
+index a153de57..72d090e3 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2017,8 +2017,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+@@ -2014,8 +2014,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
      static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
  };
  
@@ -102,7 +102,7 @@ index 517d089..0e61996 100644
      using traits = batched_mul_mat_traits<compute_type>;
      using cuda_t = typename traits::cuda_type;
  
-@@ -2226,8 +2291,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -2223,8 +2288,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
  
      // Convert output back to F32 if needed
      if (cu_data_type != CUDA_R_32F) {
@@ -120,7 +120,7 @@ index 517d089..0e61996 100644
      }
  }
  
-@@ -3838,6 +3912,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4111,6 +4185,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -244,8 +244,8 @@ index 517d089..0e61996 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4523,6 +4714,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-         return fused_node_count - 1;
+@@ -4825,6 +5016,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
      }
  
 +    if (node->op == GGML_OP_MUL_MAT) {
@@ -259,7 +259,7 @@ index 517d089..0e61996 100644
          ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
 diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
-index c3758cd..9c9385f 100644
+index c3758cd5..9c9385f8 100644
 --- a/src/ggml-cuda/norm.cu
 +++ b/src/ggml-cuda/norm.cu
 @@ -301,10 +301,68 @@ static void group_norm_f32_cuda(

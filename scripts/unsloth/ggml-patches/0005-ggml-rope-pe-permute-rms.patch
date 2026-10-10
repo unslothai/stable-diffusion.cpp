@@ -1,4 +1,4 @@
-From 092f5d51d0844f7cf282ca115a81fccdde9fafad Mon Sep 17 00:00:00 2001
+From b8666f9e06e9e07255b8bfc92c42988716b7b865 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Thu, 1 Oct 2026 23:16:25 -0700
 Subject: [PATCH] ggml : rope_pe_permute with the per-head RMS norm folded in
@@ -19,10 +19,10 @@ reported unsupported and callers keep the separate norm. test-backend-ops cases 
  5 files changed, 174 insertions(+), 5 deletions(-)
 
 diff --git a/include/ggml.h b/include/ggml.h
-index 153eed2a..8134626f 100644
+index 8c92967a..41ac28bb 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
-@@ -2483,6 +2483,18 @@ extern "C" {
+@@ -2573,6 +2573,18 @@ extern "C" {
              float                 scale,
              enum ggml_type        type);
  
@@ -42,10 +42,10 @@ index 153eed2a..8134626f 100644
      // different modulation vectors. Writes rows [row0, row1) along dim 1 (all of dims 2 and 3) of the
      // result and leaves every other row as it is in `acc`: chain one call per segment, passing the
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 40fe1949..1d67b482 100644
+index f4ca82e7..bdd36aea 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -12151,6 +12151,8 @@ void ggml_compute_forward_rope_pe_permute(
+@@ -12395,6 +12395,8 @@ void ggml_compute_forward_rope_pe_permute(
  
      const int   n_rot = ggml_get_op_params_i32(dst, 0);
      const float scale = ggml_get_op_params_f32(dst, 1);
@@ -54,7 +54,7 @@ index 40fe1949..1d67b482 100644
      const int   half  = n_rot / 2;
  
      const int64_t D = src0->ne[0];
-@@ -12165,7 +12167,7 @@ void ggml_compute_forward_rope_pe_permute(
+@@ -12409,7 +12411,7 @@ void ggml_compute_forward_rope_pe_permute(
  
      // Same rounding points as the unfused graph: each product, the sum, the scale and the
      // conversion are separate passes, so no contraction into fused multiply-adds can happen.
@@ -63,7 +63,7 @@ index 40fe1949..1d67b482 100644
  
      for (int64_t ir = ir0; ir < ir1; ++ir) {
          const int64_t h = ir % H;
-@@ -12174,6 +12176,19 @@ void ggml_compute_forward_rope_pe_permute(
+@@ -12418,6 +12420,19 @@ void ggml_compute_forward_rope_pe_permute(
  
          const float * x = (const float *) ((const char *) src0->data + h * src0->nb[1] + l * src0->nb[2] + n * src0->nb[3]);
  
@@ -228,10 +228,10 @@ index 3afe4423..b6dd7a69 100644
      return pe == nullptr || (pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
  }
 diff --git a/src/ggml.c b/src/ggml.c
-index fec933bf..62a157c6 100644
+index 165514d9..1fe59a0e 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -5594,6 +5594,21 @@ struct ggml_tensor * ggml_rope_pe_permute(
+@@ -5736,6 +5736,21 @@ struct ggml_tensor * ggml_rope_pe_permute(
      return result;
  }
  
@@ -254,10 +254,10 @@ index fec933bf..62a157c6 100644
          struct ggml_context * ctx,
          struct ggml_tensor  * acc,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 1e46361c..b58c815c 100644
+index 6b49765d..af772ae9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -2132,15 +2132,16 @@ struct test_rope_pe_permute : public test_case {
+@@ -2195,15 +2195,16 @@ struct test_rope_pe_permute : public test_case {
      const int n_rot;
      const float scale;
      const bool view; // a is a strided view (one third of a fused qkv projection)
@@ -277,7 +277,7 @@ index 1e46361c..b58c815c 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a;
-@@ -2159,7 +2160,8 @@ struct test_rope_pe_permute : public test_case {
+@@ -2222,7 +2223,8 @@ struct test_rope_pe_permute : public test_case {
              pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, n_rot / 2, ne_a[2]);
              ggml_set_name(pe, "pe");
          }
@@ -287,7 +287,7 @@ index 1e46361c..b58c815c 100644
          ggml_set_name(out, "out");
          return out;
      }
-@@ -8221,6 +8223,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9226,6 +9228,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                  test_cases.emplace_back(new test_rope_pe_permute(type, {128, 4, 9, 1}, 0, scale, view));
                  test_cases.emplace_back(new test_rope_pe_permute(type, {64, 3, 7, 2}, 32, scale, view));
                  test_cases.emplace_back(new test_rope_pe_permute(type, {200, 2, 3, 1}, 100, scale, view));

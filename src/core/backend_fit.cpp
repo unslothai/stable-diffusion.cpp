@@ -478,57 +478,61 @@ namespace sd::backend_fit {
         return true;
     }
 
-    bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params, bool prefer_temporal_tiling) {
-        return prepare_vae_retry_tiling(tiling_params, prefer_temporal_tiling, false);
+    bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params,
+                                         bool prefer_temporal_tiling,
+                                         ggml_status status,
+                                         int latent_tile_size_w,
+                                         int latent_tile_size_h,
+                                         int scale_factor) {
+        return prepare_vae_retry_tiling(tiling_params, prefer_temporal_tiling, status,
+                                        latent_tile_size_w, latent_tile_size_h, scale_factor, false);
     }
 
-    bool prepare_vae_retry_tiling(sd_tiling_params_t& tiling_params, bool prefer_temporal_tiling, bool encode) {
-        // Spatial retry tiles are a fraction of the latent: half of it for decode. Image VAE encode tiles are
-        // scaled up 2x by get_tile_sizes, so encode starts a step lower to actually split the image.
-        // get_tile_sizes keeps the tiles overlapping (sd_tiling_seam_safe_tile_size), so a fractional tile never
-        // collapses into two tiles that meet edge to edge. If a retry still fails, the tiles are halved again
-        // down to an eighth of the latent before giving up.
-        const float first_rel_size = encode ? 0.25f : 0.5f;
-        const float min_rel_size   = 0.125f;
-        const char* stage          = encode ? "encode" : "decode";
-        const char* retry_mode     = nullptr;
+    bool prepare_vae_retry_tiling(sd_tiling_params_t& tiling_params,
+                                  bool prefer_temporal_tiling,
+                                  ggml_status status,
+                                  int latent_tile_size_w,
+                                  int latent_tile_size_h,
+                                  int scale_factor,
+                                  bool encode) {
+        // Execution failures can leave the device unusable; tiling only helps with allocation failures.
+        if (status != GGML_STATUS_ALLOC_FAILED) {
+            return false;
+        }
+        const char* stage      = encode ? "encode" : "decode";
+        const char* retry_mode = nullptr;
         if (prefer_temporal_tiling && !tiling_params.temporal_tiling) {
             tiling_params.temporal_tiling = true;
             retry_mode                    = tiling_params.enabled ? "spatial+temporal" : "temporal";
-        } else if (!tiling_params.enabled) {
-            tiling_params.enabled    = true;
-            tiling_params.rel_size_x = first_rel_size;
-            tiling_params.rel_size_y = first_rel_size;
-            if (tiling_params.tile_size_x <= 0) {
-                tiling_params.tile_size_x = 256;
-            }
-            if (tiling_params.tile_size_y <= 0) {
-                tiling_params.tile_size_y = 256;
-            }
-            if (tiling_params.target_overlap <= 0.f) {
-                tiling_params.target_overlap = 0.5f;
-            }
-            retry_mode = tiling_params.temporal_tiling ? "spatial+temporal" : "spatial";
-        } else if (tiling_params.rel_size_x > 0.f && tiling_params.rel_size_x <= 1.f &&
-                   tiling_params.rel_size_y > 0.f && tiling_params.rel_size_y <= 1.f &&
-                   std::max(tiling_params.rel_size_x, tiling_params.rel_size_y) > min_rel_size) {
-            // An axis already below the floor keeps its size: clamping it up would grow the tile that just failed.
-            auto shrink              = [&](float rel) { return rel > min_rel_size ? std::max(rel * 0.5f, min_rel_size) : rel; };
-            tiling_params.rel_size_x = shrink(tiling_params.rel_size_x);
-            tiling_params.rel_size_y = shrink(tiling_params.rel_size_y);
-            if (tiling_params.target_overlap <= 0.f) {
-                tiling_params.target_overlap = 0.5f;
-            }
-            LOG_WARN("VAE %s failed (likely out of memory); retrying with smaller tiles (%.3g x %.3g of the latent)",
-                     stage,
-                     tiling_params.rel_size_x,
-                     tiling_params.rel_size_y);
-            return true;
         } else {
-            return false;
+            if (latent_tile_size_w <= 0 || latent_tile_size_h <= 0 || scale_factor <= 0) {
+                return false;
+            }
+            auto smaller_tile = [&](int size) {
+                int next_size = size / 2;
+                if (!tiling_params.enabled) {
+                    next_size = std::min(next_size, 256 / scale_factor);
+                }
+                return std::min(size, std::max(4, next_size));
+            };
+            const int tile_size_w = smaller_tile(latent_tile_size_w);
+            const int tile_size_h = smaller_tile(latent_tile_size_h);
+            if (tile_size_w == latent_tile_size_w && tile_size_h == latent_tile_size_h) {
+                return false;
+            }
+            tiling_params.enabled     = true;
+            tiling_params.rel_size_w  = 0.0f;
+            tiling_params.rel_size_h  = 0.0f;
+            tiling_params.tile_size_w = tile_size_w * scale_factor;
+            tiling_params.tile_size_h = tile_size_h * scale_factor;
+            retry_mode                = tiling_params.temporal_tiling ? "spatial+temporal" : "spatial";
+            LOG_WARN("Reducing VAE %s tiles from %dx%d to %dx%d image pixels",
+                     stage,
+                     latent_tile_size_w * scale_factor, latent_tile_size_h * scale_factor,
+                     tiling_params.tile_size_w, tiling_params.tile_size_h);
         }
 
-        LOG_WARN("VAE %s failed (likely out of memory); retrying with %s tiling",
+        LOG_WARN("VAE %s ran out of memory; retrying with %s tiling",
                  stage,
                  retry_mode);
         return true;
