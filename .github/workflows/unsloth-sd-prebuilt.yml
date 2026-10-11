@@ -273,16 +273,20 @@ jobs:
             arch: x86_64
             defines: "-DSD_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
             gate: "true"
+            cpu_floor: x64
           - label: Linux-Ubuntu-22.04-x86_64
             runner: ubuntu-22.04
             arch: x86_64
             defines: ""
             gate: "false"
+            cpu_floor: x64
           - label: Linux-Ubuntu-24.04-aarch64
             runner: ubuntu-24.04-arm
             arch: aarch64
-            defines: ""
+            # GCC 13 (the image default) rejects +sme, which the Armv9.2 variants need.
+            defines: "-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14"
             gate: "false"
+            cpu_floor: armv8.0_1
           - label: Linux-Ubuntu-22.04-x86_64-vulkan
             runner: ubuntu-22.04
             arch: x86_64
@@ -328,19 +332,43 @@ jobs:
           echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"
           echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
 
+      # CPU-only bundles carry every CPU variant ggml builds (x86: x86-64 baseline up to AVX512,
+      # AVX-VNNI and AMX; Linux arm64: Armv8.0 up to SVE2 / SME), each a libggml-cpu-<variant>
+      # that ggml scores against the host CPU at startup, loading the best. -DGGML_NATIVE=OFF
+      # alone pins one level for every host: AVX2/FMA on x86 (SIGILL on older CPUs, no AVX512 /
+      # VNNI on newer) and the compiler default Armv8.0 on Linux arm64 (no dotprod or i8mm, the
+      # int8 dot products every quantized matmul uses). The Metal and Vulkan legs keep their
+      # static build: their compute runs on the GPU.
       - name: Build sd-cli + sd-server
         working-directory: src
         run: |
           set -euo pipefail
+          CPU_VARIANTS=""
+          if [ -n "${{ matrix.cpu_floor }}" ]; then
+            CPU_VARIANTS="-DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+            # macOS: the ggml dylibs and variant modules find each other through @loader_path
+            # only, never through an absolute rpath into this runner's build tree.
+            if [ "$(uname -s)" = "Darwin" ]; then
+              CPU_VARIANTS="$CPU_VARIANTS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=@loader_path"
+            fi
+          fi
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DSD_BUILD_EXAMPLES=ON \
             -DSD_SERVER_BUILD_FRONTEND=OFF \
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
+            $CPU_VARIANTS \
             ${{ matrix.defines }}
           if [ "$(uname -s)" = "Darwin" ]; then J="$(sysctl -n hw.logicalcpu)"; else J="$(nproc)"; fi
           cmake --build build --config Release -j "$J" --target sd-cli sd-server
+
+      - name: Pin the bundle's own ggml (CPU variants)
+        if: ${{ matrix.cpu_floor != '' && runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+          bash tooling/scripts/unsloth/cpu_variants_gate.sh pin src/build/bin
 
       - name: macOS load gate
         if: ${{ matrix.gate == 'true' }}
@@ -360,6 +388,12 @@ jobs:
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
         run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      # On the finished zip: the floor variant is present, nothing points back at the build
+      # tree, and sd-cli started from the unzipped copy loads a CPU variant from that copy.
+      - name: CPU variants gate
+        if: ${{ matrix.cpu_floor != '' }}
+        run: bash tooling/scripts/unsloth/cpu_variants_gate.sh check "dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip" "${{ matrix.cpu_floor }}"
 
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -836,6 +870,7 @@ jobs:
         include:
           - label: win-cpu-x64
             vulkan: "OFF"
+            cpu_floor: x64
           - label: win-vulkan-x64
             vulkan: "ON"
     env:
@@ -891,10 +926,16 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
           Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
 
+      # win-cpu-x64 carries every CPU variant MSVC can build (x86-64 baseline up to AVX512 and
+      # AVX-VNNI; see the build-unix note), loaded per host by ggml at startup.
       - name: Build sd-cli + sd-server
         shell: pwsh
         working-directory: src
         run: |
+          $cpuVariants = @()
+          if ('${{ matrix.cpu_floor }}' -ne '') {
+            $cpuVariants = @('-DSD_BUILD_SHARED_GGML_LIB=ON', '-DBUILD_SHARED_LIBS=ON', '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON')
+          }
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_CXX_FLAGS='/bigobj' `
@@ -902,7 +943,9 @@ jobs:
             -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
             -DSD_VULKAN=${{ matrix.vulkan }} `
-            -DGGML_NATIVE=OFF
+            -DGGML_NATIVE=OFF `
+            @cpuVariants
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release -j 3 --target sd-cli sd-server
 
       # Before packaging, so every PE the bundle carries is signed. Windows
@@ -947,6 +990,46 @@ jobs:
           }
           & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
           exit $LASTEXITCODE
+
+      # The floor variant ships, and sd-cli started from the unzipped bundle (empty cwd, so
+      # ggml's cwd search finds nothing) loads a CPU variant from the bundle itself.
+      - name: CPU variants gate
+        if: ${{ matrix.cpu_floor != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = (Get-ChildItem dist -Filter *.zip | Select-Object -First 1).FullName
+          $work = Join-Path $env:RUNNER_TEMP 'cpu-variants'
+          $empty = Join-Path $env:RUNNER_TEMP 'cpu-variants-cwd'
+          Remove-Item -Recurse -Force $work, $empty -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $work, $empty | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $work
+          $cli = Get-ChildItem $work -Recurse -Filter sd-cli.exe | Select-Object -First 1
+          $dir = $cli.DirectoryName
+          $variants = @(Get-ChildItem $dir -Filter 'ggml-cpu-*.dll' | ForEach-Object { $_.BaseName -replace '^ggml-cpu-', '' })
+          Write-Host "variants: $($variants -join ' ')"
+          if ($variants -notcontains '${{ matrix.cpu_floor }}') {
+            Write-Host "::error::floor variant ${{ matrix.cpu_floor }} missing from the bundle"
+            exit 1
+          }
+          Push-Location $empty
+          $ErrorActionPreference = 'Continue'
+          $out = (& $cli.FullName -m (Join-Path $empty 'none.gguf') -p x -v 2>&1 | Out-String)
+          Pop-Location
+          $m = [regex]::Match($out, 'loaded CPU backend from (.+?\.dll)')
+          if (-not $m.Success) {
+            Write-Host $out
+            Write-Host '::error::sd-cli loaded no CPU backend variant'
+            exit 1
+          }
+          $loaded = $m.Groups[1].Value.Trim()
+          Write-Host "loaded: $loaded"
+          if ((Split-Path -Parent ([IO.Path]::GetFullPath($loaded))) -ne [IO.Path]::GetFullPath($dir)) {
+            Write-Host "::error::variant came from outside the bundle: $loaded"
+            exit 1
+          }
+          # sd-cli itself exits 1 at the missing model; that is the expected stop, not the verdict.
+          exit 0
 
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
