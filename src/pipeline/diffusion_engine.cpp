@@ -2895,10 +2895,7 @@ int StableDiffusionGGML::align_video_frames(int frames) {
     return latent_frames_to_video_frames(video_frames_to_latent_frames(frames));
 }
 
-// Tile sizes for a VAE pass; after an out-of-memory failure (last_w/last_h > 0) every axis that can shrink must
-// come out smaller. get_tile_sizes can widen a halved request to keep the seam overlap (back to the failed size),
-// so bound the seam-safe choice below the failed size instead. Returns false on invalid parameters or when no axis
-// can shrink any further.
+// After an OOM (last_w/last_h > 0) cap below the failed size: get_tile_sizes may widen a halved request back to it.
 static bool sd_vae_tile_sizes(VAE& vae,
                               const sd_tiling_params_t& tiling_params,
                               int64_t latent_w,
