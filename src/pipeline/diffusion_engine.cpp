@@ -1064,7 +1064,12 @@ void StableDiffusionGGML::configure_weight_loading() {
         const ggml_type target_wtype     = sd_type_to_ggml_type(sd_ctx_params->wtype);
         const bool quantized_on_load     = (target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype)) ||
                                            strlen(SAFE_STR(sd_ctx_params->tensor_type_rules)) > 0;
-        const bool cpu_quantized_on_load = quantized_on_load && sd_backend_is_cpu(backend_for(SDBackendModule::DIFFUSION));
+        // --backend can route any LoRA-targetable module to the CPU on its own.
+        bool lora_module_on_cpu = false;
+        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE}) {
+            lora_module_on_cpu = lora_module_on_cpu || sd_backend_is_cpu(backend_for(module));
+        }
+        const bool cpu_quantized_on_load = quantized_on_load && lora_module_on_cpu;
         if (have_quantized_weight || cpu_quantized_on_load || streaming_constrained || row_split_active()) {
             apply_lora_immediately = false;
         } else {
