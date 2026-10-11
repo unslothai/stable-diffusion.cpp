@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 #include "core/ggml_extend.h"
+#include "core/ggml_extend_backend.h"
 #include "core/ggml_runner.h"
 #include "core/util.h"
 
@@ -1125,6 +1126,74 @@ namespace Rope {
         return x_out;
     }
 
+    // SD_FUSED_ROPE_ATTN=0 turns the fused attention prologue below off.
+    __STATIC_INLINE__ bool fused_rope_attention_enabled() {
+        static const bool enabled = [] {
+            const char* e = getenv("SD_FUSED_ROPE_ATTN");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return enabled;
+    }
+
+    // Flash attention with the RoPE, head-major relayout, kv scale and F16 cast of q/k/v done by one
+    // ggml_rope_pe_permute op per tensor, instead of RoPE + relayout, then scale, then cast (k), and
+    // relayout, scale, cast (v). Same values as the unfused flash path: the op rounds each product,
+    // the sum, the scale and the conversion separately, exactly like ggml_rope_apply -> ggml_scale ->
+    // ggml_cpy. GPU backends only (CUDA / HIP); returns nullptr when it does not apply.
+    __STATIC_INLINE__ ggml_tensor* attention_fused_rope(GGMLRunnerContext* ctx,
+                                                        ggml_tensor* q,
+                                                        ggml_tensor* k,
+                                                        ggml_tensor* v,
+                                                        ggml_tensor* pe,
+                                                        ggml_tensor* mask,
+                                                        float kv_scale,
+                                                        bool rope_interleaved) {
+#ifndef SD_GGML_FUSED_ROPE_ATTN
+        return nullptr;
+#else
+        auto backend = ctx->backend;
+        // Interleaved pairing only: the non-interleaved form of ggml_rope_apply reads two of the four table
+        // entries, so it matches the fused op only for exact rotation tables.
+        if (!rope_interleaved || !ctx->flash_attn_enabled || ctx->sage_attn_enabled || backend == nullptr ||
+            sd_backend_is_cpu(backend) || !fused_rope_attention_enabled()) {
+            return nullptr;
+        }
+        const int64_t d_head = q->ne[0];
+        const int64_t L      = q->ne[2];
+        const int64_t N      = q->ne[3];
+        // ggml_ext_attention_ext pads heads under 64 channels for the CUDA kernel; keep that path for them
+        if (d_head < 64 || d_head % 2 != 0 || k->ne[0] != d_head || v->ne[0] != d_head || k->ne[2] != L || v->ne[2] != L ||
+            k->ne[3] != N || v->ne[3] != N || v->ne[1] != k->ne[1] || q->ne[1] % k->ne[1] != 0) {
+            return nullptr;
+        }
+        if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+            q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float)) {
+            return nullptr;
+        }
+        if (pe == nullptr || pe->type != GGML_TYPE_F32 || !ggml_is_contiguous(pe) || pe->ne[0] != 2 || pe->ne[1] != 2 ||
+            pe->ne[2] != d_head / 2 || pe->ne[3] != L) {
+            return nullptr;
+        }
+        if (mask != nullptr && mask->ne[3] != 1) {
+            return nullptr;
+        }
+        const int n_rot = static_cast<int>(d_head);
+        auto gctx       = ctx->ggml_ctx;
+        auto q_hm       = ggml_rope_pe_permute_set_interleaved(ggml_rope_pe_permute(gctx, q, pe, n_rot, 1.f, GGML_TYPE_F32), true);
+        auto k_hm       = ggml_rope_pe_permute_set_interleaved(ggml_rope_pe_permute(gctx, k, pe, n_rot, kv_scale, GGML_TYPE_F16), true);
+        auto v_hm       = ggml_rope_pe_permute(gctx, v, nullptr, 0, kv_scale, GGML_TYPE_F16);
+        if (!ggml_backend_supports_op(backend, q_hm) || !ggml_backend_supports_op(backend, k_hm) ||
+            !ggml_backend_supports_op(backend, v_hm)) {
+            return nullptr;
+        }
+        // [d_head, L, heads, N] -> [d_head, L, heads * N], the shapes the unfused path hands flash attention
+        q_hm = ggml_reshape_3d(gctx, q_hm, d_head, L, q->ne[1] * N);
+        k_hm = ggml_reshape_3d(gctx, k_hm, d_head, L, k->ne[1] * N);
+        v_hm = ggml_reshape_3d(gctx, v_hm, d_head, L, v->ne[1] * N);
+        return ggml_ext_attention_prepared(gctx, backend, q_hm, k_hm, v_hm, q->ne[1], N, kv_scale, mask);
+#endif
+    }
+
     __STATIC_INLINE__ ggml_tensor* attention(GGMLRunnerContext* ctx,
                                              ggml_tensor* q,
                                              ggml_tensor* k,
@@ -1136,6 +1205,9 @@ namespace Rope {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
+        if (auto fused = attention_fused_rope(ctx, q, k, v, pe, mask, kv_scale, rope_interleaved)) {
+            return fused;
+        }
         int64_t n_head = q->ne[1];
 
         q = apply_rope(ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]

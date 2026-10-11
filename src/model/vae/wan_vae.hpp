@@ -147,14 +147,16 @@ namespace WAN {
         using Conv2d::Conv2d;
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            // Swapping the time and channel axes moves no data when one of them is 1 (a single frame, the
+            // image VAE case): ggml_ext_cont then keeps the view instead of copying the whole tensor.
             ggml_tensor* x_swapped = ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2);
-            x_swapped              = ggml_cont(ctx->ggml_ctx, x_swapped);
+            x_swapped              = ggml_ext_cont(ctx->ggml_ctx, x_swapped);
 
             ggml_tensor* out = Conv2d::forward(ctx, x_swapped);
 
             ggml_tensor* out_swapped = ggml_permute(ctx->ggml_ctx, out, 0, 1, 3, 2);
 
-            out_swapped = ggml_cont(ctx->ggml_ctx, out_swapped);
+            out_swapped = ggml_ext_cont(ctx->ggml_ctx, out_swapped);
 
             return out_swapped;
         }
