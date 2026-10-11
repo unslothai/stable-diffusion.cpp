@@ -62,15 +62,20 @@ static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
 
 int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor) {
     // A tile a little over half the axis (32 of 62 latents) gets two tiles overlapping by 1-2 latents, which shows
-    // as a seam. Pick the nearest size (smaller first, larger only up to 2x) whose overlaps are >= half the target
-    // and >= 2 latents.
+    // as a seam. Keep the requested size when its overlaps are >= half the target and >= 2 latents, else pick the
+    // cheapest size that overlaps by the full target, up to 8 latents.
     const int min_tile_size = 4;
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;
     }
-    auto overlaps_enough = [&](int size) {
-        const int min_overlap = std::max(2, static_cast<int>(size * tile_overlap_factor * 0.5f));
-        const auto tiles      = sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false);
+    auto overlaps_enough = [&](int size, bool replacement) {
+        int min_overlap = std::max(2, static_cast<int>(size * tile_overlap_factor * 0.5f));
+        if (replacement) {
+            // Half the target is too little for 16x VAEs: 4 of 16 latents still leaves a line (Qwen-Image-2.1 at
+            // 480 px), 8 does not, on 8x and 16x VAEs alike.
+            min_overlap = std::max(min_overlap, std::min(8, static_cast<int>(size * tile_overlap_factor)));
+        }
+        const auto tiles = sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false);
         for (size_t i = 0; i + 1 < tiles.size(); ++i) {
             if (tiles[i].overlap_after < min_overlap) {
                 return false;
@@ -78,13 +83,42 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
         }
         return true;
     };
-    for (int size = tile_size; size >= min_tile_size; --size) {
-        if (overlaps_enough(size)) {
-            return size;
-        }
+    if (overlaps_enough(tile_size, false)) {
+        return tile_size;
     }
-    for (int size = tile_size + 1; size < small_dim && size <= 2 * tile_size; ++size) {
-        if (overlaps_enough(size)) {
+    // Of the sizes that overlap enough, take the one decoding the fewest latents along the axis (tiles * size): a
+    // 62-latent axis gets two 35-latent tiles instead of three 31-latent ones. Ties go to fewer tiles, then to the
+    // size nearest the request. Growth stays within a quarter of the request where possible (the most any axis
+    // needs is 32 -> 36 and 16 -> 20).
+    auto pick = [&](int lowest, int highest, bool replacement) {
+        int best_size     = 0;
+        int64_t best_cost = 0;
+        int best_tiles    = 0;
+        for (int size = lowest; size <= highest; ++size) {
+            if (!overlaps_enough(size, replacement)) {
+                continue;
+            }
+            const int tiles    = static_cast<int>(sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false).size());
+            const int64_t cost = static_cast<int64_t>(tiles) * size;
+            const bool better  = best_size == 0 || cost < best_cost ||
+                                 (cost == best_cost && (tiles < best_tiles ||
+                                                        (tiles == best_tiles && std::abs(size - tile_size) < std::abs(best_size - tile_size))));
+            if (better) {
+                best_size  = size;
+                best_cost  = cost;
+                best_tiles = tiles;
+            }
+        }
+        return best_size;
+    };
+    const int capped = std::min(small_dim - 1, tile_size + tile_size / 4);
+    const int widest = std::min(small_dim - 1, 2 * tile_size);
+    for (bool replacement : {true, false}) {
+        int size = pick(min_tile_size, capped, replacement);
+        if (size == 0) {
+            size = pick(capped + 1, widest, replacement);
+        }
+        if (size != 0) {
             return size;
         }
     }
