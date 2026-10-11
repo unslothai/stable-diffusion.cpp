@@ -29,7 +29,7 @@ case "$mode" in
     [ "$(uname -s)" = "Linux" ] || { echo "pin: nothing to do on $(uname -s)"; exit 0; }
     command -v patchelf > /dev/null || { echo "ERROR: patchelf not installed (the workflow installs it)" >&2; exit 1; }
     n=0
-    for f in "$bin_dir"/sd-cli "$bin_dir"/sd-server "$bin_dir"/libggml*.so*; do
+    for f in "$bin_dir"/sd-cli "$bin_dir"/sd-server "$bin_dir"/libggml*.so* "$bin_dir"/libstable-diffusion*.so*; do
       [ -f "$f" ] && [ ! -L "$f" ] || continue
       patchelf --force-rpath --set-rpath '$ORIGIN' "$f"
       n=$((n + 1))
@@ -39,6 +39,14 @@ case "$mode" in
   check)
     zip="${2:?bundle.zip}"
     floor="${3:?floor variant, e.g. x64 or armv8.0_1}"
+    work=""
+    empty=""
+    # Registered before the first step that can fail, so an early exit still removes both.
+    cleanup() {
+      if [ -n "$work" ]; then rm -rf -- "$work"; fi
+      if [ -n "$empty" ]; then rm -rf -- "$empty"; fi
+    }
+    trap cleanup EXIT
     work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/cpu-variants-XXXXXX")"
     unzip -q "$zip" -d "$work"
     dir="$(dirname "$(find "$work" -type f \( -name sd-cli -o -name sd-cli.exe \) | head -n1)")"
@@ -58,7 +66,7 @@ case "$mode" in
     esac
     fail=0
     if [ "$(uname -s)" = "Linux" ]; then
-      for f in "$dir"/sd-cli "$dir"/sd-server "$dir"/libggml*.so*; do
+      for f in "$dir"/sd-cli "$dir"/sd-server "$dir"/libggml*.so* "$dir"/libstable-diffusion*.so*; do
         [ -f "$f" ] || continue
         rp="$(readelf -d "$f" | sed -n 's/.*(\(RPATH\|RUNPATH\)).*\[\(.*\)\]/\1=\2/p')"
         if [ "$rp" != 'RPATH=$ORIGIN' ]; then echo "ERROR: $(basename "$f") has '${rp:-no rpath}', want RPATH=\$ORIGIN" >&2; fail=1; fi
@@ -90,7 +98,6 @@ case "$mode" in
       want_dir="$(cd "$dir" && pwd -P)"
       if [ "$loaded_dir" != "$want_dir" ]; then echo "ERROR: variant came from $loaded_dir, not the bundle" >&2; fail=1; fi
     fi
-    rm -rf "${work:?}" "${empty:?}"
     exit "$fail"
     ;;
   *)
