@@ -863,7 +863,7 @@ ggml_tensor* ggml_ext_attention_prepared(ggml_context* ctx,
     if (!ggml_backend_supports_op(backend, kqv)) {
         return nullptr;
     }
-    ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
+    ggml_prec_set_acc(kqv, GGML_PREC_F32);
     if (kv_scale != 1.0f) {
         kqv = ggml_ext_scale(ctx, kqv, 1.0f / kv_scale);
     }

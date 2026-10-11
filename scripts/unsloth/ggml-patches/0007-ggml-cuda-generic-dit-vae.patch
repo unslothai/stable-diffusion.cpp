@@ -18,7 +18,7 @@ index 41ac28bb..fa83c5e6 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * a,
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index bdd36aea..cadb25ac 100644
+index bdd36aea..2883f5df 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -12397,6 +12397,7 @@ void ggml_compute_forward_rope_pe_permute(
@@ -29,27 +29,45 @@ index bdd36aea..cadb25ac 100644
      const int   half  = n_rot / 2;
  
      const int64_t D = src0->ne[0];
-@@ -12436,14 +12437,14 @@ void ggml_compute_forward_rope_pe_permute(
+@@ -12435,17 +12436,28 @@ void ggml_compute_forward_rope_pe_permute(
+ 
          if (n_rot > 0) {
              const float * t = (const float *) pe->data + l * (int64_t) half * 4;
-             for (int i = 0; i < n_rot; ++i) {
+-            for (int i = 0; i < n_rot; ++i) {
 -                const int r = i / half;
 -                const int j = i - r * half;
 -                p0[i]       = x[j] * t[4 * j + 2 * r + 0];
-+                const int r = inter ? i % 2 : i / half;
-+                const int j = inter ? i / 2 : i - r * half;
-+                p0[i]       = x[inter ? 2 * j : j] * t[4 * j + 2 * r + 0];
-             }
-             for (int i = 0; i < n_rot; ++i) {
+-            }
+-            for (int i = 0; i < n_rot; ++i) {
 -                const int r = i / half;
 -                const int j = i - r * half;
 -                p1[i]       = x[j + half] * t[4 * j + 2 * r + 1];
-+                const int r = inter ? i % 2 : i / half;
-+                const int j = inter ? i / 2 : i - r * half;
-+                p1[i]       = x[inter ? 2 * j + 1 : j + half] * t[4 * j + 2 * r + 1];
++            if (inter) {
++                // the expression ggml_compute_forward_rope_apply (interleaved) evaluates, so the compiler
++                // contracts it (or not) the same way and the two ops stay bit-identical on this backend
++                for (int j = 0; j < half; ++j) {
++                    const float a    = x[2 * j];
++                    const float b    = x[2 * j + 1];
++                    y[2 * j]         = a*t[4 * j + 0] + b*t[4 * j + 1];
++                    y[2 * j + 1]     = a*t[4 * j + 2] + b*t[4 * j + 3];
++                }
++            } else {
++                for (int i = 0; i < n_rot; ++i) {
++                    const int r = i / half;
++                    const int j = i - r * half;
++                    p0[i]       = x[j] * t[4 * j + 2 * r + 0];
++                }
++                for (int i = 0; i < n_rot; ++i) {
++                    const int r = i / half;
++                    const int j = i - r * half;
++                    p1[i]       = x[j + half] * t[4 * j + 2 * r + 1];
++                }
++                ggml_vec_add_f32(n_rot, y.data(), p0.data(), p1.data());
              }
-             ggml_vec_add_f32(n_rot, y.data(), p0.data(), p1.data());
+-            ggml_vec_add_f32(n_rot, y.data(), p0.data(), p1.data());
          }
+         if (D > n_rot) {
+             memcpy(y.data() + n_rot, x + n_rot, (D - n_rot) * sizeof(float));
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
 index 831d0de8..2df04786 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
@@ -373,10 +391,10 @@ index 00000000..eb6298ea
 +                                 const ggml_tensor * b, bool silu, ggml_tensor * out);
 diff --git a/src/ggml-cuda/mul-add-fused.cu b/src/ggml-cuda/mul-add-fused.cu
 new file mode 100644
-index 00000000..ff4e1dd0
+index 00000000..29484ce4
 --- /dev/null
 +++ b/src/ggml-cuda/mul-add-fused.cu
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,172 @@
 +#include "mul-add-fused.cuh"
 +#include "ggml-impl.h"
 +
@@ -485,8 +503,9 @@ index 00000000..ff4e1dd0
 +        return 0;
 +    }
 +    ggml_tensor * add = cgraph->nodes[i_add];
-+    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || !ggml_are_same_shape(add, mul) ||
-+        (add->src[0] != mul && add->src[1] != mul)) {
++    // under ggml_build_forward_select only GGML_TENSOR_FLAG_COMPUTE nodes run: never fuse an inactive node
++    if (add->op != GGML_OP_ADD || (add->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || add->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(add) || !ggml_are_same_shape(add, mul) || (add->src[0] != mul && add->src[1] != mul)) {
 +        return 0;
 +    }
 +    const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
@@ -499,7 +518,7 @@ index 00000000..ff4e1dd0
 +        const int i_add2 = next_op(i_add);
 +        if (i_add2 > 0) {
 +            ggml_tensor * add2 = cgraph->nodes[i_add2];
-+            if (add2->op == GGML_OP_ADD && add2->type == GGML_TYPE_F32 && ggml_is_contiguous(add2) && ggml_are_same_shape(add2, add) &&
++            if (add2->op == GGML_OP_ADD && (add2->flags & GGML_TENSOR_FLAG_COMPUTE) && add2->type == GGML_TYPE_F32 && ggml_is_contiguous(add2) && ggml_are_same_shape(add2, add) &&
 +                (add2->src[0] == add || add2->src[1] == add)) {
 +                const ggml_tensor * dd = add2->src[0] == add ? add2->src[1] : add2->src[0];
 +                if (dd != add && dd != mul && mad_ok_operand(dd, add2)) {
@@ -564,10 +583,10 @@ index 00000000..8d9752ca
 +int ggml_cuda_try_fuse_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 diff --git a/src/ggml-cuda/norm-channel.cu b/src/ggml-cuda/norm-channel.cu
 new file mode 100644
-index 00000000..0ff8e91e
+index 00000000..9c0b61fd
 --- /dev/null
 +++ b/src/ggml-cuda/norm-channel.cu
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,254 @@
 +#include "norm-channel.cuh"
 +#include "ggml-impl.h"
 +
@@ -769,6 +788,12 @@ index 00000000..0ff8e91e
 +    }
 +    if (!back_ok) {
 +        NC_REJECT("check 8");
++    }
++    // under ggml_build_forward_select only GGML_TENSOR_FLAG_COMPUTE nodes run: never fuse an inactive node
++    for (const ggml_tensor * n : { (const ggml_tensor *) cont1, (const ggml_tensor *) rms, (const ggml_tensor *) mul, (const ggml_tensor *) cont2 }) {
++        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            NC_REJECT("check 8b");
++        }
 +    }
 +    // every node from i to the second CONT is part of the pattern or a view the loop skips
 +    for (int j = i + 1; j < i_pv2 + 1; ++j) {
@@ -1065,6 +1090,25 @@ index 1fe59a0e..016995c0 100644
  static struct ggml_tensor * ggml_modulate_rows_impl(
          struct ggml_context * ctx,
          struct ggml_tensor  * acc,
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a4fd2f88..1bb0ec64 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -280,6 +280,14 @@ if (NOT GGML_BACKEND_DL)
+     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+ 
++    #
++    # test-fusion-select
++
++    set(TEST_TARGET test-fusion-select)
++    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
++    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
++    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
++
+     #
+     # test-conv-transpose
+ 
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
 index 778bed20..e4438d10 100644
 --- a/tests/test-backend-ops.cpp
@@ -1284,3 +1328,257 @@ index 778bed20..e4438d10 100644
      // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
      // note: same bytes either way, so a backend that indexes them differently shows it here
      for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+diff --git a/tests/test-fusion-select.cpp b/tests/test-fusion-select.cpp
+new file mode 100644
+index 00000000..16746c56
+--- /dev/null
++++ b/tests/test-fusion-select.cpp
+@@ -0,0 +1,248 @@
++// Checks for the fused CUDA paths of the generic DiT / VAE patch:
++//  1. graphs built with ggml_build_forward_select: a backend may only fuse nodes that are flagged
++//     GGML_TENSOR_FLAG_COMPUTE, so the selected tensors must equal a graph that holds only them and the
++//     inactive tensors must stay untouched (MUL -> ADD -> ADD chain and the channel RMS norm chain).
++//  2. CPU: ggml_rope_pe_permute with interleaved pairing is bit-identical to ggml_rope_apply(interleaved)
++//     -> ggml_scale -> ggml_cpy, the chain it replaces.
++// Returns 0 when every check passes (backends without the ops skip their checks).
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <random>
++#include <string>
++#include <vector>
++
++static int n_fail = 0;
++static int n_pass = 0;
++
++static void check(bool ok, const std::string & what) {
++    printf("  %-72s %s\n", what.c_str(), ok ? "OK" : "FAIL");
++    (ok ? n_pass : n_fail)++;
++}
++
++static std::vector<float> rand_vec(size_t n, uint32_t seed, float lo = -2.0f, float hi = 2.0f) {
++    std::mt19937 rng(seed);
++    std::uniform_real_distribution<float> d(lo, hi);
++    std::vector<float> v(n);
++    for (auto & x : v) {
++        x = d(rng);
++    }
++    return v;
++}
++
++static std::vector<float> get_f32(const ggml_tensor * t) {
++    std::vector<float> v(ggml_nelements(t));
++    ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
++    return v;
++}
++
++static void fill(ggml_tensor * t, float value) {
++    std::vector<float> v(ggml_nelements(t), value);
++    ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
++}
++
++// A graph whose tensors each own their memory (no allocator reuse), so an unwritten output keeps its sentinel.
++struct graph_case {
++    ggml_context *          ctx = nullptr;
++    ggml_backend_buffer_t   buf = nullptr;
++    std::vector<ggml_tensor *> inputs;
++    std::vector<ggml_tensor *> outs;   // candidates for ggml_build_forward_select
++
++    ~graph_case() {
++        if (buf) {
++            ggml_backend_buffer_free(buf);
++        }
++        if (ctx) {
++            ggml_free(ctx);
++        }
++    }
++};
++
++using builder_t = std::function<void(ggml_context *, std::vector<ggml_tensor *> &, std::vector<ggml_tensor *> &)>;
++
++// run `build` on `backend`: select output `idx` (n_sel = number of candidates passed to the select) or, with
++// idx < 0, expand only candidate `ref`. Returns the candidate values after compute (all candidates).
++static std::vector<std::vector<float>> run_case(ggml_backend_t backend, const builder_t & build, int idx, int ref,
++                                                const std::vector<std::vector<float>> & input_data) {
++    graph_case g;
++    ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    g.ctx = ggml_init(ip);
++    build(g.ctx, g.inputs, g.outs);
++    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, backend);
++    for (size_t k = 0; k < g.inputs.size(); ++k) {
++        ggml_backend_tensor_set(g.inputs[k], input_data[k].data(), 0, ggml_nbytes(g.inputs[k]));
++    }
++    for (ggml_tensor * t = ggml_get_first_tensor(g.ctx); t; t = ggml_get_next_tensor(g.ctx, t)) {
++        if (t->op != GGML_OP_NONE && t->view_src == nullptr) {
++            fill(t, -77.0f);
++        }
++    }
++    ggml_cgraph * gf = ggml_new_graph(g.ctx);
++    if (idx >= 0) {
++        ggml_build_forward_select(gf, g.outs.data(), (int) g.outs.size(), idx);
++    } else {
++        ggml_build_forward_expand(gf, g.outs[ref]);
++    }
++    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++    std::vector<std::vector<float>> res;
++    for (ggml_tensor * t : g.outs) {
++        res.push_back(get_f32(t));
++    }
++    return res;
++}
++
++static bool bit_equal(const std::vector<float> & a, const std::vector<float> & b) {
++    return a.size() == b.size() && memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
++}
++
++static bool all_sentinel(const std::vector<float> & a) {
++    for (float x : a) {
++        if (x != -77.0f) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// every select index: the selected candidate equals the expand-only reference and every candidate not
++// needed by it keeps the sentinel. `needed[idx]` lists the candidates the selected one depends on.
++static void check_select(ggml_backend_t backend, const char * name, const builder_t & build,
++                         const std::vector<std::vector<float>> & input_data, const std::vector<std::vector<int>> & needed) {
++    for (int idx = 0; idx < (int) needed.size(); ++idx) {
++        const auto ref = run_case(backend, build, -1, idx, input_data);
++        const auto sel = run_case(backend, build, idx, idx, input_data);
++        bool inactive_ok = true;
++        for (int k = 0; k < (int) sel.size(); ++k) {
++            bool need = false;
++            for (int n : needed[idx]) {
++                need |= n == k;
++            }
++            if (!need) {
++                inactive_ok &= all_sentinel(sel[k]);
++            }
++        }
++        check(bit_equal(ref[idx], sel[idx]), std::string(name) + " select " + std::to_string(idx) + ": selected output computed");
++        check(inactive_ok, std::string(name) + " select " + std::to_string(idx) + ": inactive outputs untouched");
++    }
++}
++
++static void test_select(ggml_backend_t backend) {
++    // MUL -> ADD -> ADD: x*s + x + shift (adaLN modulate), candidates {mul, add, add2}
++    {
++        const int64_t ne0 = 64, ne1 = 33;
++        builder_t build = [&](ggml_context * ctx, std::vector<ggml_tensor *> & in, std::vector<ggml_tensor *> & out) {
++            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
++            ggml_tensor * s  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 1);
++            ggml_tensor * sh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 1);
++            ggml_tensor * m  = ggml_mul(ctx, x, s);
++            ggml_tensor * a  = ggml_add(ctx, m, x);
++            ggml_tensor * a2 = ggml_add(ctx, a, sh);
++            in  = { x, s, sh };
++            out = { m, a, a2 };
++        };
++        const std::vector<std::vector<float>> data = { rand_vec(ne0 * ne1, 1), rand_vec(ne0, 2), rand_vec(ne0, 3) };
++        check_select(backend, "MUL_ADD_CHAIN", build, data, { { 0 }, { 0, 1 }, { 0, 1, 2 } });
++    }
++    // channel RMS norm: CONT(PERMUTE(x)) -> RMS_NORM -> MUL(w) -> CONT(PERMUTE), P = 16384 positions so the
++    // fusion engages at its default size threshold; candidates {cont1, rms, mul, cont2}
++    {
++        const int64_t W = 128, H = 128, C = 8;
++        builder_t build = [&](ggml_context * ctx, std::vector<ggml_tensor *> & in, std::vector<ggml_tensor *> & out) {
++            ggml_tensor * x  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, 1, C);
++            ggml_tensor * w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
++            ggml_tensor * c1 = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 3, 0));
++            ggml_tensor * r  = ggml_rms_norm(ctx, c1, 1e-6f);
++            ggml_tensor * m  = ggml_mul(ctx, r, w);
++            ggml_tensor * c2 = ggml_cont(ctx, ggml_permute(ctx, m, 3, 0, 1, 2));
++            in  = { x, w };
++            out = { c1, r, m, c2 };
++        };
++        const std::vector<std::vector<float>> data = { rand_vec(W * H * C, 4), rand_vec(C, 5, 0.5f, 1.5f) };
++        check_select(backend, "RMS_NORM_CHANNEL", build, data, { { 0 }, { 0, 1 }, { 0, 1, 2 }, { 0, 1, 2, 3 } });
++    }
++}
++
++// CPU: interleaved ggml_rope_pe_permute vs ggml_rope_apply -> ggml_scale -> ggml_cpy, bitwise
++static void test_rope_interleaved_cpu(ggml_backend_t cpu) {
++    const int64_t shapes[][4] = { { 64, 3, 7, 1 }, { 128, 2, 5, 2 }, { 80, 4, 3, 1 } };
++    const float   scales[]    = { 1.0f, 1.0f / 128.0f };
++    const ggml_type types[]   = { GGML_TYPE_F32, GGML_TYPE_F16 };
++    uint32_t seed = 100;
++    for (const auto & ne : shapes) {
++        for (float scale : scales) {
++            for (ggml_type type : types) {
++                const int64_t D = ne[0], Hh = ne[1], L = ne[2], N = ne[3];
++                const auto xd  = rand_vec(D * Hh * L * N, seed++);
++                const auto ped = rand_vec(4 * (D / 2) * L, seed++, -1.0f, 1.0f);   // not an exact rotation
++                std::vector<uint8_t> outs[2];
++                for (int arm = 0; arm < 2; ++arm) {
++                    ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++                    ggml_context * ctx  = ggml_init(ip);
++                    ggml_tensor * x     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, Hh, L, N);
++                    ggml_tensor * pe    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, D / 2, L);
++                    ggml_tensor * y;
++                    if (arm == 0) {
++                        y = ggml_rope_apply(ctx, x, pe, true);
++                        if (scale != 1.0f) {
++                            y = ggml_scale(ctx, y, scale);
++                        }
++                        if (type != GGML_TYPE_F32) {
++                            y = ggml_cpy(ctx, y, ggml_new_tensor(ctx, type, GGML_MAX_DIMS, y->ne));
++                        }
++                    } else {
++                        y = ggml_rope_pe_permute_set_interleaved(ggml_rope_pe_permute(ctx, x, pe, (int) D, scale, type), true);
++                    }
++                    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
++                    ggml_backend_tensor_set(x, xd.data(), 0, ggml_nbytes(x));
++                    ggml_backend_tensor_set(pe, ped.data(), 0, ggml_nbytes(pe));
++                    ggml_cgraph * gf = ggml_new_graph(ctx);
++                    ggml_build_forward_expand(gf, y);
++                    GGML_ASSERT(ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS);
++                    outs[arm].resize(ggml_nbytes(y));
++                    ggml_backend_tensor_get(y, outs[arm].data(), 0, ggml_nbytes(y));
++                    ggml_backend_buffer_free(buf);
++                    ggml_free(ctx);
++                }
++                char name[160];
++                snprintf(name, sizeof(name), "CPU ROPE_PE_PERMUTE interleaved [%lld,%lld,%lld,%lld] scale=%g %s",
++                         (long long) D, (long long) Hh, (long long) L, (long long) N, scale, ggml_type_name(type));
++                check(outs[0].size() == outs[1].size() && memcmp(outs[0].data(), outs[1].data(), outs[0].size()) == 0, name);
++            }
++        }
++    }
++}
++
++int main() {
++    ggml_backend_load_all();
++
++    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    GGML_ASSERT(cpu != nullptr);
++    printf("backend CPU\n");
++    test_rope_interleaved_cpu(cpu);
++    test_select(cpu);
++    ggml_backend_free(cpu);
++
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++        ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
++        if (be == nullptr) {
++            continue;
++        }
++        printf("backend %s\n", ggml_backend_name(be));
++        test_select(be);
++        ggml_backend_free(be);
++    }
++    printf("%d passed, %d failed\n", n_pass, n_fail);
++    return n_fail == 0 ? 0 : 1;
++}

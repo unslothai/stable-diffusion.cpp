@@ -1152,6 +1152,11 @@ namespace Rope {
         return nullptr;
 #else
         auto backend = ctx->backend;
+        // the same attention-scale override ggml_ext_attention_ext(GGMLRunnerContext*, ...) applies
+        // (it keeps large k/v finite in F16), so both paths compute identical values
+        if (ctx->attn_scale > 0.f) {
+            kv_scale = ctx->attn_scale;
+        }
         // Interleaved pairing only: the non-interleaved form of ggml_rope_apply reads two of the four table
         // entries, so it matches the fused op only for exact rotation tables.
         if (!rope_interleaved || !ctx->flash_attn_enabled || ctx->sage_attn_enabled || backend == nullptr ||
