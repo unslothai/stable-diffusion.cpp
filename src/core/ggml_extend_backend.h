@@ -101,6 +101,9 @@ ggml_backend_buffer_t sd_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t dev
                                                           size_t size,
                                                           size_t max_tensor_size);
 ggml_backend_t sd_backend_cpu_init();
+// ggml's BLAS backend (Accelerate / OpenBLAS / ...), when built in and SD_CPU_BLAS is not 0.
+ggml_backend_t sd_backend_blas_init();
+bool sd_backend_set_n_threads_any(ggml_backend_t backend, int n_threads);
 bool sd_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads);
 ggml_status sd_backend_graph_compute_with_eval_callback(ggml_backend_t backend,
                                                         ggml_cgraph* gf,

@@ -766,6 +766,7 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
     if (workspace_.cpu_backend() != nullptr) {
         sd_backend_cpu_set_n_threads(workspace_.cpu_backend(), n_threads);
     }
+    workspace_.set_accelerator_threads(n_threads);
     auto scheduler = workspace_.scheduler();
     ggml_status status;
     if (scheduler != nullptr) {

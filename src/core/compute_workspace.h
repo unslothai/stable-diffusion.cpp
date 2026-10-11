@@ -17,6 +17,9 @@ namespace sd {
         ggml_backend_t backend_;
         std::vector<ggml_backend_t> extra_backends_;
         ggml_backend_t cpu_backend_     = nullptr;
+        // Host accelerator (ggml's BLAS backend, e.g. Apple Accelerate) that takes the large
+        // MUL_MATs of a CPU-only workspace. nullptr when not built in or SD_CPU_BLAS=0.
+        ggml_backend_t blas_backend_    = nullptr;
         ggml_gallocr_t allocator_       = nullptr;
         ggml_backend_sched_t scheduler_ = nullptr;
         size_t scheduler_capacity_      = 0;
@@ -26,6 +29,7 @@ namespace sd {
 
         ggml_backend_sched_t make_scheduler(size_t graph_size);
         bool needs_scheduler(ggml_cgraph* graph) const;
+        bool uses_blas() const { return blas_backend_ != nullptr && extra_backends_.empty(); }
 
     public:
         struct Measurement {
@@ -34,8 +38,7 @@ namespace sd {
         };
         using AssignNodes = std::function<void(ggml_backend_sched_t, ggml_cgraph*)>;
 
-        explicit ComputeWorkspace(ggml_backend_t backend)
-            : backend_(backend) {}
+        explicit ComputeWorkspace(ggml_backend_t backend);
         ~ComputeWorkspace();
         ComputeWorkspace(const ComputeWorkspace&)            = delete;
         ComputeWorkspace& operator=(const ComputeWorkspace&) = delete;
@@ -56,6 +59,7 @@ namespace sd {
         bool active() const { return active_; }
         ggml_backend_sched_t scheduler() const { return scheduler_; }
         ggml_backend_t cpu_backend() const { return cpu_backend_; }
+        void set_accelerator_threads(int n_threads) const;
         size_t bytes(ggml_backend_t backend) const;
         size_t reservation_count() const { return reservations_; }
     };

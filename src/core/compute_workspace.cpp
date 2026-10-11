@@ -1,6 +1,7 @@
 #include "core/compute_workspace.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -14,10 +15,24 @@
 #include "ggml-impl.h"
 
 namespace sd {
+    ComputeWorkspace::ComputeWorkspace(ggml_backend_t backend)
+        : backend_(backend) {
+        if (sd_backend_is_cpu(backend_)) {
+            blas_backend_ = sd_backend_blas_init();
+        }
+    }
+
     ComputeWorkspace::~ComputeWorkspace() {
         segment_end();
         release();
         ggml_backend_free(cpu_backend_);
+        ggml_backend_free(blas_backend_);
+    }
+
+    void ComputeWorkspace::set_accelerator_threads(int n_threads) const {
+        if (blas_backend_ != nullptr) {
+            sd_backend_set_n_threads_any(blas_backend_, n_threads);
+        }
     }
 
     void ComputeWorkspace::set_extra_backends(const std::vector<ggml_backend_t>& backends) {
@@ -33,7 +48,11 @@ namespace sd {
             return true;
         }
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-            if (!ggml_backend_supports_op(backend_, ggml_graph_node(graph, i))) {
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            if (!ggml_backend_supports_op(backend_, node)) {
+                return true;
+            }
+            if (uses_blas() && node->op == GGML_OP_MUL_MAT && ggml_backend_supports_op(blas_backend_, node)) {
                 return true;
             }
         }
@@ -43,6 +62,12 @@ namespace sd {
     ggml_backend_sched_t ComputeWorkspace::make_scheduler(size_t graph_size) {
         std::vector<ggml_backend_t> backends{backend_};
         backends.insert(backends.end(), extra_backends_.begin(), extra_backends_.end());
+        if (uses_blas()) {
+            // Higher priority than the CPU backend: the scheduler hands it every MUL_MAT whose weight
+            // sits in a host buffer and that it supports (large F32-activation products). Weights in
+            // a CPU repack buffer are not host buffers, so those matmuls stay on the repack kernels.
+            backends.insert(backends.begin(), blas_backend_);
+        }
         if (!sd_backend_is_cpu(backend_)) {
             if (cpu_backend_ == nullptr) {
                 cpu_backend_ = sd_backend_cpu_init();
@@ -108,6 +133,17 @@ namespace sd {
             if (!ggml_backend_sched_alloc_graph(scheduler_, graph)) {
                 release();
                 return false;
+            }
+            if (uses_blas()) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 4) {
+                    int on_blas = 0;
+                    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                        on_blas += ggml_backend_sched_get_tensor_backend(scheduler_, ggml_graph_node(graph, i)) == blas_backend_;
+                    }
+                    LOG_INFO("cpu blas: %d of %d graph nodes run on %s", on_blas, ggml_graph_n_nodes(graph),
+                             ggml_backend_name(blas_backend_));
+                }
             }
         } else {
             if (scheduler_ != nullptr) {
@@ -207,11 +243,14 @@ namespace sd {
         auto scheduler   = make_scheduler(graph_size);
         if (scheduler != nullptr) {
             assign_nodes(scheduler, copy_graph);
-            std::vector<size_t> sizes(extra_backends_.size() + 2);
+            std::vector<size_t> sizes(extra_backends_.size() + 3);
             ggml_backend_sched_reserve_size(scheduler, copy_graph, sizes.data());
-            result.buffers.push_back({backend_, sizes[0]});
+            // The BLAS backend computes into host memory next to the CPU backend: count its share
+            // as the CPU backend's, so the residency bookkeeping sees one host device.
+            const size_t first = uses_blas() ? 1 : 0;
+            result.buffers.push_back({backend_, sizes[first] + (first ? sizes[0] : 0)});
             for (size_t i = 0; i < extra_backends_.size(); ++i) {
-                result.buffers.push_back({extra_backends_[i], sizes[i + 1]});
+                result.buffers.push_back({extra_backends_[i], sizes[i + 1 + first]});
             }
             ggml_backend_sched_free(scheduler);
         }
@@ -264,7 +303,11 @@ namespace sd {
 
     size_t ComputeWorkspace::bytes(ggml_backend_t backend) const {
         if (scheduler_ != nullptr) {
-            return ggml_backend_sched_get_buffer_size(scheduler_, backend);
+            size_t total = ggml_backend_sched_get_buffer_size(scheduler_, backend);
+            if (backend == backend_ && uses_blas()) {
+                total += ggml_backend_sched_get_buffer_size(scheduler_, blas_backend_);
+            }
+            return total;
         }
         return allocator_ != nullptr && backend == backend_ ? ggml_gallocr_get_buffer_size(allocator_, 0) : 0;
     }
