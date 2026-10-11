@@ -569,13 +569,17 @@ jobs:
             readelf -d "$cuda_lib" | grep -qF "[${so}]" \
               || { echo "ERROR: $(basename "$cuda_lib") does not link ${so}" >&2; exit 1; }
           done
-          # cuDNN and NVRTC are opened at run time only; a link-time dependency would stop the
-          # binaries loading on every host without them.
-          for f in "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/libggml*.so*; do
-            if readelf -d "$f" | grep -qE 'NEEDED.*(cudnn|nvrtc)'; then
-              echo "ERROR: $(basename "$f") links libcudnn or libnvrtc; they must stay run-time dlopens" >&2
-              exit 1
-            fi
+          # The host supplies exactly what llama.cpp's build of this major links. cuDNN and NVRTC are
+          # run-time dlopens only; linking them would stop the binaries loading on hosts without them.
+          allowed=" libcuda.so.1 libcudart.so.${MAJOR} libcublas.so.${MAJOR} libcublasLt.so.${MAJOR} "
+          for f in "$BIN"/sd-cli "$BIN"/sd-server "$BIN"/libggml*.so* "$BIN"/libstable-diffusion*.so*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            for so in $(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(lib\(cu\|nv\)[^]]*\)\].*/\1/p'); do
+              case "$allowed" in
+                *" $so "*) ;;
+                *) echo "ERROR: $(basename "$f") links $so; only ${allowed} may come from the host" >&2; exit 1 ;;
+              esac
+            done
           done
 
       - name: Package bundle
@@ -765,8 +769,13 @@ jobs:
           # cublas is always the host's. cudart is too on CUDA 12; CUDA 13 links it statically, as in
           # unslothai/llama.cpp's cuda13 build, which imports cublas64_13.dll alone.
           if ($imports -notmatch [regex]::Escape("cublas64_$major.dll")) { throw "ggml-cuda.dll does not import cublas64_$major.dll" }
-          $other = [regex]::Matches($imports, '(?i)(cudart|cublas)64_(\d+)\.dll') | Where-Object { $_.Groups[2].Value -ne $major }
-          if ($other) { throw "ggml-cuda.dll imports another CUDA major: $($other.Value -join ', ')" }
+          # Anything else CUDA-shaped (another major, nvrtc, cudnn) would not be on the host.
+          $allowed = @('nvcuda.dll', "cudart64_$major.dll", "cublas64_$major.dll", "cublasLt64_$major.dll")
+          foreach ($pe in Get-ChildItem $bin -Include *.dll, *.exe -Recurse) {
+            $deps = [regex]::Matches(((& dumpbin /dependents $pe.FullName) -join "`n"), '(?im)^\s*((?:cu|nv)\S*\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value }
+            $extra = @($deps | Where-Object { $allowed -notcontains $_ })
+            if ($extra.Count -gt 0) { throw "$($pe.Name) imports $($extra -join ', '); only $($allowed -join ', ') may come from the host" }
+          }
 
       - name: Sign Windows binaries
         uses: ./tooling/.github/actions/sign-windows

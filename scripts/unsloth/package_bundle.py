@@ -70,17 +70,16 @@ def _collect(bin_dir: Path) -> list[tuple[str, Path]]:
     A shared-ggml build leaves each library as a real file plus two symlinks, and zipfile follows
     links, so shipping all three stores the 100+ MB CUDA library three times. Ship it once, under
     its soname."""
-    found: dict[str, Path] = {}
-    for p in sorted(bin_dir.rglob("*")):
-        if p.is_symlink():
-            target = p.resolve()
-            if _SONAME_RE.fullmatch(p.name) and target.is_file():
-                found[p.name] = target
-            continue
-        if p.is_file() and (p.name in _BINARIES or _is_runtime_lib(p.name)):
-            found.setdefault(p.name, p)
-    under_soname = {path for name, path in found.items() if name != path.name}
-    return [(name, path) for name, path in found.items() if path not in under_soname or name != path.name]
+    wanted = [
+        p for p in sorted(bin_dir.rglob("*"))
+        if p.is_file() and (p.name in _BINARIES or _is_runtime_lib(p.name))
+    ]
+    found = {p.name: p.resolve() for p in wanted if p.is_symlink() and _SONAME_RE.fullmatch(p.name)}
+    under_soname = set(found.values())
+    for p in wanted:
+        if p.name not in found and p.resolve() not in under_soname:
+            found[p.name] = p
+    return sorted(found.items())
 
 
 def main() -> int:
