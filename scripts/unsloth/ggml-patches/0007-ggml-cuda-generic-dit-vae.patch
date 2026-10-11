@@ -564,10 +564,10 @@ index 00000000..8d9752ca
 +int ggml_cuda_try_fuse_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 diff --git a/src/ggml-cuda/norm-channel.cu b/src/ggml-cuda/norm-channel.cu
 new file mode 100644
-index 00000000..1b921122
+index 00000000..0ff8e91e
 --- /dev/null
 +++ b/src/ggml-cuda/norm-channel.cu
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,248 @@
 +#include "norm-channel.cuh"
 +#include "ggml-impl.h"
 +
@@ -782,7 +782,11 @@ index 00000000..1b921122
 +    const char * x0 = (const char *) x->data;
 +    const char * d0 = (const char *) cont2->data;
 +    const bool partial_overlap = d0 != x0 && d0 < x0 + ggml_nbytes(x) && x0 < d0 + ggml_nbytes(cont2);
-+    if (P > INT64_C(1) << 40 || partial_overlap) {
++    // Unfused, w is read by the MUL before the second CONT writes, so the allocator may hand w's buffer to
++    // cont2; the fused kernel reads w while writing cont2, so any overlap with w is unsafe.
++    const char * w0       = (const char *) w->data;
++    const bool w_overlap  = d0 < w0 + ggml_nbytes(w) && w0 < d0 + ggml_nbytes(cont2);
++    if (P > INT64_C(1) << 40 || partial_overlap || w_overlap) {
 +        NC_REJECT("check 10");
 +    }
 +    // One thread per position walks every channel, so the kernel needs many positions to fill the GPU.
