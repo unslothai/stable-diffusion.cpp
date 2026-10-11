@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/ggml_extend.h"
+#include "core/ggml_extend_backend.h"
 #include "core/ggml_runner.h"
 #include "model.h"
 
@@ -162,6 +163,10 @@ protected:
             wtype = GGML_TYPE_F32;
         }
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, in_features, out_features);
+        if (ggml_is_quantized(wtype)) {
+            // forward() only ever multiplies by it, so on CPU it may live repacked.
+            sd_tag_matmul_only_weight(params["weight"]);
+        }
         if (bias) {
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);
@@ -333,7 +338,17 @@ public:
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;
             forward_params.linear.scale          = scale;
-            out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
+            if (sd_backend_is_cpu(ctx->backend) && sd_weight_may_be_cpu_repacked(w)) {
+                // The weight may be repacked, which only MUL_MAT can read, so the adapter is added
+                // to the output (x W^T + x dW^T) instead of being folded into a copy of W.
+                if (linear_bias != nullptr) {
+                    linear_bias = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, linear_bias, prefix + "bias");
+                }
+                out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
+                out = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx, ctx->backend, x, w, out, prefix, forward_params);
+            } else {
+                out = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
+            }
         } else {
             out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
         }

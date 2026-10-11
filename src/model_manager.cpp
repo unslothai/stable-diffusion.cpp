@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iterator>
 #include <mutex>
+#include <set>
 #include <tuple>
 #include <unordered_set>
 
@@ -1096,6 +1097,20 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     }
     if (params_buft == nullptr) {
         params_buft = ggml_backend_get_default_buffer_type(state.params_backend);
+    }
+    if (state.usage_op == GGML_OP_NONE && state.params_backend == state.compute_backend &&
+        sd_backend_is_cpu(state.compute_backend)) {
+        ggml_backend_buffer_type_t repack_buft = sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state.compute_backend), state.tensor);
+        if (repack_buft != nullptr) {
+            static std::mutex logged_mutex;
+            static std::set<std::string> logged;
+            std::lock_guard<std::mutex> lock(logged_mutex);
+            if (logged.insert(ggml_backend_buft_name(repack_buft)).second) {
+                LOG_INFO("cpu weight repack: quantized matmul weights use %s (SD_CPU_REPACK=0 to disable)",
+                         ggml_backend_buft_name(repack_buft));
+            }
+            return repack_buft;
+        }
     }
     if (state.usage_op != GGML_OP_NONE &&
         state.compute_backend != nullptr) {

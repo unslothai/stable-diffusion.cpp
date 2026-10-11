@@ -87,6 +87,21 @@ private:
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
 bool sd_backend_is_cpu(ggml_backend_t backend);
+
+// CPU weight repacking. ggml's CPU backend offers "extra" buffer types (the interleaved
+// Q4_0 / Q4_K / Q2_K / Q5_K / Q6_K / IQ4_NL / Q8_0 layouts and, on AMX builds, AMX tiles) that
+// convert a weight once at upload so every matmul reading it runs a wider GEMM kernel. Such a
+// buffer can only feed MUL_MAT, so a weight is eligible only when the block that owns it tags
+// it as matmul-only. On by default; SD_CPU_REPACK=0 turns it off.
+bool sd_cpu_weight_repack_enabled();
+void sd_cpu_weight_repack_disable(const char* reason);
+void sd_tag_matmul_only_weight(ggml_tensor* weight);
+bool sd_is_matmul_only_weight(const ggml_tensor* weight);
+// False only when `weight` is already allocated somewhere other than a CPU extra buffer; an
+// unallocated weight may still land in one, so it answers true.
+bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight);
+// The CPU extra buffer type `weight` should live in, or nullptr for the plain CPU buffer.
+ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_dev, const ggml_tensor* weight);
 bool sd_backend_supports_cuda_mma(ggml_backend_t backend);
 ggml_backend_buffer_t sd_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device,
                                                           void* ptr,

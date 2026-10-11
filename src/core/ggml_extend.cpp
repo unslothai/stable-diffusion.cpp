@@ -211,6 +211,19 @@ ggml_tensor* ggml_ext_linear_matmul(ggml_context* ctx,
                                     ggml_tensor* x,
                                     ggml_tensor* w,
                                     bool force_prec_f32) {
+    if (x->ne[3] > 1 && sd_weight_may_be_cpu_repacked(w)) {
+        // The CPU repacked matmul takes at most three activation dims; for a 2D weight
+        // flattening the batch dims is the same product.
+        if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx, x);
+        }
+        const int64_t ne1 = x->ne[1];
+        const int64_t ne2 = x->ne[2];
+        const int64_t ne3 = x->ne[3];
+        x                 = ggml_reshape_3d(ctx, x, x->ne[0], ne1, ne2 * ne3);
+        x                 = ggml_ext_linear_matmul(ctx, x, w, force_prec_f32);
+        return ggml_reshape_4d(ctx, x, x->ne[0], ne1, ne2, ne3);
+    }
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
