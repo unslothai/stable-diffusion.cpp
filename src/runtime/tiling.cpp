@@ -106,7 +106,7 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
         return tile_size;
     }
     const int max_tiles = tile_count(nearest);
-    // Fewest latents decoded (tiles * size) wins, then fewer tiles, then nearest the request; 62 latents -> 2 x 35.
+    // Fewest latents decoded (tiles * size) wins, then fewer tiles; 62 latents -> 2 x 35.
     // Growth stays within a quarter of the request where possible.
     auto pick = [&](int lowest, int highest, bool replacement) {
         int best_size     = 0;
@@ -121,9 +121,8 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
                 continue;
             }
             const int64_t cost = static_cast<int64_t>(tiles) * size;
-            const bool better  = best_size == 0 || cost < best_cost ||
-                                 (cost == best_cost && (tiles < best_tiles ||
-                                                        (tiles == best_tiles && std::abs(size - tile_size) < std::abs(best_size - tile_size))));
+            // Equal cost and tile count means equal size, so no further tie-break is needed.
+            const bool better = best_size == 0 || cost < best_cost || (cost == best_cost && tiles < best_tiles);
             if (better) {
                 best_size  = size;
                 best_cost  = cost;
