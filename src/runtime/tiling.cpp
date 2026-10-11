@@ -90,8 +90,7 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
     auto tile_count = [&](int size) {
         return static_cast<int>(sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false).size());
     };
-    // The nearest passing size (smaller first, larger only up to 2x) bounds the tile count: a cheaper choice made of
-    // many small tiles would multiply VAE calls (370 latents at 64 with overlap 0.1: 7 tiles, not 16 of 25).
+    // The nearest passing size (smaller first, then larger up to 2x) caps the tile count so tiny tiles never win.
     int nearest = 0;
     for (int size = tile_size - 1; size >= min_tile_size && nearest == 0; --size) {
         if (overlaps_enough(size, false)) {
@@ -107,10 +106,8 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
         return tile_size;
     }
     const int max_tiles = tile_count(nearest);
-    // Of the sizes that overlap enough, take the one decoding the fewest latents along the axis (tiles * size): a
-    // 62-latent axis gets two 35-latent tiles instead of three 31-latent ones. Ties go to fewer tiles, then to the
-    // size nearest the request. Growth stays within a quarter of the request where possible (the most any axis
-    // needs is 32 -> 36 and 16 -> 20), and no candidate may need more tiles than the nearest passing size.
+    // Fewest latents decoded (tiles * size) wins, then fewer tiles, then nearest the request; 62 latents -> 2 x 35.
+    // Growth stays within a quarter of the request where possible.
     auto pick = [&](int lowest, int highest, bool replacement) {
         int best_size     = 0;
         int64_t best_cost = 0;
