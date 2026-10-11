@@ -564,10 +564,10 @@ index 00000000..8d9752ca
 +int ggml_cuda_try_fuse_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 diff --git a/src/ggml-cuda/norm-channel.cu b/src/ggml-cuda/norm-channel.cu
 new file mode 100644
-index 00000000..84a33c9c
+index 00000000..1b921122
 --- /dev/null
 +++ b/src/ggml-cuda/norm-channel.cu
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,244 @@
 +#include "norm-channel.cuh"
 +#include "ggml-impl.h"
 +
@@ -588,6 +588,15 @@ index 00000000..84a33c9c
 +    }();
 +    return enabled && WARP_SIZE == 32;
 +#endif
++}
++
++// GGML_CUDA_NORM_CHANNEL=2 fuses at every size (tests); by default only where it beats the unfused chain.
++static bool norm_channel_forced() {
++    static const bool forced = [] {
++        const char * e = getenv("GGML_CUDA_NORM_CHANNEL");
++        return e != nullptr && atoi(e) == 2;
++    }();
++    return forced;
 +}
 +
 +static __device__ __forceinline__ float nc_butterfly32(float * v) {
@@ -775,6 +784,13 @@ index 00000000..84a33c9c
 +    const bool partial_overlap = d0 != x0 && d0 < x0 + ggml_nbytes(x) && x0 < d0 + ggml_nbytes(cont2);
 +    if (P > INT64_C(1) << 40 || partial_overlap) {
 +        NC_REJECT("check 10");
++    }
++    // One thread per position walks every channel, so the kernel needs many positions to fill the GPU.
++    // Measured on B200 against CONT + RMS_NORM + MUL + CONT (Qwen-Image VAE shapes, whole image and tiles):
++    // with C < 1024 it wins from 16384 positions (173 vs 245 us), with C >= 1024 from 65536 (1.2 vs 3.3 ms),
++    // and loses below (P = 4096, C = 1152: 656 vs 209 us).
++    if (!norm_channel_forced() && P < (C < 1024 ? 16384 : 65536)) {
++        NC_REJECT("check 12");
 +    }
 +    float eps;
 +    memcpy(&eps, rms->op_params, sizeof(float));
@@ -1046,7 +1062,7 @@ index 1fe59a0e..016995c0 100644
          struct ggml_context * ctx,
          struct ggml_tensor  * acc,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 778bed20..34417288 100644
+index 778bed20..e4438d10 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -2196,15 +2196,16 @@ struct test_rope_pe_permute : public test_case {
@@ -1250,3 +1266,17 @@ index 778bed20..34417288 100644
      test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
      test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
      test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
+@@ -11303,6 +11457,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Wan / Qwen-Image VAE channel RMS norm at whole-image and tile sizes
++    for (int64_t C : {144, 288, 576, 1152}) {
++        for (int64_t S : {16, 32, 64, 128, 256}) {
++            test_cases.emplace_back(new test_rms_norm_channel({S, S, 1, C}, true));
++        }
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
