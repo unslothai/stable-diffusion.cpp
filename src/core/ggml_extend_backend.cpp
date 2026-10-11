@@ -1,7 +1,6 @@
 #include "core/ggml_extend_backend.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <map>
@@ -437,20 +436,12 @@ bool sd_backend_is_cpu(ggml_backend_t backend) {
     return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
-static std::atomic<bool> g_cpu_weight_repack_disabled{false};
-
 bool sd_cpu_weight_repack_enabled() {
     static const bool env_enabled = [] {
         const char* v = std::getenv("SD_CPU_REPACK");
         return v == nullptr || !(v[0] == '0' && v[1] == '\0');
     }();
-    return env_enabled && !g_cpu_weight_repack_disabled.load();
-}
-
-void sd_cpu_weight_repack_disable(const char* reason) {
-    if (!g_cpu_weight_repack_disabled.exchange(true)) {
-        LOG_INFO("cpu weight repack disabled: %s", reason);
-    }
+    return env_enabled;
 }
 
 // The tag lives in the weight itself, in an op_params slot no op reads: a weight is a leaf

@@ -94,7 +94,6 @@ bool sd_backend_is_cpu(ggml_backend_t backend);
 // buffer can only feed MUL_MAT, so a weight is eligible only when the block that owns it tags
 // it as matmul-only. On by default; SD_CPU_REPACK=0 turns it off.
 bool sd_cpu_weight_repack_enabled();
-void sd_cpu_weight_repack_disable(const char* reason);
 void sd_tag_matmul_only_weight(ggml_tensor* weight);
 bool sd_is_matmul_only_weight(const ggml_tensor* weight);
 // For an allocated weight: whether it sits in a CPU extra buffer. An unallocated weight may still

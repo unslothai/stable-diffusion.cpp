@@ -1098,7 +1098,7 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     if (params_buft == nullptr) {
         params_buft = ggml_backend_get_default_buffer_type(state.params_backend);
     }
-    if (state.usage_op == GGML_OP_NONE && state.params_backend == state.compute_backend &&
+    if (cpu_repack_allowed_ && state.usage_op == GGML_OP_NONE && state.params_backend == state.compute_backend &&
         sd_backend_is_cpu(state.compute_backend)) {
         ggml_backend_buffer_type_t repack_buft = sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state.compute_backend), state.tensor);
         if (repack_buft != nullptr) {

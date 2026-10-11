@@ -1059,13 +1059,13 @@ void StableDiffusionGGML::configure_weight_loading() {
         const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
         const bool streaming_constrained = params_offloaded ||
                                            backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION);
-        // On CPU the quantized matmul weights are repacked, which a merged LoRA cannot rewrite;
-        // that includes weights a --type conversion quantizes while loading.
-        const ggml_type target_wtype = sd_type_to_ggml_type(sd_ctx_params->wtype);
-        const bool cpu_repacked      = sd_cpu_weight_repack_enabled() &&
-                                       sd_backend_is_cpu(backend_for(SDBackendModule::DIFFUSION)) &&
-                                       target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype);
-        if (have_quantized_weight || cpu_repacked || streaming_constrained || row_split_active()) {
+        // On CPU a merged LoRA cannot rewrite weights that --type or --tensor-type-rules quantize while
+        // loading (repacked or not), so those runs apply LoRAs at runtime too.
+        const ggml_type target_wtype     = sd_type_to_ggml_type(sd_ctx_params->wtype);
+        const bool quantized_on_load     = (target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype)) ||
+                                           strlen(SAFE_STR(sd_ctx_params->tensor_type_rules)) > 0;
+        const bool cpu_quantized_on_load = quantized_on_load && sd_backend_is_cpu(backend_for(SDBackendModule::DIFFUSION));
+        if (have_quantized_weight || cpu_quantized_on_load || streaming_constrained || row_split_active()) {
             apply_lora_immediately = false;
         } else {
             apply_lora_immediately = true;
@@ -1090,7 +1090,7 @@ void StableDiffusionGGML::configure_weight_loading() {
 
     if (apply_lora_immediately) {
         // Merging a LoRA rewrites weights in place, which a repacked CPU weight cannot take.
-        sd_cpu_weight_repack_disable("LoRA apply mode is 'immediately'");
+        model_manager->set_cpu_repack_allowed(false);
     }
 
     bool needs_writable_mmap = enable_mmap && apply_lora_immediately;

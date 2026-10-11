@@ -113,6 +113,7 @@ private:
     int n_threads_                   = 0;
     bool enable_mmap_                = false;
     bool writable_mmap_              = false;
+    bool cpu_repack_allowed_         = true;
     bool segmented_compute_disabled_ = false;
     bool prefetch_disabled_          = false;
 
@@ -203,6 +204,8 @@ public:
     void set_prefetch_disabled(bool disabled) { prefetch_disabled_ = disabled; }
     void set_enable_mmap(bool enable_mmap) { enable_mmap_ = enable_mmap; }
     void set_writable_mmap(bool writable_mmap) { writable_mmap_ = writable_mmap; }
+    // Per context: an 'immediately' LoRA merge rewrites weights in place, which a repacked CPU weight cannot take.
+    void set_cpu_repack_allowed(bool allowed) { cpu_repack_allowed_ = allowed; }
     void set_common_ignore_tensors(std::set<std::string> ignore_tensors);
     bool prepare_lora_sources(std::vector<LoraSpec>& loras);
     bool set_loras(std::vector<LoraSpec> loras, SDVersion version);
