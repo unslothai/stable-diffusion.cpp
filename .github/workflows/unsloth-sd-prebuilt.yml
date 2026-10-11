@@ -332,13 +332,8 @@ jobs:
           echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"
           echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
 
-      # CPU-only bundles carry every CPU variant ggml builds (x86: x86-64 baseline up to AVX512,
-      # AVX-VNNI and AMX; Linux arm64: Armv8.0 up to SVE2 / SME), each a libggml-cpu-<variant>
-      # that ggml scores against the host CPU at startup, loading the best. -DGGML_NATIVE=OFF
-      # alone pins one level for every host: AVX2/FMA on x86 (SIGILL on older CPUs, no AVX512 /
-      # VNNI on newer) and the compiler default Armv8.0 on Linux arm64 (no dotprod or i8mm, the
-      # int8 dot products every quantized matmul uses). The Metal and Vulkan legs keep their
-      # static build: their compute runs on the GPU.
+      # CPU bundles ship all ggml CPU variants, picked per host at startup; -DGGML_NATIVE=OFF alone
+      # pins AVX2 (SIGILL on older x86) or plain Armv8.0. Metal/Vulkan stay static.
       - name: Build sd-cli + sd-server
         working-directory: src
         run: |
@@ -346,8 +341,7 @@ jobs:
           CPU_VARIANTS=""
           if [ -n "${{ matrix.cpu_floor }}" ]; then
             CPU_VARIANTS="-DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
-            # macOS: the ggml dylibs and variant modules find each other through @loader_path
-            # only, never through an absolute rpath into this runner's build tree.
+            # macOS: @loader_path only, never an absolute rpath into the build tree.
             if [ "$(uname -s)" = "Darwin" ]; then
               CPU_VARIANTS="$CPU_VARIANTS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=@loader_path"
             fi
@@ -389,8 +383,6 @@ jobs:
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
-      # On the finished zip: the floor variant is present, nothing points back at the build
-      # tree, and sd-cli started from the unzipped copy loads a CPU variant from that copy.
       - name: CPU variants gate
         if: ${{ matrix.cpu_floor != '' }}
         run: bash tooling/scripts/unsloth/cpu_variants_gate.sh check "dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip" "${{ matrix.cpu_floor }}"
@@ -926,8 +918,6 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
           Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
 
-      # win-cpu-x64 carries every CPU variant MSVC can build (x86-64 baseline up to AVX512 and
-      # AVX-VNNI; see the build-unix note), loaded per host by ggml at startup.
       - name: Build sd-cli + sd-server
         shell: pwsh
         working-directory: src
@@ -991,8 +981,6 @@ jobs:
           & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
           exit $LASTEXITCODE
 
-      # The floor variant ships, and sd-cli started from the unzipped bundle (empty cwd, so
-      # ggml's cwd search finds nothing) loads a CPU variant from the bundle itself.
       - name: CPU variants gate
         if: ${{ matrix.cpu_floor != '' }}
         shell: pwsh

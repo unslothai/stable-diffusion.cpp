@@ -339,8 +339,7 @@ public:
             forward_params.linear.force_prec_f32 = force_prec_f32;
             forward_params.linear.scale          = scale;
             if (sd_backend_is_cpu(ctx->backend) && sd_weight_may_be_cpu_repacked(w)) {
-                // The weight may be repacked, which only MUL_MAT can read, so the adapter is added
-                // to the output (x W^T + x dW^T) instead of being folded into a copy of W.
+                // W may be repacked (MUL_MAT-only): add x dW^T to the output instead of folding into W.
                 if (linear_bias != nullptr) {
                     linear_bias = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, linear_bias, prefix + "bias");
                 }

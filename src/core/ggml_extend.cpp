@@ -212,9 +212,7 @@ ggml_tensor* ggml_ext_linear_matmul(ggml_context* ctx,
                                     ggml_tensor* w,
                                     bool force_prec_f32) {
     if (sd_weight_may_be_cpu_repacked(w) && w->ne[2] == 1 && w->ne[3] == 1) {
-        // The CPU repacked matmuls (AMX, CPU_REPACK) read activations as contiguous rows and get batch dims
-        // wrong (AMX steps the 2D weight per batch), so hand them contiguous 2D rows: for a 2D weight that is
-        // the same product.
+        // Repacked CPU matmuls (AMX, CPU_REPACK) get batch dims wrong: feed contiguous 2D rows.
         if (!ggml_is_contiguous(x)) {
             x = ggml_cont(ctx, x);
         }

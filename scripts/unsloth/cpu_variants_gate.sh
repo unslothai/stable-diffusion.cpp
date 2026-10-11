@@ -2,22 +2,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
 #
-# CPU bundles ship ggml's CPU backend as runtime-selected variants (GGML_BACKEND_DL +
-# GGML_CPU_ALL_VARIANTS): libggml-cpu-<variant> for every x86 level from plain x86-64 up to
-# AVX512 / AVX-VNNI / AMX, or every Armv8/v9 level, and ggml loads the best one the host CPU
-# supports. A static -DGGML_NATIVE=OFF build is pinned to AVX2 on x86 (and crashes with SIGILL
-# on anything older) and to plain Armv8.0 on Linux arm64, so most machines ran a slower kernel
-# set than they support.
-#
-#   cpu_variants_gate.sh pin   <bin_dir>
-#       Linux only: point every binary and ggml library at $ORIGIN with DT_RPATH (searched
-#       before LD_LIBRARY_PATH, unlike RUNPATH), the same rule the CUDA bundles use, so the
-#       bundle's own libggml-base wins over another ggml on the loader path.
-#   cpu_variants_gate.sh check <bundle.zip> <floor_variant>
-#       Unzip into a fresh directory and prove the bundle is self-contained and loadable:
-#       the floor variant (the one every CPU of the arch can run) is present, no library or
-#       binary still points at the build tree, and sd-cli started from the unzipped copy
-#       loads a CPU variant from that copy.
+#   pin   <bin_dir>: Linux: DT_RPATH=$ORIGIN (beats LD_LIBRARY_PATH, unlike RUNPATH) so the bundle's ggml wins.
+#   check <bundle.zip> <floor_variant>: floor variant present, no build-tree paths, sd-cli loads a CPU variant from the bundle.
 
 set -euo pipefail
 
@@ -41,7 +27,6 @@ case "$mode" in
     floor="${3:?floor variant, e.g. x64 or armv8.0_1}"
     work=""
     empty=""
-    # Registered before the first step that can fail, so an early exit still removes both.
     cleanup() {
       if [ -n "$work" ]; then rm -rf -- "$work"; fi
       if [ -n "$empty" ]; then rm -rf -- "$empty"; fi
@@ -82,8 +67,7 @@ case "$mode" in
     fi
     cli="$dir/sd-cli"
     [ -f "$cli.exe" ] && cli="$cli.exe"
-    # A model path that cannot exist: sd-cli registers the backends, prints System Info, then
-    # stops at the model. Run from an empty cwd so ggml's cwd search cannot find anything.
+    # Nonexistent model: sd-cli loads backends then stops. Empty cwd defeats ggml's cwd search.
     empty="$(mktemp -d "${RUNNER_TEMP:-/tmp}/cpu-variants-cwd-XXXXXX")"
     out="$(cd "$empty" && env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "$cli" -m "$empty/none.gguf" -p x -v 2>&1 || true)"
     loaded="$(printf '%s\n' "$out" | sed -n 's/.*loaded CPU backend from \(.*\)$/\1/p' | head -n1 | tr -d '\r')"

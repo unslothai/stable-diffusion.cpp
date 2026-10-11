@@ -1059,14 +1059,12 @@ void StableDiffusionGGML::configure_weight_loading() {
         const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
         const bool streaming_constrained = params_offloaded ||
                                            backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION);
-        // On CPU a merged LoRA cannot rewrite weights that --type or --tensor-type-rules quantize while
-        // loading (repacked or not), so those runs apply LoRAs at runtime too.
+        // On CPU, weights quantized at load (--type / --tensor-type-rules) cannot take a merged LoRA.
         const ggml_type target_wtype     = sd_type_to_ggml_type(sd_ctx_params->wtype);
         bool quantized_on_load           = target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype);
         for (const auto& rule : parse_tensor_type_rules(SAFE_STR(sd_ctx_params->tensor_type_rules))) {
             quantized_on_load = quantized_on_load || ggml_is_quantized(rule.second);
         }
-        // --backend can route any LoRA-targetable module to the CPU on its own.
         bool lora_module_on_cpu = false;
         for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE}) {
             lora_module_on_cpu = lora_module_on_cpu || sd_backend_is_cpu(backend_for(module));

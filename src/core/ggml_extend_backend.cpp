@@ -444,10 +444,7 @@ bool sd_cpu_weight_repack_enabled() {
     return env_enabled;
 }
 
-// The tag lives in the weight itself, in an op_params slot no op reads: a weight is a leaf
-// (GGML_OP_NONE), and op_params belong to the op that produces a tensor. Keeping it on the
-// tensor ties its lifetime to the tensor, so a freed and reallocated address can never inherit
-// it the way an external pointer set could.
+// Tag lives in an unused op_params slot of the leaf weight, so a reused address cannot inherit it (unlike a pointer set).
 static constexpr int32_t SD_MATMUL_ONLY_TAG     = 0x53444d4d;  // "SDMM"
 static constexpr size_t SD_MATMUL_ONLY_TAG_SLOT = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
 
@@ -469,8 +466,7 @@ bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight) {
     if (weight->buffer == nullptr) {
         return sd_cpu_weight_repack_enabled();
     }
-    // An allocated weight answers from its buffer alone, so a later context switching repacking off
-    // cannot hide weights an earlier one already placed in a CPU extra buffer.
+    // Buffer first: a later context disabling repack must not hide already-repacked weights.
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
     ggml_backend_dev_t dev          = ggml_backend_buft_get_device(buft);
     return !ggml_backend_buft_is_host(buft) && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -488,8 +484,6 @@ ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_
     if (get_extra_bufts == nullptr) {
         return nullptr;
     }
-    // Every buffer type decides from (type, ne0, ne1) alone, and a model asks for the same few
-    // shapes thousands of times, so remember the answer per shape.
     static std::mutex cache_mutex;
     static std::map<std::tuple<ggml_backend_dev_t, int, int64_t, int64_t>, ggml_backend_buffer_type_t> cache;
     const auto key = std::make_tuple(cpu_dev, (int)weight->type, weight->ne[0], weight->ne[1]);
@@ -508,9 +502,7 @@ ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_
     if (ctx == nullptr) {
         return nullptr;
     }
-    // Ask the device about the real op: a MUL_MAT of this weight against F32 activations, with
-    // the weight sitting in each candidate buffer type in turn (first match wins: AMX, then the
-    // generic repack). The dummy buffer is zero-sized; supports_op only reads its type.
+    // Probe supports_op with a real MUL_MAT per candidate (AMX first); the dummy buffer is only read for its type.
     ggml_tensor* w                    = ggml_new_tensor_2d(ctx, weight->type, weight->ne[0], weight->ne[1]);
     ggml_tensor* x                    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weight->ne[0], 64);
     ggml_tensor* op                   = ggml_mul_mat(ctx, w, x);

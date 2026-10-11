@@ -1042,8 +1042,7 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
             continue;
         }
         auto& batches = groups[{state->source_file, state->source_version}];
-        // The loader supplies one destination per name and the others copy from it, so a conflicting type or a
-        // first destination in a CPU repack buffer (no read path, repacked layout) needs another batch.
+        // Others copy from the first destination: a type conflict or a repacked first destination needs another batch.
         auto batch = std::find_if(batches.begin(), batches.end(), [&](const ReadBatch& candidate) {
             auto found = candidate.find(state->name);
             if (found == candidate.end()) {
