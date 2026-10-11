@@ -1042,10 +1042,15 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
             continue;
         }
         auto& batches = groups[{state->source_file, state->source_version}];
-        // The loader supplies one destination per name; only conflicting types need another batch.
+        // The loader supplies one destination per name and the others copy from it, so a conflicting type or a
+        // first destination in a CPU repack buffer (no read path, repacked layout) needs another batch.
         auto batch = std::find_if(batches.begin(), batches.end(), [&](const ReadBatch& candidate) {
             auto found = candidate.find(state->name);
-            return found == candidate.end() || found->second.front()->tensor->type == state->tensor->type;
+            if (found == candidate.end()) {
+                return true;
+            }
+            const ggml_tensor* first = found->second.front()->tensor;
+            return first->type == state->tensor->type && !sd_weight_may_be_cpu_repacked(first);
         });
         if (batch == batches.end()) {
             batches.emplace_back();
