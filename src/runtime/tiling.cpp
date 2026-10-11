@@ -1,6 +1,7 @@
 #include "runtime/tiling.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -60,12 +61,14 @@ static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
     return tiles;
 }
 
-int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor) {
+int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor, int max_tile_size) {
     // A tile a little over half the axis (32 of 62 latents) gets two tiles overlapping by 1-2 latents, which shows
     // as a seam. Keep the requested size when its overlaps are >= half the target and >= 2 latents, else pick the
     // cheapest size that overlaps by the full target, up to 8 latents, never using more tiles than the nearest
     // passing size would.
     const int min_tile_size = 4;
+    const int limit         = max_tile_size >= min_tile_size ? max_tile_size : INT_MAX;
+    tile_size               = std::min(tile_size, limit);
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;
     }
@@ -97,7 +100,7 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
             nearest = size;
         }
     }
-    for (int size = tile_size + 1; nearest == 0 && size < small_dim && size <= 2 * tile_size; ++size) {
+    for (int size = tile_size + 1; nearest == 0 && size < small_dim && size <= std::min(2 * tile_size, limit); ++size) {
         if (overlaps_enough(size, false)) {
             nearest = size;
         }
@@ -131,8 +134,8 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
         }
         return best_size;
     };
-    const int capped = std::min(small_dim - 1, tile_size + tile_size / 4);
-    const int widest = std::min(small_dim - 1, 2 * tile_size);
+    const int capped = std::min({small_dim - 1, tile_size + tile_size / 4, limit});
+    const int widest = std::min({small_dim - 1, 2 * tile_size, limit});
     for (bool replacement : {true, false}) {
         int size = pick(min_tile_size, capped, replacement);
         if (size == 0) {

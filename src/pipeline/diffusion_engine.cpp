@@ -2895,12 +2895,12 @@ int StableDiffusionGGML::align_video_frames(int frames) {
     return latent_frames_to_video_frames(video_frames_to_latent_frames(frames));
 }
 
-// Tile sizes for a VAE pass; after an out-of-memory failure (last_w/last_h > 0) every tile must come out smaller.
-// get_tile_sizes can widen a halved request to keep the seam overlap (back to the failed size), so lower the
-// request of an axis that did not shrink one latent at a time. Returns false on invalid parameters or when no
-// axis can shrink any further.
+// Tile sizes for a VAE pass; after an out-of-memory failure (last_w/last_h > 0) every axis that can shrink must
+// come out smaller. get_tile_sizes can widen a halved request to keep the seam overlap (back to the failed size),
+// so bound the seam-safe choice below the failed size instead. Returns false on invalid parameters or when no axis
+// can shrink any further.
 static bool sd_vae_tile_sizes(VAE& vae,
-                              sd_tiling_params_t& tiling_params,
+                              const sd_tiling_params_t& tiling_params,
                               int64_t latent_w,
                               int64_t latent_h,
                               bool circular_x,
@@ -2909,28 +2909,27 @@ static bool sd_vae_tile_sizes(VAE& vae,
                               int last_h,
                               int& tile_size_w,
                               int& tile_size_h) {
-    const int scale_factor = vae.get_scale_factor();
-    for (;;) {
-        tile_size_w = static_cast<int>(latent_w);
-        tile_size_h = static_cast<int>(latent_h);
-        float tile_overlap;
-        if (tiling_params.enabled &&
-            !vae.get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params,
-                                latent_w, latent_h, circular_x, circular_y)) {
-            return false;
-        }
-        if (last_w <= 0 || !tiling_params.enabled) {
-            return true;
-        }
-        const bool lower_w = tile_size_w >= last_w && tiling_params.tile_size_w > 4 * scale_factor;
-        const bool lower_h = tile_size_h >= last_h && tiling_params.tile_size_h > 4 * scale_factor;
-        if (!lower_w && !lower_h) {
-            return tile_size_w < last_w || tile_size_h < last_h;
-        }
-        tiling_params.tile_size_w -= lower_w ? scale_factor : 0;
-        tiling_params.tile_size_h -= lower_h ? scale_factor : 0;
+    vae.retry_tile_limit_w = last_w > 0 ? last_w - 1 : 0;
+    vae.retry_tile_limit_h = last_h > 0 ? last_h - 1 : 0;
+    tile_size_w            = static_cast<int>(latent_w);
+    tile_size_h            = static_cast<int>(latent_h);
+    float tile_overlap;
+    if (tiling_params.enabled &&
+        !vae.get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params,
+                            latent_w, latent_h, circular_x, circular_y)) {
+        return false;
     }
+    return last_w <= 0 || !tiling_params.enabled || tile_size_w < last_w || tile_size_h < last_h;
 }
+
+// Clears the retry bound when a VAE pass ends.
+struct VAERetryTileLimitGuard {
+    VAE& vae;
+    ~VAERetryTileLimitGuard() {
+        vae.retry_tile_limit_w = 0;
+        vae.retry_tile_limit_h = 0;
+    }
+};
 
 sd::Tensor<float> StableDiffusionGGML::encode_to_vae_latents(const sd::Tensor<float>& x) {
     // Same out-of-memory fallback as decode_first_stage, on a copy of the tiling parameters, so the
@@ -2940,6 +2939,7 @@ sd::Tensor<float> StableDiffusionGGML::encode_to_vae_latents(const sd::Tensor<fl
     const int64_t latent_w  = x.shape()[0] / scale_factor;
     const int64_t latent_h  = x.shape()[1] / scale_factor;
     sd::Tensor<float> latents;
+    VAERetryTileLimitGuard limit_guard{*first_stage_model};
     for (int last_w = 0, last_h = 0;;) {
         int tile_size_w;
         int tile_size_h;
@@ -2982,6 +2982,7 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
     auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
     const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&
                                         first_stage_model->can_temporal_tile_decode();
+    VAERetryTileLimitGuard limit_guard{*first_stage_model};
     for (int last_w = 0, last_h = 0;;) {
         int tile_size_w;
         int tile_size_h;
