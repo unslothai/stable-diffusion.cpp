@@ -2922,7 +2922,6 @@ static bool sd_vae_tile_sizes(VAE& vae,
     return last_w <= 0 || !tiling_params.enabled || tile_size_w < last_w || tile_size_h < last_h;
 }
 
-// Clears the retry bound when a VAE pass ends.
 struct VAERetryTileLimitGuard {
     VAE& vae;
     ~VAERetryTileLimitGuard() {
