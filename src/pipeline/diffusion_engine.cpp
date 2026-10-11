@@ -1059,7 +1059,13 @@ void StableDiffusionGGML::configure_weight_loading() {
         const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
         const bool streaming_constrained = params_offloaded ||
                                            backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION);
-        if (have_quantized_weight || streaming_constrained || row_split_active()) {
+        // On CPU the quantized matmul weights are repacked, which a merged LoRA cannot rewrite;
+        // that includes weights a --type conversion quantizes while loading.
+        const ggml_type target_wtype = sd_type_to_ggml_type(sd_ctx_params->wtype);
+        const bool cpu_repacked      = sd_cpu_weight_repack_enabled() &&
+                                       sd_backend_is_cpu(backend_for(SDBackendModule::DIFFUSION)) &&
+                                       target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype);
+        if (have_quantized_weight || cpu_repacked || streaming_constrained || row_split_active()) {
             apply_lora_immediately = false;
         } else {
             apply_lora_immediately = true;
