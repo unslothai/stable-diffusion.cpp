@@ -97,8 +97,8 @@ bool sd_cpu_weight_repack_enabled();
 void sd_cpu_weight_repack_disable(const char* reason);
 void sd_tag_matmul_only_weight(ggml_tensor* weight);
 bool sd_is_matmul_only_weight(const ggml_tensor* weight);
-// False only when `weight` is already allocated somewhere other than a CPU extra buffer; an
-// unallocated weight may still land in one, so it answers true.
+// For an allocated weight: whether it sits in a CPU extra buffer. An unallocated weight may still
+// land in one, so it answers whether repacking is enabled.
 bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight);
 // The CPU extra buffer type `weight` should live in, or nullptr for the plain CPU buffer.
 ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_dev, const ggml_tensor* weight);

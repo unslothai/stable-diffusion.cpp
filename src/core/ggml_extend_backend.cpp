@@ -472,12 +472,14 @@ bool sd_is_matmul_only_weight(const ggml_tensor* weight) {
 }
 
 bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight) {
-    if (!sd_is_matmul_only_weight(weight) || !sd_cpu_weight_repack_enabled()) {
+    if (!sd_is_matmul_only_weight(weight)) {
         return false;
     }
     if (weight->buffer == nullptr) {
-        return true;
+        return sd_cpu_weight_repack_enabled();
     }
+    // An allocated weight answers from its buffer alone, so a later context switching repacking off
+    // cannot hide weights an earlier one already placed in a CPU extra buffer.
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
     ggml_backend_dev_t dev          = ggml_backend_buft_get_device(buft);
     return !ggml_backend_buft_is_host(buft) && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
