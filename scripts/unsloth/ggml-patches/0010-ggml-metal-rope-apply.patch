@@ -1,0 +1,205 @@
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index dc6b695e..d1a624ad 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -2391,6 +2391,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_roll(ggml_metal_
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope_apply(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_ROPE_APPLY);
++    GGML_UNUSED(op);
++
++    const char * name = "kernel_rope_apply_f32";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_PAD);
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 1bdaecc7..b41813a9 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -171,6 +171,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_roll              (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope_apply        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_arange            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_timestep_embedding(ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index a81d3a8c..498ee7ca 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1681,6 +1681,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+         case GGML_OP_ROPE:
+         case GGML_OP_ROPE_BACK:
+             return true;
++        case GGML_OP_ROPE_APPLY:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
++                   op->src[0]->ne[1] <= 65535 && op->src[0]->ne[3] <= 65535;
+         case GGML_OP_IM2COL:
+             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
+         case GGML_OP_CONV_2D:
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index 490dd83a..d61e0fcb 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -1166,6 +1166,22 @@ typedef struct {
+     int32_t  s3;
+ } ggml_metal_kargs_roll;
+ 
++typedef struct {
++    int32_t  ne00;
++    int32_t  ne01;
++    int32_t  ne02;
++    int32_t  ne03;
++    uint64_t nb00;
++    uint64_t nb01;
++    uint64_t nb02;
++    uint64_t nb03;
++    uint64_t nb10;
++    uint64_t nb11;
++    uint64_t nb12;
++    uint64_t nb13;
++    int32_t  interleaved;
++} ggml_metal_kargs_rope_apply;
++
+ typedef struct {
+     uint64_t nb1;
+     int      dim;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 708703e5..031adb8a 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -410,6 +410,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_rope(ctx, idx);
+             } break;
++        case GGML_OP_ROPE_APPLY:
++            {
++                n_fuse = ggml_metal_op_rope_apply(ctx, idx);
++            } break;
+         case GGML_OP_IM2COL:
+             {
+                 n_fuse = ggml_metal_op_im2col(ctx, idx);
+@@ -4977,6 +4981,47 @@ int ggml_metal_op_roll(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_rope_apply(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
++
++    ggml_metal_kargs_rope_apply args = {
++        /*.ne00        =*/ ne00,
++        /*.ne01        =*/ ne01,
++        /*.ne02        =*/ ne02,
++        /*.ne03        =*/ ne03,
++        /*.nb00        =*/ nb00,
++        /*.nb01        =*/ nb01,
++        /*.nb02        =*/ nb02,
++        /*.nb03        =*/ nb03,
++        /*.nb10        =*/ nb10,
++        /*.nb11        =*/ nb11,
++        /*.nb12        =*/ nb12,
++        /*.nb13        =*/ nb13,
++        /*.interleaved =*/ ggml_get_op_params_i32(op, 0) != 0 ? 1 : 0,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_rope_apply(lib, op);
++
++    const int nth = std::max(1, std::min(ne00/2, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)));
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, ne02, ne01, ne03, nth, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
+index 583d1156..ef6be30f 100644
+--- a/src/ggml-metal/ggml-metal-ops.h
++++ b/src/ggml-metal/ggml-metal-ops.h
+@@ -93,6 +93,7 @@ int ggml_metal_op_upscale           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_pad_reflect_1d    (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_rope_apply        (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
+diff --git a/src/ggml-metal/kernels/rope.metal b/src/ggml-metal/kernels/rope.metal
+index 401ceacb..b47563c6 100644
+--- a/src/ggml-metal/kernels/rope.metal
++++ b/src/ggml-metal/kernels/rope.metal
+@@ -331,3 +331,46 @@ template [[host_name("kernel_rope_multi_f16")]] kernel kernel_rope_multi_t kerne
+ 
+ template [[host_name("kernel_rope_vision_f32")]] kernel kernel_rope_vision_t kernel_rope_vision<float>;
+ template [[host_name("kernel_rope_vision_f16")]] kernel kernel_rope_vision_t kernel_rope_vision<half>;
++
++// x [d, n_head, L, N] (any strides), pe [2, 2, d/2, L] of [[cos, -sin], [sin, cos]]; dst contiguous [d, L, n_head*N]
++kernel void kernel_rope_apply_f32(
++        constant ggml_metal_kargs_rope_apply & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int64_t token = tgpig.x;
++    const int64_t head  = tgpig.y;
++    const int64_t batch = tgpig.z;
++
++    const int64_t half_dim = args.ne00/2;
++
++    device const char * x_row  = src0 + head*args.nb01 + token*args.nb02 + batch*args.nb03;
++    device const char * pe_row = src1 + token*args.nb13;
++    device       float * out   = (device float *) dst + (token + args.ne02*(head + args.ne01*batch))*args.ne00;
++
++    for (int64_t j = tpitg.x; j < half_dim; j += ntg.x) {
++        const int64_t i0 = args.interleaved ? 2*j     : j;
++        const int64_t i1 = args.interleaved ? 2*j + 1 : j + half_dim;
++
++        const float a = *(device const float *) (x_row + i0*args.nb00);
++        const float b = *(device const float *) (x_row + i1*args.nb00);
++
++        device const char * m = pe_row + j*args.nb12;
++
++        const float c = *(device const float *) (m);
++        const float s = *(device const float *) (m + args.nb11);
++
++        if (args.interleaved) {
++            const float neg_s = *(device const float *) (m + args.nb10);
++            const float c1    = *(device const float *) (m + args.nb10 + args.nb11);
++            out[i0] = a*c + b*neg_s;
++            out[i1] = a*s + b*c1;
++        } else {
++            out[i0] = a*c - b*s;
++            out[i1] = a*s + b*c;
++        }
++    }
++}

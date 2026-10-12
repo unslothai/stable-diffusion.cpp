@@ -1,0 +1,61 @@
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 031adb8a..aacf12c0 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4103,13 +4103,13 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_group_norm(lib, op);
+ 
+-    int nth = 32; // SIMD width
+-    //while (nth < ne00/4 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+-    //    nth *= 2;
+-    //}
++    // one simdgroup per group starves the GPU on VAE group norms; the 32-float reduction buffer caps nth at 1024
++    const int64_t gs = (int64_t) ne00*ne01*((ne02 + ngrp - 1)/ngrp);
+ 
+-    //nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+-    //nth = std::min(nth, ne00/4);
++    int nth = 32; // SIMD width
++    while (nth < 1024 && (int64_t) nth*8 <= gs && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
++        nth *= 2;
++    }
+ 
+     const size_t smem = pipeline.smem;
+ 
+@@ -4120,7 +4120,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+ 
+     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp, 1, 1, nth, 1, 1);
++    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp*ne03, 1, 1, nth, 1, 1);
+ 
+     return 1;
+ }
+diff --git a/src/ggml-metal/kernels/norm.metal b/src/ggml-metal/kernels/norm.metal
+index c76d0c7f..a301bbf0 100644
+--- a/src/ggml-metal/kernels/norm.metal
++++ b/src/ggml-metal/kernels/norm.metal
+@@ -249,7 +249,12 @@ kernel void kernel_group_norm_f32(
+     const int64_t ne = args.ne00*args.ne01*args.ne02;
+     const int64_t gs = args.ne00*args.ne01*((args.ne02 + args.ngrp - 1) / args.ngrp);
+ 
+-    int start = tgpig * gs;
++    // src0 is contiguous
++    const int64_t i03 = tgpig / args.ngrp;
++    src0 += i03*ne;
++    dst  += i03*ne;
++
++    int start = (tgpig % args.ngrp) * gs;
+     int end   = start + gs;
+ 
+     start += tpitg;
+@@ -294,6 +299,9 @@ kernel void kernel_group_norm_f32(
+ 
+     tmp = simd_sum(tmp);
+     if (ntg > N_SIMDWIDTH) {
++        // every simdgroup must have read the mean reduction from buf before it is reused
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
+         if (sgitg == 0) {
+             buf[tiisg] = 0.0f;
+         }

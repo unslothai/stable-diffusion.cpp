@@ -1,0 +1,32 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index 8c348734..cc597430 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -1294,6 +1294,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         GGML_ASSERT(*cur_backend_id != -1);
+     }
+ 
++    // pass 4.5: an in-place op writes into its view_src's memory, so run it on the backend owning
++    // that buffer; elsewhere it gets a foreign pointer (Metal "buffer is nil", CUDA illegal address)
++    for (int i = 0; i < graph->n_nodes; i++) {
++        struct ggml_tensor * node = graph->nodes[i];
++        if (node->view_src == NULL || ggml_is_view_op(node->op)) {
++            continue;
++        }
++        int * cur_backend_id = &tensor_backend_id(node);
++        const int owner_id = node->view_src->buffer != NULL
++            ? ggml_backend_sched_backend_from_buffer(sched, node->view_src, node)
++            : tensor_backend_id(node->view_src);
++        if (owner_id == -1 || owner_id == *cur_backend_id ||
++            ggml_backend_sched_buffer_supported(sched, node->view_src, *cur_backend_id)) {
++            continue;
++        }
++        if (ggml_backend_supports_op(sched->backends[owner_id], node)) {
++            *cur_backend_id = owner_id;
++            SET_CAUSE(node, "4.5.inplace");
++        }
++    }
++
+     // pass 5: split graph, find tensors that need to be copied
+     {
+         int i_split = 0;
