@@ -508,8 +508,7 @@ ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_
     if (ctx == nullptr) {
         return nullptr;
     }
-    // Probe supports_op with a real MUL_MAT per candidate (AMX first); the dummy buffer is only read for its type.
-    // Activations are 2D F32, the form ggml_ext_linear_matmul always feeds a weight that may be repacked.
+    // Probe with a real 2D-F32 MUL_MAT per candidate (AMX first), the form ggml_ext_linear_matmul feeds; dummy buffer read only for its type.
     ggml_tensor* w                    = ggml_new_tensor_2d(ctx, weight->type, weight->ne[0], weight->ne[1]);
     ggml_tensor* x                    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weight->ne[0], 64);
     ggml_tensor* op                   = ggml_mul_mat(ctx, w, x);

@@ -67,7 +67,6 @@ struct TensorStorage {
         }
     }
 
-    // True when dst can point straight into the file bytes (no conversion, same layout).
     bool maps_directly_to(const ggml_tensor* dst) const {
         if (is_f64 || is_i64 ||
 #ifdef SD_USE_UPSTREAM_GGML
