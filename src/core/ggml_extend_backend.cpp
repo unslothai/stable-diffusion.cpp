@@ -454,6 +454,12 @@ void sd_tag_matmul_only_weight(ggml_tensor* weight) {
     }
 }
 
+void sd_untag_matmul_only_weight(ggml_tensor* weight) {
+    if (sd_is_matmul_only_weight(weight)) {
+        weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] = 0;
+    }
+}
+
 bool sd_is_matmul_only_weight(const ggml_tensor* weight) {
     return weight != nullptr && weight->op == GGML_OP_NONE &&
            weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] == SD_MATMUL_ONLY_TAG;

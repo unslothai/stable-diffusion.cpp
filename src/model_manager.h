@@ -49,6 +49,7 @@ private:
         bool params_follow_compute_backend           = false;
         bool metadata_validated                      = false;
         enum ggml_op usage_op                        = GGML_OP_NONE;
+        bool matmul_only                             = false;  // tagged by its block: may be CPU-repacked
 
         int pin_count = 0;
 

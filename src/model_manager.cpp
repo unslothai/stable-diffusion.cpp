@@ -12,6 +12,19 @@
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
 
+// The matmul-only tag lets a weight whose buffer is not allocated yet take the repacked-CPU graph path,
+// so keep it only while the weight computes on the CPU; a GPU weight never lands in a CPU repack buffer.
+static void sync_cpu_repack_tag(ggml_tensor* tensor, bool matmul_only, ggml_backend_t compute_backend) {
+    if (!matmul_only) {
+        return;
+    }
+    if (sd_backend_is_cpu(compute_backend)) {
+        sd_tag_matmul_only_weight(tensor);
+    } else {
+        sd_untag_matmul_only_weight(tensor);
+    }
+}
+
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
     GGML_ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
     size_t align = (alignment - ((reinterpret_cast<uintptr_t>(buffer) + offset) % alignment)) % alignment;
@@ -261,6 +274,8 @@ bool ModelManager::register_param_tensors(ModelComponent component,
         state->residency_mode  = residency_mode;
         state->compute_backend = compute_backend;
         state->params_backend  = params_backend;
+        state->matmul_only     = sd_is_matmul_only_weight(tensor);
+        sync_cpu_repack_tag(tensor, state->matmul_only, compute_backend);
         auto split_buffer      = split_buffer_types_.find(compute_backend);
         if (allow_split_buffer && split_buffer != split_buffer_types_.end()) {
             state->split_buffer_type = split_buffer->second;
@@ -1418,6 +1433,7 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
         }
 
         state->compute_backend = compute_backend;
+        sync_cpu_repack_tag(state->tensor, state->matmul_only, compute_backend);
         if (params_follow_compute) {
             state->params_backend = compute_backend;
         }
