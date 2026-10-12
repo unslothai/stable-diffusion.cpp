@@ -1093,10 +1093,8 @@ void StableDiffusionGGML::configure_weight_loading() {
         apply_lora_immediately = false;
     }
 
-    if (apply_lora_immediately) {
-        // Merging a LoRA rewrites weights in place, which a repacked CPU weight cannot take.
-        model_manager->set_cpu_repack_allowed(false);
-    }
+    // Merging a LoRA rewrites weights in place, which a repacked CPU weight cannot take.
+    model_manager->set_cpu_repack_allowed(!apply_lora_immediately);
 
     bool needs_writable_mmap = enable_mmap && apply_lora_immediately;
     model_manager->set_writable_mmap(needs_writable_mmap);
