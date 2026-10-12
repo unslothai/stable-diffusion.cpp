@@ -1126,7 +1126,6 @@ namespace Rope {
         return x_out;
     }
 
-    // SD_FUSED_ROPE_ATTN=0 turns the fused attention prologue below off.
     __STATIC_INLINE__ bool fused_rope_attention_enabled() {
         static const bool enabled = [] {
             const char* e = getenv("SD_FUSED_ROPE_ATTN");
@@ -1135,11 +1134,9 @@ namespace Rope {
         return enabled;
     }
 
-    // Flash attention with the RoPE, head-major relayout, kv scale and F16 cast of q/k/v done by one
-    // ggml_rope_pe_permute op per tensor, instead of RoPE + relayout, then scale, then cast (k), and
-    // relayout, scale, cast (v). Same values as the unfused flash path: the op rounds each product,
-    // the sum, the scale and the conversion separately, exactly like ggml_rope_apply -> ggml_scale ->
-    // ggml_cpy. GPU backends only (CUDA / HIP); returns nullptr when it does not apply.
+    // Fuses RoPE, relayout, kv scale and F16 cast into ggml_rope_pe_permute; must match the unfused
+    // flash path bit for bit (same rounding order as ggml_rope_apply -> ggml_scale -> ggml_cpy).
+    // CUDA / HIP only; SD_FUSED_ROPE_ATTN=0 disables; returns nullptr when it does not apply.
     __STATIC_INLINE__ ggml_tensor* attention_fused_rope(GGMLRunnerContext* ctx,
                                                         ggml_tensor* q,
                                                         ggml_tensor* k,
@@ -1152,13 +1149,11 @@ namespace Rope {
         return nullptr;
 #else
         auto backend = ctx->backend;
-        // the same attention-scale override ggml_ext_attention_ext(GGMLRunnerContext*, ...) applies
-        // (it keeps large k/v finite in F16), so both paths compute identical values
+        // same attn_scale override as ggml_ext_attention_ext: keeps large k/v finite in F16
         if (ctx->attn_scale > 0.f) {
             kv_scale = ctx->attn_scale;
         }
-        // Interleaved pairing only: the non-interleaved form of ggml_rope_apply reads two of the four table
-        // entries, so it matches the fused op only for exact rotation tables.
+        // interleaved only: non-interleaved ggml_rope_apply reads 2 of 4 table entries, so it would differ
         if (!rope_interleaved || !ctx->flash_attn_enabled || ctx->sage_attn_enabled || backend == nullptr ||
             sd_backend_is_cpu(backend) || !fused_rope_attention_enabled()) {
             return nullptr;
@@ -1191,7 +1186,7 @@ namespace Rope {
             !ggml_backend_supports_op(backend, v_hm)) {
             return nullptr;
         }
-        // [d_head, L, heads, N] -> [d_head, L, heads * N], the shapes the unfused path hands flash attention
+        // [d_head, L, heads, N] -> [d_head, L, heads * N], as the unfused path
         q_hm = ggml_reshape_3d(gctx, q_hm, d_head, L, q->ne[1] * N);
         k_hm = ggml_reshape_3d(gctx, k_hm, d_head, L, k->ne[1] * N);
         v_hm = ggml_reshape_3d(gctx, v_hm, d_head, L, v->ne[1] * N);

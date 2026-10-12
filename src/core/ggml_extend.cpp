@@ -451,8 +451,7 @@ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
     if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
-        // ggml_conv_2d, except that the final [OC, N] -> [N, OC] relayout is skipped when it moves no data
-        // (a batch of one, every VAE decode and most U-Net steps): same values, one full copy fewer per conv.
+        // ggml_conv_2d, but skips the final [OC, N] -> [N, OC] relayout when N == 1 (no data moves).
         ggml_tensor* im2col = ggml_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1, true,
                                           w->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16);  // [N, OH, OW, IC * KH * KW]
         ggml_tensor* out    = ggml_mul_mat(ctx,
@@ -852,7 +851,6 @@ ggml_tensor* ggml_ext_attention_prepared(ggml_context* ctx,
     float scale = (1.0f / sqrt((float)d_head));
 
     if (mask != nullptr) {
-        // same mask preparation as ggml_ext_attention_ext's flash path
         if (mask->ne[1] != L_q) {
             mask = ggml_repeat(ctx, mask, ggml_new_tensor_4d(ctx, mask->type, mask->ne[0], L_q, mask->ne[2], mask->ne[3]));
         }
