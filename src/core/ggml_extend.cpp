@@ -212,7 +212,11 @@ ggml_tensor* ggml_ext_linear_matmul(ggml_context* ctx,
                                     ggml_tensor* w,
                                     bool force_prec_f32) {
     if (sd_weight_may_be_cpu_repacked(w) && w->ne[2] == 1 && w->ne[3] == 1) {
-        // Repacked CPU matmuls (AMX, CPU_REPACK) get batch dims wrong: feed contiguous 2D rows.
+        // Repacked CPU matmuls (AMX, CPU_REPACK) get batch dims wrong and only take F32 activations
+        // (the type sd_cpu_repack_buffer_type_for probes with): feed contiguous 2D F32 rows.
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F32);
+        }
         if (!ggml_is_contiguous(x)) {
             x = ggml_cont(ctx, x);
         }
