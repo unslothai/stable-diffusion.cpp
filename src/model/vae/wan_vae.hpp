@@ -147,14 +147,15 @@ namespace WAN {
         using Conv2d::Conv2d;
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            // With T == 1 or C == 1 this swap moves no data, so ggml_ext_cont keeps the view (no copy).
             ggml_tensor* x_swapped = ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2);
-            x_swapped              = ggml_cont(ctx->ggml_ctx, x_swapped);
+            x_swapped              = ggml_ext_cont(ctx->ggml_ctx, x_swapped);
 
             ggml_tensor* out = Conv2d::forward(ctx, x_swapped);
 
             ggml_tensor* out_swapped = ggml_permute(ctx->ggml_ctx, out, 0, 1, 3, 2);
 
-            out_swapped = ggml_cont(ctx->ggml_ctx, out_swapped);
+            out_swapped = ggml_ext_cont(ctx->ggml_ctx, out_swapped);
 
             return out_swapped;
         }

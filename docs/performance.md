@@ -156,3 +156,17 @@ Use `--params-backend diffusion=disk` instead when reducing system RAM residency
 ## Use quantization to reduce memory usage.
 
 [quantization](./quantization_and_gguf.md)
+
+## Fused DiT and VAE kernels (CUDA)
+
+With the fork's ggml patches (`scripts/unsloth/ggml-patches/0007-ggml-cuda-generic-dit-vae.patch`) these run by
+default on CUDA. Each gives the same output bit for bit as the ops it replaces, and each has a switch (`=0` turns it off):
+
+| what | families | switch |
+|---|---|---|
+| Shared DiT attention (`Rope::attention`, flash attention on): RoPE, head-major relayout, kv scale and F16 cast of q / k / v in one op per tensor | FLUX.1, FLUX.2, Chroma, Z-Image, Qwen-Image, Wan, and the other DiTs using `Rope::attention` | `SD_FUSED_ROPE_ATTN` |
+| GroupNorm spread over the whole GPU, fused with the per-channel affine and the SiLU after it | SD 1.x / SDXL U-Net, every KL VAE decode (SD, SDXL, FLUX, Z-Image, Chroma) | `GGML_CUDA_GROUP_NORM_PAR` |
+| Channel RMS norm of the Wan-style VAE computed in place, without the two relayout copies around it (large layers only, so mostly untiled decodes; `=2` forces it at every size) | Qwen-Image, Qwen-Image-2.1, Wan VAE | `GGML_CUDA_NORM_CHANNEL` |
+| `x*s + y (+ z)` elementwise chains (adaLN modulate, gated residual) in one pass | most DiTs | `GGML_CUDA_FUSE_MUL_ADD` |
+
+Convolutions on a batch of one (and the Wan VAE's single-frame 2D convolutions) also skip relayout copies that move no data.

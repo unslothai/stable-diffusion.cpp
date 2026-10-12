@@ -1,0 +1,1133 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 41ac28bb..fa83c5e6 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2576,6 +2576,14 @@ extern "C" {
+     // ggml_rope_pe_permute of ggml_rms_norm(a, eps) (no weight): every head row of `a` is
+     // RMS-normalised first, with the same arithmetic as GGML_OP_RMS_NORM on the same backend, so
+     // the result matches the two-op chain bit for bit where the backend supports it.
++    // ggml_rope_pe_permute (or _rms) with interleaved pairing: rotated element i < n_rot pairs
++    // a[2*j] with a[2*j + 1] (j = i / 2, r = i % 2): y = a[2*j]*pe[0, r, j, t] + a[2*j + 1]*pe[1, r, j, t],
++    // the pairing ggml_rope_apply(interleaved = true) uses, with the same rounding (bit-identical
++    // to ggml_rope_apply -> ggml_scale -> ggml_cpy). Returns `t` (a ggml_rope_pe_permute result).
++    GGML_API struct ggml_tensor * ggml_rope_pe_permute_set_interleaved(
++            struct ggml_tensor  * t,
++            bool                  interleaved);
++
+     GGML_API struct ggml_tensor * ggml_rope_pe_permute_rms(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index bdd36aea..2883f5df 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -12397,6 +12397,7 @@ void ggml_compute_forward_rope_pe_permute(
+     const float scale = ggml_get_op_params_f32(dst, 1);
+     const bool  norm  = ggml_get_op_params_i32(dst, 2) != 0;
+     const float eps   = ggml_get_op_params_f32(dst, 3);
++    const bool  inter = ggml_get_op_params_i32(dst, 4) != 0;
+     const int   half  = n_rot / 2;
+ 
+     const int64_t D = src0->ne[0];
+@@ -12435,17 +12436,28 @@ void ggml_compute_forward_rope_pe_permute(
+ 
+         if (n_rot > 0) {
+             const float * t = (const float *) pe->data + l * (int64_t) half * 4;
+-            for (int i = 0; i < n_rot; ++i) {
+-                const int r = i / half;
+-                const int j = i - r * half;
+-                p0[i]       = x[j] * t[4 * j + 2 * r + 0];
+-            }
+-            for (int i = 0; i < n_rot; ++i) {
+-                const int r = i / half;
+-                const int j = i - r * half;
+-                p1[i]       = x[j + half] * t[4 * j + 2 * r + 1];
++            if (inter) {
++                // the expression ggml_compute_forward_rope_apply (interleaved) evaluates, so the compiler
++                // contracts it (or not) the same way and the two ops stay bit-identical on this backend
++                for (int j = 0; j < half; ++j) {
++                    const float a    = x[2 * j];
++                    const float b    = x[2 * j + 1];
++                    y[2 * j]         = a*t[4 * j + 0] + b*t[4 * j + 1];
++                    y[2 * j + 1]     = a*t[4 * j + 2] + b*t[4 * j + 3];
++                }
++            } else {
++                for (int i = 0; i < n_rot; ++i) {
++                    const int r = i / half;
++                    const int j = i - r * half;
++                    p0[i]       = x[j] * t[4 * j + 2 * r + 0];
++                }
++                for (int i = 0; i < n_rot; ++i) {
++                    const int r = i / half;
++                    const int j = i - r * half;
++                    p1[i]       = x[j + half] * t[4 * j + 2 * r + 1];
++                }
++                ggml_vec_add_f32(n_rot, y.data(), p0.data(), p1.data());
+             }
+-            ggml_vec_add_f32(n_rot, y.data(), p0.data(), p1.data());
+         }
+         if (D > n_rot) {
+             memcpy(y.data() + n_rot, x + n_rot, (D - n_rot) * sizeof(float));
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 831d0de8..8f4e6f3d 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -37,6 +37,9 @@
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
++#include "ggml-cuda/group-norm-par.cuh"
++#include "ggml-cuda/norm-channel.cuh"
++#include "ggml-cuda/mul-add-fused.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+ #include "ggml-cuda/opt-step-sgd.cuh"
+ #include "ggml-cuda/out-prod.cuh"
+@@ -4313,6 +4316,106 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
+     return consumed;
+ }
+ 
++// GROUP_NORM -> MUL(w) -> ADD(b) [-> SILU] with w, b per channel ([1, 1, C, 1], F32, contiguous): the
++// shape ggml_ext_group_norm-style VAE / U-Net code builds. Returns the number of extra nodes consumed.
++static int ggml_cuda_try_fuse_group_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor * gn = cgraph->nodes[i];
++    if (gn->op != GGML_OP_GROUP_NORM || !ggml_cuda_group_norm_par_supported(gn)) {
++        return 0;
++    }
++    // the per-channel operands are usually reshaped 1-D weights; their RESHAPE nodes sit between the
++    // ops of the chain, so step over view nodes that do not read the chain itself
++    auto next_op = [&](int from, const ggml_tensor * prev) {
++        for (int j = from + 1; j < cgraph->n_nodes; ++j) {
++            const ggml_tensor * n = cgraph->nodes[j];
++            const bool view = n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE ||
++                              n->op == GGML_OP_TRANSPOSE;
++            if (view && n->src[0] != prev && n->view_src != prev) {
++                continue;
++            }
++            return j;
++        }
++        return -1;
++    };
++    const int i_mul = next_op(i, gn);
++    const int i_add = i_mul < 0 ? -1 : next_op(i_mul, cgraph->nodes[i_mul]);
++    if (i_add < 0) {
++        return 0;
++    }
++    int idx[4] = { i, i_mul, i_add, -1 };
++    const enum ggml_op ops[4] = { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY };
++    // ggml_can_fuse_ext minus its view rule: sd.cpp's in-place MUL/ADD/SILU are views of the GROUP_NORM
++    // result, every reader of that memory is a counted chain use, and the fused kernel writes the same values.
++    auto chain_ok = [&](int n) {
++        for (int k = 0; k < n; ++k) {
++            const ggml_tensor * node = cgraph->nodes[idx[k]];
++            if (node->op != ops[k] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++                return false;
++            }
++            if (k == 0 ? node->view_src != nullptr
++                       : node->view_src != nullptr && (node->view_src != gn || node->view_offs != 0 || node->data != gn->data)) {
++                return false;
++            }
++            if (k < n - 1 && (ggml_node_get_use_count(cgraph, idx[k]) != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT))) {
++                return false;
++            }
++            if (k > 0) {
++                const ggml_tensor * prev = cgraph->nodes[idx[k - 1]];
++                if ((node->src[0] != prev && node->src[1] != prev) || !ggml_are_same_shape(node, prev)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    };
++    if (!chain_ok(3)) {
++        return 0;
++    }
++    ggml_tensor * mul = cgraph->nodes[i_mul];
++    ggml_tensor * add = cgraph->nodes[i_add];
++    const ggml_tensor * w = mul->src[0] == gn ? mul->src[1] : mul->src[0];
++    const ggml_tensor * b = add->src[0] == mul ? add->src[1] : add->src[0];
++    const int64_t C = gn->ne[2];
++    auto per_channel = [&](const ggml_tensor * t) {
++        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 1 && t->ne[1] == 1 &&
++               t->ne[2] == C && t->ne[3] == 1;
++    };
++    if (!per_channel(w) || !per_channel(b) || mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(mul) || !ggml_is_contiguous(add)) {
++        return 0;
++    }
++    int n_fused = 3;
++    const int i_u = next_op(i_add, add);
++    if (i_u > 0) {
++        const ggml_tensor * u = cgraph->nodes[i_u];
++        idx[3] = i_u;
++        if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SILU && u->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(u) && chain_ok(4)) {
++            n_fused = 4;
++        }
++    }
++    ggml_tensor * out = cgraph->nodes[idx[n_fused - 1]];
++    // every node in [i, last] is either fused here or a view the loop would skip anyway
++    const int last = idx[n_fused - 1];
++    int out_nodes[] = { last };
++    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, last - i + 1, out_nodes, 1)) {
++        return 0;
++    }
++    // leaf sources skipped above: w/b must not overlap out; x only elementwise (x[j] read before out[j] written)
++    auto overlaps = [&](const ggml_tensor * t) {
++        const char * o0 = (const char *) out->data;
++        const char * t0 = (const char *) t->data;
++        return t0 < o0 + ggml_nbytes(out) && o0 < t0 + ggml_nbytes(t);
++    };
++    const ggml_tensor * x = gn->src[0];
++    if (overlaps(w) || overlaps(b) ||
++        (overlaps(x) && !(x->data == out->data && ggml_are_same_shape(x, out) && ggml_is_contiguous(x)))) {
++        return 0;
++    }
++    ggml_cuda_op_group_norm_par(ctx, gn, w, b, n_fused == 4, out);
++    return last - i;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -4322,6 +4425,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if (node->op == GGML_OP_GROUP_NORM) {
++        const int consumed = ggml_cuda_try_fuse_group_norm(*cuda_ctx, cgraph, i);
++        if (consumed > 0) {
++            return consumed;
++        }
++    }
++
++    if (node->op == GGML_OP_CONT) {
++        const int consumed = ggml_cuda_try_fuse_rms_norm_channel(*cuda_ctx, cgraph, i);
++        if (consumed > 0) {
++            return consumed;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+@@ -4334,6 +4451,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    if (node->op == GGML_OP_MUL) {
++        const int consumed = ggml_cuda_try_fuse_mul_add(*cuda_ctx, cgraph, i);
++        if (consumed > 0) {
++            return consumed;
++        }
++    }
++
+     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+     if (node->op == GGML_OP_GATED_DELTA_NET) {
+         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+diff --git a/src/ggml-cuda/group-norm-par.cu b/src/ggml-cuda/group-norm-par.cu
+new file mode 100644
+index 00000000..dbc652df
+--- /dev/null
++++ b/src/ggml-cuda/group-norm-par.cu
+@@ -0,0 +1,174 @@
++#include "group-norm-par.cuh"
++#include "unary.cuh"
++
++// The stock group_norm_f32<1024> runs one 1024-thread block per group, so a VAE decode with 32
++// groups keeps 32 SMs busy and walks the group three times (sum, centred sum of squares, scale),
++// then the affine and the SiLU are three more full passes. Here the same reductions run spread over
++// the GPU without changing a single rounding:
++//   - thread t (0..1023) of the stock block sums x[g*G + t + 1024*k] in increasing k; each such
++//     chain is computed whole by one thread here too, 32 consecutive t per warp, so the warp sums
++//     (xor butterfly) are the same values the stock kernel writes to shared memory;
++//   - the 32 warp sums are combined by the same warp butterfly (stock: warp lanes read shared[lane]);
++//   - mean = sum / G and the centred pass use the same expressions, then scale = rsqrtf(var + eps);
++//   - y = (x - mean) * scale, then * w, + b, then silu, each rounded separately as in the
++//     unfused MUL / ADD / UNARY kernels.
++// Kernels: partial sums, partial centred squares, per-group stats, one elementwise apply pass.
++
++static constexpr int GN_PAR_THREADS = 1024; // the stock block size whose arithmetic is reproduced
++static constexpr int GN_PAR_WARPS   = GN_PAR_THREADS / WARP_SIZE;
++static constexpr int GN_PAR_WPB     = 4;    // warps per block in the reduction kernels
++
++bool ggml_cuda_group_norm_par_enabled() {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    return false;  // warp size / reduction differ from what is reproduced here
++#else
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_GROUP_NORM_PAR");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled && WARP_SIZE == 32;
++#endif
++}
++
++static int64_t gn_par_group_size(const ggml_tensor * gn) {
++    const ggml_tensor * src0       = gn->src[0];
++    const int           num_groups = gn->op_params[0];
++    return src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
++}
++
++bool ggml_cuda_group_norm_par_supported(const ggml_tensor * gn) {
++    if (!ggml_cuda_group_norm_par_enabled() || gn->op != GGML_OP_GROUP_NORM) {
++        return false;
++    }
++    const ggml_tensor * src0 = gn->src[0];
++    if (src0->type != GGML_TYPE_F32 || gn->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(gn)) {
++        return false;
++    }
++    const int64_t group_size = gn_par_group_size(gn);
++    // the stock kernel uses its 1024-thread variant only from 1024 elements per group; it indexes with int
++    return group_size >= GN_PAR_THREADS && ggml_nelements(src0) < INT_MAX;
++}
++
++// one warp per (group, chain block of 32 threads): sum of x over the warp's 32 chains
++static __global__ void gn_par_sum(const float * __restrict__ x, float * __restrict__ part, const int group_size,
++                                  const int ne_elements) {
++    const int g    = blockIdx.x;
++    const int w    = blockIdx.y * GN_PAR_WPB + threadIdx.x / WARP_SIZE;
++    const int t    = w * WARP_SIZE + threadIdx.x % WARP_SIZE;
++    const int start = g * group_size + t;
++    const int end   = min(g * group_size + group_size, ne_elements);
++    float tmp = 0.0f;
++    for (int j = start; j < end; j += GN_PAR_THREADS) {
++        tmp += x[j];
++    }
++    tmp = warp_reduce_sum(tmp);
++    if (threadIdx.x % WARP_SIZE == 0) {
++        part[g * GN_PAR_WARPS + w] = tmp;
++    }
++}
++
++static __device__ __forceinline__ float gn_par_combine(const float * part, const int g) {
++    // stock: lanes read shared_vals[lane] (one value per warp) and reduce
++    return warp_reduce_sum(part[g * GN_PAR_WARPS + threadIdx.x % WARP_SIZE]);
++}
++
++static __global__ void gn_par_sqdev(const float * __restrict__ x, const float * __restrict__ part, float * __restrict__ part2,
++                                    const int group_size, const int ne_elements) {
++    const int g    = blockIdx.x;
++    const int w    = blockIdx.y * GN_PAR_WPB + threadIdx.x / WARP_SIZE;
++    const int t    = w * WARP_SIZE + threadIdx.x % WARP_SIZE;
++    const int start = g * group_size + t;
++    const int end   = min(g * group_size + group_size, ne_elements);
++
++    float tmp = gn_par_combine(part, g);
++    const float mean = tmp / group_size;
++    tmp = 0.0f;
++    for (int j = start; j < end; j += GN_PAR_THREADS) {
++        const float xi = x[j] - mean;
++        tmp += xi * xi;
++    }
++    tmp = warp_reduce_sum(tmp);
++    if (threadIdx.x % WARP_SIZE == 0) {
++        part2[g * GN_PAR_WARPS + w] = tmp;
++    }
++}
++
++static __global__ void gn_par_stats(const float * __restrict__ part, const float * __restrict__ part2, float2 * __restrict__ stats,
++                                    const int group_size, const float eps) {
++    const int g = blockIdx.x;
++    float tmp = gn_par_combine(part, g);
++    const float mean = tmp / group_size;
++    tmp = gn_par_combine(part2, g);
++    const float variance = tmp / group_size;
++    const float scale    = rsqrtf(variance + eps);
++    if (threadIdx.x == 0) {
++        stats[g] = make_float2(mean, scale);
++    }
++}
++
++template <bool affine, bool silu>
++static __global__ void gn_par_apply(const float * x, const float2 * __restrict__ stats, const float * __restrict__ w,
++                                    const float * __restrict__ b, float * dst, const int64_t ne_elements,
++                                    const int group_size, const int64_t plane, const int64_t channels) {
++    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
++    for (int64_t j = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; j < ne_elements; j += stride) {
++        const float2 st = stats[j / group_size];
++        float y = __fmul_rn(__fsub_rn(x[j], st.x), st.y);
++        if constexpr (affine) {
++            const int64_t c = (j / plane) % channels;
++            y = __fmul_rn(y, w[c]);
++            y = __fadd_rn(y, b[c]);
++        }
++        if constexpr (silu) {
++            y = ggml_cuda_op_silu_single(y);
++        }
++        dst[j] = y;
++    }
++}
++
++void ggml_cuda_op_group_norm_par(ggml_backend_cuda_context & ctx, const ggml_tensor * gn, const ggml_tensor * w,
++                                 const ggml_tensor * b, bool silu, ggml_tensor * out) {
++    const ggml_tensor * src0 = gn->src[0];
++    const float * x = (const float *) src0->data;
++    float * dst = (float *) out->data;
++    cudaStream_t stream = ctx.stream();
++
++    const int num_groups = gn->op_params[0];
++    float eps;
++    memcpy(&eps, gn->op_params + 1, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
++
++    const int group_size  = (int) gn_par_group_size(gn);
++    const int ne_elements = (int) ggml_nelements(src0);
++    const int n_groups    = num_groups * (int) src0->ne[3];
++
++    ggml_cuda_pool_alloc<float>  part(ctx.pool(), (size_t) n_groups * GN_PAR_WARPS);
++    ggml_cuda_pool_alloc<float>  part2(ctx.pool(), (size_t) n_groups * GN_PAR_WARPS);
++    ggml_cuda_pool_alloc<float2> stats(ctx.pool(), (size_t) n_groups);
++
++    const dim3 rgrid(n_groups, GN_PAR_WARPS / GN_PAR_WPB, 1);
++    const dim3 rblock(GN_PAR_WPB * WARP_SIZE, 1, 1);
++    gn_par_sum<<<rgrid, rblock, 0, stream>>>(x, part.get(), group_size, ne_elements);
++    gn_par_sqdev<<<rgrid, rblock, 0, stream>>>(x, part.get(), part2.get(), group_size, ne_elements);
++    gn_par_stats<<<n_groups, WARP_SIZE, 0, stream>>>(part.get(), part2.get(), stats.get(), group_size, eps);
++
++    const int     threads = 256;
++    const int64_t want    = ((int64_t) ne_elements + threads - 1) / threads;
++    const int     blocks  = (int) std::min<int64_t>(want, (int64_t) ggml_cuda_info().devices[ctx.device].nsm * 32);
++    const int64_t plane   = src0->ne[0] * src0->ne[1];
++    const float * wd = w ? (const float *) w->data : nullptr;
++    const float * bd = b ? (const float *) b->data : nullptr;
++    if (w) {
++        if (silu) {
++            gn_par_apply<true, true><<<blocks, threads, 0, stream>>>(x, stats.get(), wd, bd, dst, ne_elements, group_size, plane, src0->ne[2]);
++        } else {
++            gn_par_apply<true, false><<<blocks, threads, 0, stream>>>(x, stats.get(), wd, bd, dst, ne_elements, group_size, plane, src0->ne[2]);
++        }
++    } else {
++        if (silu) {
++            gn_par_apply<false, true><<<blocks, threads, 0, stream>>>(x, stats.get(), wd, bd, dst, ne_elements, group_size, plane, src0->ne[2]);
++        } else {
++            gn_par_apply<false, false><<<blocks, threads, 0, stream>>>(x, stats.get(), wd, bd, dst, ne_elements, group_size, plane, src0->ne[2]);
++        }
++    }
++}
+diff --git a/src/ggml-cuda/group-norm-par.cuh b/src/ggml-cuda/group-norm-par.cuh
+new file mode 100644
+index 00000000..eb6298ea
+--- /dev/null
++++ b/src/ggml-cuda/group-norm-par.cuh
+@@ -0,0 +1,15 @@
++#pragma once
++#include "common.cuh"
++
++// Parallel GROUP_NORM with the stock kernel's exact arithmetic, optionally fused with the
++// per-channel affine (MUL by w, ADD of b, both [1, 1, C, 1]) and a SiLU that follow it in the graph.
++// Returns false (nothing launched) when the inputs are outside what it handles; the caller then
++// runs the stock ops. GGML_CUDA_GROUP_NORM_PAR=0 turns it off.
++bool ggml_cuda_group_norm_par_enabled();
++
++bool ggml_cuda_group_norm_par_supported(const ggml_tensor * gn);
++
++// gn: the GROUP_NORM node; w / b: affine operands or nullptr; silu: apply SiLU; out: the tensor
++// that receives the result (the last fused node).
++void ggml_cuda_op_group_norm_par(ggml_backend_cuda_context & ctx, const ggml_tensor * gn, const ggml_tensor * w,
++                                 const ggml_tensor * b, bool silu, ggml_tensor * out);
+diff --git a/src/ggml-cuda/mul-add-fused.cu b/src/ggml-cuda/mul-add-fused.cu
+new file mode 100644
+index 00000000..29484ce4
+--- /dev/null
++++ b/src/ggml-cuda/mul-add-fused.cu
+@@ -0,0 +1,172 @@
++#include "mul-add-fused.cuh"
++#include "ggml-impl.h"
++
++static bool mul_add_fusion_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_FUSE_MUL_ADD");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++struct mad_operand {
++    const float * p;
++    int64_t ne[4];
++    int64_t nb[4]; // in elements
++};
++
++static __device__ __forceinline__ const float * mad_row(const mad_operand & o, const int64_t i1, const int64_t i2, const int64_t i3) {
++    return o.p + (o.ne[1] == 1 ? 0 : i1 * o.nb[1]) + (o.ne[2] == 1 ? 0 : i2 * o.nb[2]) + (o.ne[3] == 1 ? 0 : i3 * o.nb[3]);
++}
++
++static __device__ __forceinline__ float mad_at(const float * row, const mad_operand & o, const int64_t i0) {
++    return row[o.ne[0] == 1 ? 0 : i0 * o.nb[0]];
++}
++
++// one block per output row; y = (a*b) + c [+ d], b, c, d broadcast like binbcast (dims of size 1)
++template <bool has_d>
++static __global__ void mul_add_fused_f32(const mad_operand a, const mad_operand b, const mad_operand c, const mad_operand d,
++                                         float * __restrict__ dst, const int64_t ne0, const int64_t ne1, const int64_t ne2) {
++    const int64_t r  = blockIdx.x;
++    const int64_t i1 = r % ne1;
++    const int64_t i2 = (r / ne1) % ne2;
++    const int64_t i3 = r / (ne1 * ne2);
++    const float * ra = mad_row(a, i1, i2, i3);
++    const float * rb = mad_row(b, i1, i2, i3);
++    const float * rc = mad_row(c, i1, i2, i3);
++    const float * rd = has_d ? mad_row(d, i1, i2, i3) : nullptr;
++    float * out = dst + r * ne0;
++    for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
++        float y = __fmul_rn(mad_at(ra, a, i0), mad_at(rb, b, i0));
++        y = __fadd_rn(y, mad_at(rc, c, i0));
++        if constexpr (has_d) {
++            y = __fadd_rn(y, mad_at(rd, d, i0));
++        }
++        out[i0] = y;
++    }
++}
++
++static bool mad_ok_operand(const ggml_tensor * t, const ggml_tensor * out) {
++    if (t == nullptr || t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
++        return false;
++    }
++    for (int k = 0; k < 4; ++k) {
++        if (t->ne[k] != out->ne[k] && t->ne[k] != 1) {
++            return false;
++        }
++        if (t->nb[k] % sizeof(float) != 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static mad_operand mad_make(const ggml_tensor * t) {
++    mad_operand o;
++    o.p = (const float *) t->data;
++    for (int k = 0; k < 4; ++k) {
++        o.ne[k] = t->ne[k];
++        o.nb[k] = t->nb[k] / (int64_t) sizeof(float);
++    }
++    return o;
++}
++
++static bool mad_is_skippable_view(const ggml_tensor * n, const ggml_tensor * prev) {
++    const bool view = n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
++    return view && n->src[0] != prev && n->view_src != prev;
++}
++
++int ggml_cuda_try_fuse_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (!mul_add_fusion_enabled()) {
++        return 0;
++    }
++    ggml_tensor * mul = cgraph->nodes[i];
++    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || !ggml_node_has_n_uses(cgraph, i, 1)) {
++        return 0;
++    }
++    auto next_op = [&](int from) {
++        for (int j = from + 1; j < cgraph->n_nodes; ++j) {
++            if (!mad_is_skippable_view(cgraph->nodes[j], cgraph->nodes[from])) {
++                return j;
++            }
++        }
++        return -1;
++    };
++    // the full-shape factor goes first so the output shape is the MUL's shape
++    const ggml_tensor * a = mul->src[0];
++    const ggml_tensor * b = mul->src[1];
++    if (!ggml_are_same_shape(a, mul)) {
++        std::swap(a, b);
++    }
++    if (!ggml_are_same_shape(a, mul) || !mad_ok_operand(a, mul) || !mad_ok_operand(b, mul)) {
++        return 0;
++    }
++    const int i_add = next_op(i);
++    if (i_add < 0) {
++        return 0;
++    }
++    ggml_tensor * add = cgraph->nodes[i_add];
++    // under ggml_build_forward_select only GGML_TENSOR_FLAG_COMPUTE nodes run: never fuse an inactive node
++    if (add->op != GGML_OP_ADD || (add->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || add->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(add) || !ggml_are_same_shape(add, mul) || (add->src[0] != mul && add->src[1] != mul)) {
++        return 0;
++    }
++    const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
++    if (c == mul || !mad_ok_operand(c, add)) {
++        return 0;
++    }
++    int last = i_add;
++    const ggml_tensor * d = nullptr;
++    if (ggml_node_has_n_uses(cgraph, i_add, 1)) {
++        const int i_add2 = next_op(i_add);
++        if (i_add2 > 0) {
++            ggml_tensor * add2 = cgraph->nodes[i_add2];
++            if (add2->op == GGML_OP_ADD && (add2->flags & GGML_TENSOR_FLAG_COMPUTE) && add2->type == GGML_TYPE_F32 && ggml_is_contiguous(add2) && ggml_are_same_shape(add2, add) &&
++                (add2->src[0] == add || add2->src[1] == add)) {
++                const ggml_tensor * dd = add2->src[0] == add ? add2->src[1] : add2->src[0];
++                if (dd != add && dd != mul && mad_ok_operand(dd, add2)) {
++                    d    = dd;
++                    last = i_add2;
++                }
++            }
++        }
++    }
++    for (int j = i + 1; j < last; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (j != i_add && !(n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE)) {
++            return 0;
++        }
++    }
++    ggml_tensor * out = cgraph->nodes[last];
++    // the output may only alias the elementwise inputs at the same element (in-place adds)
++    auto overlaps = [&](const ggml_tensor * t) {
++        if (t == nullptr || t->data == nullptr) {
++            return false;
++        }
++        const char * o0 = (const char *) out->data;
++        const char * o1 = o0 + ggml_nbytes(out);
++        const char * t0 = (const char *) t->data;
++        const char * t1 = t0 + ggml_nbytes(t);
++        return t0 < o1 && o0 < t1;
++    };
++    auto same_layout = [&](const ggml_tensor * t) {
++        return t->data == out->data && ggml_are_same_shape(t, out) && ggml_is_contiguous(t);
++    };
++    for (const ggml_tensor * t : { a, b, c, d }) {
++        if (overlaps(t) && !same_layout(t)) {
++            return 0;
++        }
++    }
++    const int64_t nrows = ggml_nrows(out);
++    if (nrows > INT_MAX) {
++        return 0;
++    }
++    const int threads = (int) std::min<int64_t>(256, std::max<int64_t>(32, (out->ne[0] + 31) / 32 * 32));
++    const mad_operand oa = mad_make(a), ob = mad_make(b), oc = mad_make(c), od = d ? mad_make(d) : oc;
++    if (d) {
++        mul_add_fused_f32<true><<<(unsigned int) nrows, threads, 0, ctx.stream()>>>(oa, ob, oc, od, (float *) out->data, out->ne[0], out->ne[1], out->ne[2]);
++    } else {
++        mul_add_fused_f32<false><<<(unsigned int) nrows, threads, 0, ctx.stream()>>>(oa, ob, oc, od, (float *) out->data, out->ne[0], out->ne[1], out->ne[2]);
++    }
++    return last - i;
++}
+diff --git a/src/ggml-cuda/mul-add-fused.cuh b/src/ggml-cuda/mul-add-fused.cuh
+new file mode 100644
+index 00000000..8d9752ca
+--- /dev/null
++++ b/src/ggml-cuda/mul-add-fused.cuh
+@@ -0,0 +1,8 @@
++#pragma once
++#include "common.cuh"
++
++// MUL -> ADD [-> ADD] chains of F32 elementwise ops with broadcast operands (adaLN modulate
++// x + x*scale (+ shift), gated residual r + y*gate): one pass instead of two or three, each
++// product and sum still rounded separately (bit-identical to the unfused MUL / ADD kernels).
++// Returns the number of extra nodes consumed. GGML_CUDA_FUSE_MUL_ADD=0 turns it off.
++int ggml_cuda_try_fuse_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+diff --git a/src/ggml-cuda/norm-channel.cu b/src/ggml-cuda/norm-channel.cu
+new file mode 100644
+index 00000000..c1a8819d
+--- /dev/null
++++ b/src/ggml-cuda/norm-channel.cu
+@@ -0,0 +1,259 @@
++#include "norm-channel.cuh"
++#include "ggml-impl.h"
++
++// The unfused RMS_NORM over rows of C < 1024 channels runs rms_norm_f32<256> (1024 threads from 1024
++// channels; that tree is reproduced too) (or the narrow-block
++// variant, documented bit-identical to it): thread t sums squares of columns t, t+256, ... (in that
++// order), each warp reduces its 32 partials with the xor butterfly, and the 8 warp sums plus 24 zero
++// partials are reduced by the same butterfly. Here one thread owns one spatial position (so loads
++// across a warp are contiguous) and evaluates exactly that reduction tree in registers.
++
++static bool norm_channel_enabled() {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    return false;
++#else
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_NORM_CHANNEL");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled && WARP_SIZE == 32;
++#endif
++}
++
++// GGML_CUDA_NORM_CHANNEL=2 fuses at every size (tests); by default only where it beats the unfused chain.
++static bool norm_channel_forced() {
++    static const bool forced = [] {
++        const char * e = getenv("GGML_CUDA_NORM_CHANNEL");
++        return e != nullptr && atoi(e) == 2;
++    }();
++    return forced;
++}
++
++static __device__ __forceinline__ float nc_butterfly32(float * v) {
++    // value every lane holds after warp_reduce_sum: lane l adds lane l^off at each step
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++#pragma unroll
++        for (int l = 0; l < off; ++l) {
++            v[l] = v[l] + v[l + off];
++        }
++    }
++    return v[0];
++}
++
++// BLOCK: the thread count of the rms_norm_f32 launch this reproduces (256 below 1024 columns, else 1024)
++template <int BLOCK>
++static __global__ void rms_norm_channel_f32(const float * x, const float * __restrict__ w, float * dst,
++                                            const int C, const int64_t P, const int64_t inner, const float eps) {
++    const int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (q >= P) {
++        return;
++    }
++    // position q = (outer index, inner index); its channel c sits at base + c*inner
++    const int64_t p = (q / inner) * inner * C + q % inner;
++    const float * xp = x + p;
++    float wsum[32];
++#pragma unroll
++    for (int i = 0; i < 32; ++i) {
++        wsum[i] = 0.0f;
++    }
++#pragma unroll 1
++    for (int wi = 0; wi < BLOCK / 32; ++wi) {
++        float lane[32];
++#pragma unroll
++        for (int l = 0; l < 32; ++l) {
++            float tmp = 0.0f;
++            for (int col = wi * 32 + l; col < C; col += BLOCK) {
++                const float xi = xp[(int64_t) col * inner];
++                tmp += xi * xi;
++            }
++            lane[l] = tmp;
++        }
++        wsum[wi] = nc_butterfly32(lane);
++    }
++    const float tmp   = nc_butterfly32(wsum);
++    const float mean  = tmp / C;
++    const float scale = rsqrtf(mean + eps);
++    for (int col = 0; col < C; ++col) {
++        dst[p + (int64_t) col * inner] = scale * xp[(int64_t) col * inner] * w[col];
++    }
++}
++
++static bool nc_debug() {
++    static const bool on = getenv("GGML_CUDA_NORM_CHANNEL_DEBUG") != nullptr;
++    return on;
++}
++#define NC_REJECT(why) do { if (nc_debug()) { GGML_LOG_INFO("norm-channel: node %d (%s) rejected: %s\n", i, cont1->name, why); } return 0; } while (0)
++
++static bool is_view_op(const ggml_tensor * t) {
++    return t->op == GGML_OP_PERMUTE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE;
++}
++
++int ggml_cuda_try_fuse_rms_norm_channel(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (!norm_channel_enabled()) {
++        return 0;
++    }
++    // node i: CONT whose source is a permuted view of a contiguous F32 x: cont[c, a, b, d] = x[a, b, d, c]
++    ggml_tensor * cont1 = cgraph->nodes[i];
++    if (cont1->op != GGML_OP_CONT || cont1->type != GGML_TYPE_F32) {
++        return 0;
++    }
++    const ggml_tensor * pv = cont1->src[0];
++    if (pv == nullptr || pv->op != GGML_OP_PERMUTE || pv->type != GGML_TYPE_F32) {
++        return 0;
++    }
++    const ggml_tensor * x = pv->src[0];
++    if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || pv->view_offs != 0 || pv->data != x->data) {
++        NC_REJECT("check 1");
++    }
++    // pv dim 0 (the normalised axis) must be one axis k of x; the other axes may come in any order
++    const int64_t C = pv->ne[0];
++    int k = -1;
++    for (int m = 0; m < GGML_MAX_DIMS; ++m) {
++        if (x->ne[m] == C && x->nb[m] == pv->nb[0] && (k < 0 || x->ne[m] > 1)) {
++            k = m;
++        }
++    }
++    // map every pv axis j > 0 of size > 1 to the x axis it reads
++    int pv_from_x[GGML_MAX_DIMS] = { -1, -1, -1, -1 };
++    pv_from_x[0] = k;
++    bool layout_ok = k >= 0 && C >= 1 && ggml_nelements(pv) == ggml_nelements(x);
++    for (int j = 1; j < GGML_MAX_DIMS && layout_ok; ++j) {
++        if (pv->ne[j] == 1) {
++            continue;
++        }
++        for (int m = 0; m < GGML_MAX_DIMS; ++m) {
++            if (m != k && x->ne[m] == pv->ne[j] && x->nb[m] == pv->nb[j]) {
++                pv_from_x[j] = m;
++            }
++        }
++        layout_ok = pv_from_x[j] >= 0;
++    }
++    if (!layout_ok) {
++        NC_REJECT("check 2");
++    }
++    const int64_t inner = x->nb[k] / (int64_t) sizeof(float);   // elements below the channel axis
++    const int64_t P     = ggml_nelements(x) / C;                 // positions normalised independently
++    // then RMS_NORM(cont1) and MUL(rms, w[C]) in that order (views in between are skipped)
++    auto next_op = [&](int from) {
++        for (int j = from + 1; j < cgraph->n_nodes; ++j) {
++            if (!is_view_op(cgraph->nodes[j]) || cgraph->nodes[j]->src[0] == cgraph->nodes[from]) {
++                return j;
++            }
++        }
++        return -1;
++    };
++    const int i_rms = next_op(i);
++    if (i_rms < 0) {
++        NC_REJECT("check 3");
++    }
++    ggml_tensor * rms = cgraph->nodes[i_rms];
++    const int i_mul = next_op(i_rms);
++    if (i_mul < 0) {
++        NC_REJECT("check 4");
++    }
++    ggml_tensor * mul = cgraph->nodes[i_mul];
++    if (rms->op != GGML_OP_RMS_NORM) {
++        if (nc_debug()) { GGML_LOG_INFO("norm-channel: C=%lld next op %s (%s)\n", (long long) C, ggml_op_desc(rms), rms->name); }
++        NC_REJECT("check 5a");
++    }
++    // the CONT must only make the permuted view contiguous (a CONT_4D may reshape it)
++    if (!ggml_are_same_shape(cont1, pv)) {
++        NC_REJECT("check 5e");
++    }
++    if (rms->src[0] != cont1) {
++        NC_REJECT("check 5b");
++    }
++    if (mul->op != GGML_OP_MUL || mul->src[0] != rms) {
++        if (nc_debug()) { GGML_LOG_INFO("norm-channel: C=%lld after rms %s (%s)\n", (long long) C, ggml_op_desc(mul), mul->name); }
++        NC_REJECT("check 5c");
++    }
++    if (!ggml_node_has_n_uses(cgraph, i, 1) || !ggml_node_has_n_uses(cgraph, i_rms, 1) || !ggml_node_has_n_uses(cgraph, i_mul, 1)) {
++        NC_REJECT("check 5d");
++    }
++    const ggml_tensor * w = mul->src[1];
++    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != C || ggml_nelements(w) != C ||
++        mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, rms)) {
++        NC_REJECT("check 6");
++    }
++    // then PERMUTE(mul) back to x's layout and its CONT
++    const int i_pv2 = i_mul + 1;
++    if (i_pv2 + 1 >= cgraph->n_nodes) {
++        NC_REJECT("check 7");
++    }
++    ggml_tensor * pv2   = cgraph->nodes[i_pv2];
++    ggml_tensor * cont2 = cgraph->nodes[i_pv2 + 1];
++    bool back_ok = pv2->op == GGML_OP_PERMUTE && pv2->src[0] == mul && cont2->op == GGML_OP_CONT && cont2->src[0] == pv2 &&
++                   cont2->type == GGML_TYPE_F32 && ggml_are_same_shape(cont2, x) && ggml_are_same_shape(cont2, pv2) &&
++                   ggml_is_contiguous(cont2) && ggml_is_contiguous(mul);
++    // the graph does not count uses of views, so check by hand that cont2 is the only reader of pv2
++    for (int j = 0; j < cgraph->n_nodes && back_ok; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        for (int s = 0; s < GGML_MAX_SRC && back_ok; ++s) {
++            back_ok = n == cont2 || n->src[s] != pv2;
++        }
++    }
++    // pv2 must be the inverse permutation: x axis m reads the mul axis that was built from x axis m
++    for (int j = 0; j < GGML_MAX_DIMS && back_ok; ++j) {
++        if (pv->ne[j] == 1 && j != 0) {
++            continue;
++        }
++        const int m = pv_from_x[j];
++        back_ok = x->ne[m] == 1 || pv2->nb[m] == mul->nb[j];
++    }
++    if (!back_ok) {
++        NC_REJECT("check 8");
++    }
++    // under ggml_build_forward_select only GGML_TENSOR_FLAG_COMPUTE nodes run: never fuse an inactive node
++    for (const ggml_tensor * n : { (const ggml_tensor *) cont1, (const ggml_tensor *) rms, (const ggml_tensor *) mul, (const ggml_tensor *) cont2 }) {
++        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            NC_REJECT("check 8b");
++        }
++    }
++    // every node from i to the second CONT is part of the pattern or a view the loop skips
++    for (int j = i + 1; j < i_pv2 + 1; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (j != i_rms && j != i_mul && j != i_pv2 && !is_view_op(n)) {
++            NC_REJECT("check 9");
++        }
++    }
++    // The result may reuse x's memory (x is often dead after this norm): with the same layout every
++    // thread reads all channels of its position before writing them, so only partial overlap is unsafe.
++    const char * x0 = (const char *) x->data;
++    const char * d0 = (const char *) cont2->data;
++    const bool partial_overlap = d0 != x0 && d0 < x0 + ggml_nbytes(x) && x0 < d0 + ggml_nbytes(cont2);
++    // Unfused, w is read by the MUL before the second CONT writes, so the allocator may hand w's buffer to
++    // cont2; the fused kernel reads w while writing cont2, so any overlap with w is unsafe.
++    const char * w0       = (const char *) w->data;
++    const bool w_overlap  = d0 < w0 + ggml_nbytes(w) && w0 < d0 + ggml_nbytes(cont2);
++    if (P > INT64_C(1) << 40 || partial_overlap || w_overlap) {
++        NC_REJECT("check 10");
++    }
++    // One thread per position walks every channel, so the kernel needs many positions to fill the GPU.
++    // Measured on B200 against CONT + RMS_NORM + MUL + CONT (Qwen-Image VAE shapes, whole image and tiles):
++    // with C < 1024 it wins from 16384 positions (173 vs 245 us), with C >= 1024 from 65536 (1.2 vs 3.3 ms),
++    // and loses below (P = 4096, C = 1152: 656 vs 209 us).
++    if (!norm_channel_forced() && P < (C < 1024 ? 16384 : 65536)) {
++        NC_REJECT("check 12");
++    }
++    float eps;
++    memcpy(&eps, rms->op_params, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
++
++    const int threads = 128;
++    const int64_t blocks = (P + threads - 1) / threads;
++    if (blocks > INT_MAX) {
++        NC_REJECT("check 11");
++    }
++    if (C < 1024) {
++        rms_norm_channel_f32<256><<<(unsigned int) blocks, threads, 0, ctx.stream()>>>(
++            (const float *) x->data, (const float *) w->data, (float *) cont2->data, (int) C, P, inner, eps);
++    } else {
++        rms_norm_channel_f32<1024><<<(unsigned int) blocks, threads, 0, ctx.stream()>>>(
++            (const float *) x->data, (const float *) w->data, (float *) cont2->data, (int) C, P, inner, eps);
++    }
++    if (nc_debug()) {
++        GGML_LOG_INFO("norm-channel: fused C=%lld P=%lld\n", (long long) C, (long long) P);
++    }
++    return i_pv2 + 1 - i;
++}
+diff --git a/src/ggml-cuda/norm-channel.cuh b/src/ggml-cuda/norm-channel.cuh
+new file mode 100644
+index 00000000..da57e590
+--- /dev/null
++++ b/src/ggml-cuda/norm-channel.cuh
+@@ -0,0 +1,9 @@
++#pragma once
++#include "common.cuh"
++
++// CONT(PERMUTE(x)) -> RMS_NORM -> MUL(w) -> CONT(PERMUTE back): an RMS norm over the outermost
++// (channel) axis of a contiguous x, the way channel-first video VAEs (Wan) build it. Computes the
++// result straight from x into the final tensor, without the two relayout copies, bit-identical
++// to the unfused ops. Returns the number of extra nodes consumed (0: not this pattern / unsupported).
++// GGML_CUDA_NORM_CHANNEL=0 turns it off.
++int ggml_cuda_try_fuse_rms_norm_channel(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index 9c9385f8..ae2def32 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "group-norm-par.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -534,6 +535,11 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     memcpy(&eps, dst->op_params + 1, sizeof(float));
+     GGML_ASSERT(eps >= 0.0f);
+ 
++    if (ggml_cuda_group_norm_par_supported(dst)) {
++        ggml_cuda_op_group_norm_par(ctx, dst, nullptr, nullptr, false, dst);
++        return;
++    }
++
+     int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
+ }
+diff --git a/src/ggml-cuda/rope-pe.cu b/src/ggml-cuda/rope-pe.cu
+index b6dd7a69..2fe9a599 100644
+--- a/src/ggml-cuda/rope-pe.cu
++++ b/src/ggml-cuda/rope-pe.cu
+@@ -6,7 +6,7 @@
+ // Rounding matches the unfused graph exactly: __fmul_rn/__fadd_rn keep the two products and the
+ // sum as separately rounded operations (no FMA contraction), the scale is the same `scale*y + bias`
+ // expression the SCALE kernel evaluates, and the conversion uses the same ggml_cuda_cast as CPY.
+-template <typename dst_t, bool has_scale>
++template <typename dst_t, bool has_scale, bool interleaved = false>
+ static __global__ void rope_pe_permute_kernel(
+         const char * __restrict__ x, const float * __restrict__ pe, dst_t * __restrict__ dst,
+         const int D, const int H, const int64_t L, const int n_rot,
+@@ -21,9 +21,13 @@ static __global__ void rope_pe_permute_kernel(
+         int   j  = i;
+         float c0 = 0.0f;
+         float c1 = 0.0f;
++        int ja = i;
++        int jb = i;
+         if (rot) {
+-            const int r = i >= half;
+-            j           = i - r * half;
++            const int r = interleaved ? (i & 1) : (i >= half);
++            j           = interleaved ? (i >> 1) : i - r * half;
++            ja          = interleaved ? 2 * j : j;
++            jb          = interleaved ? 2 * j + 1 : j + half;
+             const float * t = pe + (l * half + j) * 4 + 2 * r;
+             c0 = t[0];
+             c1 = t[1];
+@@ -32,7 +36,7 @@ static __global__ void rope_pe_permute_kernel(
+             const float * xr = (const float *) (x + h * nb01 + l * nb02 + n * nb03);
+             float y;
+             if (rot) {
+-                y = __fadd_rn(__fmul_rn(xr[j], c0), __fmul_rn(xr[j + half], c1));
++                y = __fadd_rn(__fmul_rn(xr[ja], c0), __fmul_rn(xr[jb], c1));
+             } else {
+                 y = xr[i];
+             }
+@@ -48,7 +52,7 @@ static __global__ void rope_pe_permute_kernel(
+ // per (token, batch), the size and reduction rms_norm_f32_cuda's small-row path uses for this row
+ // length, so each normalised value is bit-identical to GGML_OP_RMS_NORM's; the normalised row is
+ // staged in shared memory for the RoPE partner reads.
+-template <typename dst_t, bool has_scale, int block_size>
++template <typename dst_t, bool has_scale, int block_size, bool interleaved = false>
+ static __global__ void rope_pe_permute_rms_kernel(
+         const char * __restrict__ x, const float * __restrict__ pe, dst_t * __restrict__ dst,
+         const int D, const int H, const int64_t L, const int n_rot,
+@@ -64,11 +68,15 @@ static __global__ void rope_pe_permute_rms_kernel(
+ 
+     const bool rot = i < n_rot;
+     int   j  = i;
++    int   ja = i;
++    int   jb = i;
+     float c0 = 0.0f;
+     float c1 = 0.0f;
+     if (rot) {
+-        const int r = i >= half;
+-        j           = i - r * half;
++        const int r = interleaved ? (i & 1) : (i >= half);
++        j           = interleaved ? (i >> 1) : i - r * half;
++        ja          = interleaved ? 2 * j : j;
++        jb          = interleaved ? 2 * j + 1 : j + half;
+         const float * t = pe + (l * half + j) * 4 + 2 * r;
+         c0 = t[0];
+         c1 = t[1];
+@@ -91,7 +99,7 @@ static __global__ void rope_pe_permute_rms_kernel(
+         if (i < D) {
+             float y;
+             if (rot) {
+-                y = __fadd_rn(__fmul_rn(xs[j], c0), __fmul_rn(xs[j + half], c1));
++                y = __fadd_rn(__fmul_rn(xs[ja], c0), __fmul_rn(xs[jb], c1));
+             } else {
+                 y = xs[i];
+             }
+@@ -117,7 +125,7 @@ static bool rope_pe_rms_small_rows_enabled() {
+ #endif
+ }
+ 
+-template <typename dst_t, int block_size>
++template <typename dst_t, int block_size, bool interleaved>
+ static void rope_pe_permute_rms_launch(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
+                                        const float scale, const float eps, cudaStream_t stream) {
+     const int     D = (int) src0->ne[0];
+@@ -128,29 +136,29 @@ static void rope_pe_permute_rms_launch(const ggml_tensor * src0, const float * p
+     const dim3 block(block_size, 1, 1);
+     const char * x = (const char *) src0->data;
+     if (scale != 1.0f) {
+-        rope_pe_permute_rms_kernel<dst_t, true, block_size><<<grid, block, 0, stream>>>(
++        rope_pe_permute_rms_kernel<dst_t, true, block_size, interleaved><<<grid, block, 0, stream>>>(
+             x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f, eps);
+     } else {
+-        rope_pe_permute_rms_kernel<dst_t, false, block_size><<<grid, block, 0, stream>>>(
++        rope_pe_permute_rms_kernel<dst_t, false, block_size, interleaved><<<grid, block, 0, stream>>>(
+             x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f, eps);
+     }
+ }
+ 
+-template <typename dst_t>
++template <typename dst_t, bool interleaved = false>
+ static void rope_pe_permute_rms_cuda(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
+                                      const float scale, const float eps, cudaStream_t stream) {
+     const int D = (int) src0->ne[0];
+     GGML_ASSERT(D <= 128);
+     if (D <= 32) {
+-        rope_pe_permute_rms_launch<dst_t, 32>(src0, pe, dst, n_rot, scale, eps, stream);
++        rope_pe_permute_rms_launch<dst_t, 32, interleaved>(src0, pe, dst, n_rot, scale, eps, stream);
+     } else if (D <= 64) {
+-        rope_pe_permute_rms_launch<dst_t, 64>(src0, pe, dst, n_rot, scale, eps, stream);
++        rope_pe_permute_rms_launch<dst_t, 64, interleaved>(src0, pe, dst, n_rot, scale, eps, stream);
+     } else {
+-        rope_pe_permute_rms_launch<dst_t, 128>(src0, pe, dst, n_rot, scale, eps, stream);
++        rope_pe_permute_rms_launch<dst_t, 128, interleaved>(src0, pe, dst, n_rot, scale, eps, stream);
+     }
+ }
+ 
+-template <typename dst_t>
++template <typename dst_t, bool interleaved = false>
+ static void rope_pe_permute_cuda(const ggml_tensor * src0, const float * pe, dst_t * dst, const int n_rot,
+                                  const float scale, cudaStream_t stream) {
+     const int     D = (int) src0->ne[0];
+@@ -162,10 +170,10 @@ static void rope_pe_permute_cuda(const ggml_tensor * src0, const float * pe, dst
+     const dim3 block(D >= 128 ? 128 : ((D + 31) / 32) * 32, 1, 1);
+     const char * x = (const char *) src0->data;
+     if (scale != 1.0f) {
+-        rope_pe_permute_kernel<dst_t, true><<<grid, block, 0, stream>>>(
++        rope_pe_permute_kernel<dst_t, true, interleaved><<<grid, block, 0, stream>>>(
+             x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f);
+     } else {
+-        rope_pe_permute_kernel<dst_t, false><<<grid, block, 0, stream>>>(
++        rope_pe_permute_kernel<dst_t, false, interleaved><<<grid, block, 0, stream>>>(
+             x, pe, dst, D, H, L, n_rot, src0->nb[1], src0->nb[2], src0->nb[3], scale, 0.0f);
+     }
+ }
+@@ -184,22 +192,41 @@ void ggml_cuda_op_rope_pe_permute(ggml_backend_cuda_context & ctx, ggml_tensor *
+     cudaStream_t  stream = ctx.stream();
+     const float * pe_d   = pe ? (const float *) pe->data : nullptr;
+ 
++    // interleaved pairing (2j, 2j+1) only matters when something rotates
++    const bool interleaved = n_rot > 0 && ggml_get_op_params_i32(dst, 4) != 0;
++
+     if (ggml_get_op_params_i32(dst, 2) != 0) {
+         const float eps = ggml_get_op_params_f32(dst, 3);
+         if (dst->type == GGML_TYPE_F16) {
+-            rope_pe_permute_rms_cuda(src0, pe_d, (half *) dst->data, n_rot, scale, eps, stream);
++            if (interleaved) {
++                rope_pe_permute_rms_cuda<half, true>(src0, pe_d, (half *) dst->data, n_rot, scale, eps, stream);
++            } else {
++                rope_pe_permute_rms_cuda<half, false>(src0, pe_d, (half *) dst->data, n_rot, scale, eps, stream);
++            }
+         } else {
+             GGML_ASSERT(dst->type == GGML_TYPE_F32);
+-            rope_pe_permute_rms_cuda(src0, pe_d, (float *) dst->data, n_rot, scale, eps, stream);
++            if (interleaved) {
++                rope_pe_permute_rms_cuda<float, true>(src0, pe_d, (float *) dst->data, n_rot, scale, eps, stream);
++            } else {
++                rope_pe_permute_rms_cuda<float, false>(src0, pe_d, (float *) dst->data, n_rot, scale, eps, stream);
++            }
+         }
+         return;
+     }
+ 
+     if (dst->type == GGML_TYPE_F16) {
+-        rope_pe_permute_cuda(src0, pe_d, (half *) dst->data, n_rot, scale, stream);
++        if (interleaved) {
++            rope_pe_permute_cuda<half, true>(src0, pe_d, (half *) dst->data, n_rot, scale, stream);
++        } else {
++            rope_pe_permute_cuda<half, false>(src0, pe_d, (half *) dst->data, n_rot, scale, stream);
++        }
+     } else {
+         GGML_ASSERT(dst->type == GGML_TYPE_F32);
+-        rope_pe_permute_cuda(src0, pe_d, (float *) dst->data, n_rot, scale, stream);
++        if (interleaved) {
++            rope_pe_permute_cuda<float, true>(src0, pe_d, (float *) dst->data, n_rot, scale, stream);
++        } else {
++            rope_pe_permute_cuda<float, false>(src0, pe_d, (float *) dst->data, n_rot, scale, stream);
++        }
+     }
+ }
+ 
+diff --git a/src/ggml-cuda/rope.cu b/src/ggml-cuda/rope.cu
+index d332618b..fb5f62bb 100644
+--- a/src/ggml-cuda/rope.cu
++++ b/src/ggml-cuda/rope.cu
+@@ -13,6 +13,9 @@ static __global__ void rope_apply_f32(
+         const float * x, const float * pe, float * dst,
+         int64_t half_dim, int64_t heads, int64_t tokens, int64_t pairs,
+         RopeApplyStrides strides) {
++    // Launched with programmatic dependent launch (ggml_cuda_kernel_launch): wait for the producer of x
++    // before reading it. Without this the kernel could read q/k while the preceding norm still wrote them.
++    ggml_cuda_pdl_sync();
+     const int64_t index = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+     if (index >= pairs) {
+         return;
+diff --git a/src/ggml.c b/src/ggml.c
+index 1fe59a0e..016995c0 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -5751,6 +5751,14 @@ struct ggml_tensor * ggml_rope_pe_permute_rms(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_rope_pe_permute_set_interleaved(
++        struct ggml_tensor  * t,
++        bool                  interleaved) {
++    GGML_ASSERT(t->op == GGML_OP_ROPE_PE_PERMUTE);
++    ggml_set_op_params_i32(t, 4, interleaved ? 1 : 0);
++    return t;
++}
++
+ static struct ggml_tensor * ggml_modulate_rows_impl(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * acc,
