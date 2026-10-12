@@ -266,7 +266,7 @@ jobs:
           - label: Darwin-macOS-arm64
             runner: macos-14
             arch: arm64
-            # Static: ggml's apple_m1 variant drops FP16_VA (~40% slower). BLAS spelled out since sd.cpp now routes big matmuls to it.
+            # Static: apple_m1 variant drops FP16_VA (~40% slower). BLAS explicit: sd.cpp routes big matmuls to it.
             defines: "-DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
             gate: "true"
           - label: Darwin-macOS-x86_64

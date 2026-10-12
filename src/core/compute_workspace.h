@@ -17,7 +17,6 @@ namespace sd {
         ggml_backend_t backend_;
         std::vector<ggml_backend_t> extra_backends_;
         ggml_backend_t cpu_backend_     = nullptr;
-        // ggml BLAS backend for large MUL_MATs; nullptr when not built in or SD_CPU_BLAS=0.
         ggml_backend_t blas_backend_    = nullptr;
         ggml_gallocr_t allocator_       = nullptr;
         ggml_backend_sched_t scheduler_ = nullptr;
