@@ -69,7 +69,7 @@ index bdd36aea..2883f5df 100644
          if (D > n_rot) {
              memcpy(y.data() + n_rot, x + n_rot, (D - n_rot) * sizeof(float));
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 831d0de8..558767ff 100644
+index 831d0de8..8f4e6f3d 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,9 @@
@@ -82,7 +82,7 @@ index 831d0de8..558767ff 100644
  #include "ggml-cuda/opt-step-adamw.cuh"
  #include "ggml-cuda/opt-step-sgd.cuh"
  #include "ggml-cuda/out-prod.cuh"
-@@ -4313,6 +4316,109 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
+@@ -4313,6 +4316,106 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
      return consumed;
  }
  
@@ -114,10 +114,8 @@ index 831d0de8..558767ff 100644
 +    }
 +    int idx[4] = { i, i_mul, i_add, -1 };
 +    const enum ggml_op ops[4] = { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY };
-+    // ggml_can_fuse_ext without its view rule: sd.cpp builds the affine and SiLU in place
-+    // (ggml_mul_inplace(gn, w) ...), so MUL / ADD / SILU are whole views of the GROUP_NORM result.
-+    // Such a view writes gn's memory, every reader of that memory is a counted use of a chain node,
-+    // and the fused kernel leaves the same final values there.
++    // ggml_can_fuse_ext minus its view rule: sd.cpp's in-place MUL/ADD/SILU are views of the GROUP_NORM
++    // result, every reader of that memory is a counted chain use, and the fused kernel writes the same values.
 +    auto chain_ok = [&](int n) {
 +        for (int k = 0; k < n; ++k) {
 +            const ggml_tensor * node = cgraph->nodes[idx[k]];
@@ -173,8 +171,7 @@ index 831d0de8..558767ff 100644
 +    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, last - i + 1, out_nodes, 1)) {
 +        return 0;
 +    }
-+    // the check above skips leaf sources: w and b are read while out is written, so they may not
-+    // overlap it at all; x only at the same element (the last pass reads x[j] before writing out[j])
++    // leaf sources skipped above: w/b must not overlap out; x only elementwise (x[j] read before out[j] written)
 +    auto overlaps = [&](const ggml_tensor * t) {
 +        const char * o0 = (const char *) out->data;
 +        const char * t0 = (const char *) t->data;
@@ -192,7 +189,7 @@ index 831d0de8..558767ff 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4322,6 +4428,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4322,6 +4425,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -213,7 +210,7 @@ index 831d0de8..558767ff 100644
      if (node->op == GGML_OP_MUL) {
          ggml_cuda_moe_weighted_reduction_match match;
          if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-@@ -4334,6 +4454,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4334,6 +4451,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
