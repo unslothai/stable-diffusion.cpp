@@ -50,9 +50,13 @@ overlap. For example, `0.5x0.5` uses half the width and height in both encode an
 decode. The target overlap is clamped to 0 through 0.5 and the actual overlap is
 adjusted to fit the image. On an axis that does not wrap, a tile size that would leave
 neighboring tiles overlapping by less than half the target (or by fewer than 2 latent
-pixels) is adjusted to the nearest size that does not: smaller first, larger only up to
-twice the requested size. Without it, a tile a little over half of the axis gives two
-tiles that barely overlap and the tile edge shows as a line. Size and overlap options
+pixels) is replaced. The replacement is the size that decodes the fewest latent pixels
+along the axis (tiles times size) among sizes whose overlaps reach the full target overlap,
+capped at 8 latent pixels, preferring sizes within 25% above the request. It never uses
+more tiles than the nearest size that overlaps by half the target (smaller first, larger
+only up to twice the request), and falls back to that size when nothing better qualifies.
+Without it, a tile a little over half of the axis gives two tiles that barely overlap and
+the tile edge shows as a line. Size and overlap options
 require `--vae-tiling`.
 
 **Migration:** `--vae-tile-size` and the C/JSON fields `tile_size_w` and

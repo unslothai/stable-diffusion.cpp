@@ -44,8 +44,7 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
                                            const TileBatchProcessCallback& on_processing,
                                            bool silent = false);
 
-// Returns tile_size, adjusted if needed so a non-circular axis of small_dim is never split into tiles that
-// barely overlap (see the definition for why that shows as a seam).
-int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor);
+// tile_size adjusted so tiles never barely overlap; max_tile_size > 0 (OOM retry) caps it, never below 4.
+int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor, int max_tile_size = 0);
 
 #endif  // __SD_RUNTIME_TILING_H__
