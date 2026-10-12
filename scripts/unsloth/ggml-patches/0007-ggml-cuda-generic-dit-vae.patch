@@ -69,7 +69,7 @@ index bdd36aea..2883f5df 100644
          if (D > n_rot) {
              memcpy(y.data() + n_rot, x + n_rot, (D - n_rot) * sizeof(float));
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 831d0de8..2df04786 100644
+index 831d0de8..558767ff 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,9 @@
@@ -82,7 +82,7 @@ index 831d0de8..2df04786 100644
  #include "ggml-cuda/opt-step-adamw.cuh"
  #include "ggml-cuda/opt-step-sgd.cuh"
  #include "ggml-cuda/out-prod.cuh"
-@@ -4313,6 +4316,71 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
+@@ -4313,6 +4316,109 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
      return consumed;
  }
  
@@ -114,7 +114,33 @@ index 831d0de8..2df04786 100644
 +    }
 +    int idx[4] = { i, i_mul, i_add, -1 };
 +    const enum ggml_op ops[4] = { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY };
-+    if (!ggml_can_fuse_ext(cgraph, idx, ops, 3)) {
++    // ggml_can_fuse_ext without its view rule: sd.cpp builds the affine and SiLU in place
++    // (ggml_mul_inplace(gn, w) ...), so MUL / ADD / SILU are whole views of the GROUP_NORM result.
++    // Such a view writes gn's memory, every reader of that memory is a counted use of a chain node,
++    // and the fused kernel leaves the same final values there.
++    auto chain_ok = [&](int n) {
++        for (int k = 0; k < n; ++k) {
++            const ggml_tensor * node = cgraph->nodes[idx[k]];
++            if (node->op != ops[k] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++                return false;
++            }
++            if (k == 0 ? node->view_src != nullptr
++                       : node->view_src != nullptr && (node->view_src != gn || node->view_offs != 0 || node->data != gn->data)) {
++                return false;
++            }
++            if (k < n - 1 && (ggml_node_get_use_count(cgraph, idx[k]) != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT))) {
++                return false;
++            }
++            if (k > 0) {
++                const ggml_tensor * prev = cgraph->nodes[idx[k - 1]];
++                if ((node->src[0] != prev && node->src[1] != prev) || !ggml_are_same_shape(node, prev)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    };
++    if (!chain_ok(3)) {
 +        return 0;
 +    }
 +    ggml_tensor * mul = cgraph->nodes[i_mul];
@@ -136,7 +162,7 @@ index 831d0de8..2df04786 100644
 +        const ggml_tensor * u = cgraph->nodes[i_u];
 +        idx[3] = i_u;
 +        if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SILU && u->type == GGML_TYPE_F32 &&
-+            ggml_is_contiguous(u) && ggml_can_fuse_ext(cgraph, idx, ops, 4)) {
++            ggml_is_contiguous(u) && chain_ok(4)) {
 +            n_fused = 4;
 +        }
 +    }
@@ -147,6 +173,18 @@ index 831d0de8..2df04786 100644
 +    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, last - i + 1, out_nodes, 1)) {
 +        return 0;
 +    }
++    // the check above skips leaf sources: w and b are read while out is written, so they may not
++    // overlap it at all; x only at the same element (the last pass reads x[j] before writing out[j])
++    auto overlaps = [&](const ggml_tensor * t) {
++        const char * o0 = (const char *) out->data;
++        const char * t0 = (const char *) t->data;
++        return t0 < o0 + ggml_nbytes(out) && o0 < t0 + ggml_nbytes(t);
++    };
++    const ggml_tensor * x = gn->src[0];
++    if (overlaps(w) || overlaps(b) ||
++        (overlaps(x) && !(x->data == out->data && ggml_are_same_shape(x, out) && ggml_is_contiguous(x)))) {
++        return 0;
++    }
 +    ggml_cuda_op_group_norm_par(ctx, gn, w, b, n_fused == 4, out);
 +    return last - i;
 +}
@@ -154,7 +192,7 @@ index 831d0de8..2df04786 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4322,6 +4390,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4322,6 +4428,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -175,7 +213,7 @@ index 831d0de8..2df04786 100644
      if (node->op == GGML_OP_MUL) {
          ggml_cuda_moe_weighted_reduction_match match;
          if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-@@ -4334,6 +4416,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4334,6 +4454,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -191,10 +229,10 @@ index 831d0de8..2df04786 100644
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
 diff --git a/src/ggml-cuda/group-norm-par.cu b/src/ggml-cuda/group-norm-par.cu
 new file mode 100644
-index 00000000..3e640e62
+index 00000000..dbc652df
 --- /dev/null
 +++ b/src/ggml-cuda/group-norm-par.cu
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,174 @@
 +#include "group-norm-par.cuh"
 +#include "unary.cuh"
 +
@@ -333,6 +371,7 @@ index 00000000..3e640e62
 +    const int num_groups = gn->op_params[0];
 +    float eps;
 +    memcpy(&eps, gn->op_params + 1, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
 +
 +    const int group_size  = (int) gn_par_group_size(gn);
 +    const int ne_elements = (int) ggml_nelements(src0);
@@ -583,10 +622,10 @@ index 00000000..8d9752ca
 +int ggml_cuda_try_fuse_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 diff --git a/src/ggml-cuda/norm-channel.cu b/src/ggml-cuda/norm-channel.cu
 new file mode 100644
-index 00000000..9c0b61fd
+index 00000000..c1a8819d
 --- /dev/null
 +++ b/src/ggml-cuda/norm-channel.cu
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,259 @@
 +#include "norm-channel.cuh"
 +#include "ggml-impl.h"
 +
@@ -746,6 +785,10 @@ index 00000000..9c0b61fd
 +        if (nc_debug()) { GGML_LOG_INFO("norm-channel: C=%lld next op %s (%s)\n", (long long) C, ggml_op_desc(rms), rms->name); }
 +        NC_REJECT("check 5a");
 +    }
++    // the CONT must only make the permuted view contiguous (a CONT_4D may reshape it)
++    if (!ggml_are_same_shape(cont1, pv)) {
++        NC_REJECT("check 5e");
++    }
 +    if (rms->src[0] != cont1) {
 +        NC_REJECT("check 5b");
 +    }
@@ -769,7 +812,7 @@ index 00000000..9c0b61fd
 +    ggml_tensor * pv2   = cgraph->nodes[i_pv2];
 +    ggml_tensor * cont2 = cgraph->nodes[i_pv2 + 1];
 +    bool back_ok = pv2->op == GGML_OP_PERMUTE && pv2->src[0] == mul && cont2->op == GGML_OP_CONT && cont2->src[0] == pv2 &&
-+                   cont2->type == GGML_TYPE_F32 && ggml_are_same_shape(cont2, x) &&
++                   cont2->type == GGML_TYPE_F32 && ggml_are_same_shape(cont2, x) && ggml_are_same_shape(cont2, pv2) &&
 +                   ggml_is_contiguous(cont2) && ggml_is_contiguous(mul);
 +    // the graph does not count uses of views, so check by hand that cont2 is the only reader of pv2
 +    for (int j = 0; j < cgraph->n_nodes && back_ok; ++j) {
@@ -823,6 +866,7 @@ index 00000000..9c0b61fd
 +    }
 +    float eps;
 +    memcpy(&eps, rms->op_params, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
 +
 +    const int threads = 128;
 +    const int64_t blocks = (P + threads - 1) / threads;
