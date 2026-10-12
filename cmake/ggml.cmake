@@ -27,6 +27,7 @@ if(EXISTS "${sd_ggml_header}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${sd_ggml_header}")
     file(STRINGS "${sd_ggml_header}" sd_ggml_h3_fused_ops REGEX "ggml_rope_pe_permute\\(")
     file(STRINGS "${sd_ggml_header}" sd_ggml_h3_fused_qk_norm REGEX "ggml_rope_pe_permute_rms\\(")
+    file(STRINGS "${sd_ggml_header}" sd_ggml_rope_pe_interleaved REGEX "ggml_rope_pe_permute_set_interleaved\\(")
 endif()
 if(sd_ggml_h3_fused_ops)
     target_compile_definitions(${SD_LIB} PUBLIC SD_GGML_H3_FUSED_OPS)
@@ -36,6 +37,10 @@ endif()
 # The fused q/k RMS norm comes from patch 0005.
 if(sd_ggml_h3_fused_qk_norm)
     target_compile_definitions(${SD_LIB} PUBLIC SD_GGML_H3_FUSED_QK_NORM)
+endif()
+# Interleaved pairing for the fused RoPE op (patch 0007): the shared DiT attention (Rope::attention) uses it.
+if(sd_ggml_h3_fused_ops AND sd_ggml_rope_pe_interleaved)
+    target_compile_definitions(${SD_LIB} PUBLIC SD_GGML_FUSED_ROPE_ATTN)
 endif()
 
 if(SD_USE_UPSTREAM_GGML)

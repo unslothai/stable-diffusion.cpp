@@ -236,6 +236,7 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 // already applied. Builds the same flash_attn_ext + output scaling as ggml_ext_attention_ext
 // (skip_reshape, unmasked), so the result is identical; returns nullptr when the backend lacks
 // flash attention for these inputs (the caller then uses ggml_ext_attention_ext).
+// mask (optional): as for ggml_ext_attention_ext's flash path (mask->ne[3] == 1).
 // return: [N, L_q, n_head * d_head]
 ggml_tensor* ggml_ext_attention_prepared(ggml_context* ctx,
                                          ggml_backend_t backend,
@@ -244,7 +245,8 @@ ggml_tensor* ggml_ext_attention_prepared(ggml_context* ctx,
                                          ggml_tensor* v,
                                          int64_t n_head,
                                          int64_t N,
-                                         float kv_scale);
+                                         float kv_scale,
+                                         ggml_tensor* mask = nullptr);
 
 ggml_tensor* ggml_ext_layer_norm(ggml_context* ctx,
                                  ggml_tensor* x,

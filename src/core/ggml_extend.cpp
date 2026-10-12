@@ -212,7 +212,11 @@ ggml_tensor* ggml_ext_linear_matmul(ggml_context* ctx,
                                     ggml_tensor* w,
                                     bool force_prec_f32) {
     if (sd_weight_may_be_cpu_repacked(w) && w->ne[2] == 1 && w->ne[3] == 1) {
-        // Repacked CPU matmuls (AMX, CPU_REPACK) get batch dims wrong: feed contiguous 2D rows.
+        // Repacked CPU matmuls (AMX, CPU_REPACK) get batch dims wrong and only take F32 activations
+        // (the type sd_cpu_repack_buffer_type_for probes with): feed contiguous 2D F32 rows.
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F32);
+        }
         if (!ggml_is_contiguous(x)) {
             x = ggml_cont(ctx, x);
         }
@@ -466,7 +470,14 @@ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
     if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
-        x = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
+        // ggml_conv_2d, but skips the final [OC, N] -> [N, OC] relayout when N == 1 (no data moves).
+        ggml_tensor* im2col = ggml_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1, true,
+                                          w->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16);  // [N, OH, OW, IC * KH * KW]
+        ggml_tensor* out    = ggml_mul_mat(ctx,
+                                           ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
+                                           ggml_reshape_2d(ctx, w, (w->ne[0] * w->ne[1] * w->ne[2]), w->ne[3]));
+        out                 = ggml_reshape_4d(ctx, out, im2col->ne[1], im2col->ne[2], im2col->ne[3], w->ne[3]);  // [OC, N, OH, OW]
+        x                   = ggml_ext_cont(ctx, ggml_permute(ctx, out, 0, 1, 3, 2));                       // [N, OC, OH, OW]
     }
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, 1.f / scale);
@@ -846,22 +857,30 @@ ggml_tensor* ggml_ext_attention_prepared(ggml_context* ctx,
                                          ggml_tensor* v,
                                          int64_t n_head,
                                          int64_t N,
-                                         float kv_scale) {
+                                         float kv_scale,
+                                         ggml_tensor* mask) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
     const int64_t L_q    = q->ne[1];
     const int64_t d_head = v->ne[0];
-    if (backend == nullptr || d_head < 64) {
+    if (backend == nullptr || d_head < 64 || (mask != nullptr && mask->ne[3] != 1)) {
         return nullptr;
     }
 
     // Same expressions as ggml_ext_attention_ext so the softmax scale rounds identically.
     float scale = (1.0f / sqrt((float)d_head));
 
-    auto kqv = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale / kv_scale, 0, 0);
+    if (mask != nullptr) {
+        if (mask->ne[1] != L_q) {
+            mask = ggml_repeat(ctx, mask, ggml_new_tensor_4d(ctx, mask->type, mask->ne[0], L_q, mask->ne[2], mask->ne[3]));
+        }
+        mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+    }
+
+    auto kqv = ggml_flash_attn_ext(ctx, q, k, v, mask, scale / kv_scale, 0, 0);
     if (!ggml_backend_supports_op(backend, kqv)) {
         return nullptr;
     }
-    ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
+    ggml_prec_set_acc(kqv, GGML_PREC_F32);
     if (kv_scale != 1.0f) {
         kqv = ggml_ext_scale(ctx, kqv, 1.0f / kv_scale);
     }

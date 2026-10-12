@@ -1,6 +1,7 @@
 #include "runtime/tiling.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -60,17 +61,21 @@ static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
     return tiles;
 }
 
-int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor) {
-    // A tile a little over half the axis (32 of 62 latents) gets two tiles overlapping by 1-2 latents, which shows
-    // as a seam. Pick the nearest size (smaller first, larger only up to 2x) whose overlaps are >= half the target
-    // and >= 2 latents.
+int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor, int max_tile_size) {
+    // Overlaps of 1-2 latents (32-latent tiles on a 62 axis) show as a seam; require >= half the target and >= 2.
     const int min_tile_size = 4;
+    const int limit         = max_tile_size > 0 ? std::max(max_tile_size, min_tile_size) : INT_MAX;
+    tile_size               = std::min(tile_size, limit);
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;
     }
-    auto overlaps_enough = [&](int size) {
-        const int min_overlap = std::max(2, static_cast<int>(size * tile_overlap_factor * 0.5f));
-        const auto tiles      = sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false);
+    auto overlaps_enough = [&](int size, bool replacement) {
+        int min_overlap = std::max(2, static_cast<int>(size * tile_overlap_factor * 0.5f));
+        if (replacement) {
+            // Half the target still leaves a line on 16x VAEs (Qwen-Image-2.1 at 480 px); 8 latents does not.
+            min_overlap = std::max(min_overlap, std::min(8, static_cast<int>(size * tile_overlap_factor)));
+        }
+        const auto tiles = sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false);
         for (size_t i = 0; i + 1 < tiles.size(); ++i) {
             if (tiles[i].overlap_after < min_overlap) {
                 return false;
@@ -78,17 +83,62 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
         }
         return true;
     };
-    for (int size = tile_size; size >= min_tile_size; --size) {
-        if (overlaps_enough(size)) {
+    if (overlaps_enough(tile_size, false)) {
+        return tile_size;
+    }
+    auto tile_count = [&](int size) {
+        return static_cast<int>(sd_tiling_plan_axis(small_dim, size, tile_overlap_factor, false).size());
+    };
+    // The nearest passing size (smaller first, then larger up to 2x) caps the tile count so tiny tiles never win.
+    int nearest = 0;
+    for (int size = tile_size - 1; size >= min_tile_size && nearest == 0; --size) {
+        if (overlaps_enough(size, false)) {
+            nearest = size;
+        }
+    }
+    for (int size = tile_size + 1; nearest == 0 && size < small_dim && size <= std::min(2 * tile_size, limit); ++size) {
+        if (overlaps_enough(size, false)) {
+            nearest = size;
+        }
+    }
+    if (nearest == 0) {
+        return tile_size;
+    }
+    const int max_tiles = tile_count(nearest);
+    auto pick = [&](int lowest, int highest, bool replacement) {
+        int best_size     = 0;
+        int64_t best_cost = 0;
+        int best_tiles    = 0;
+        for (int size = lowest; size <= highest; ++size) {
+            if (!overlaps_enough(size, replacement)) {
+                continue;
+            }
+            const int tiles = tile_count(size);
+            if (tiles > max_tiles) {
+                continue;
+            }
+            const int64_t cost = static_cast<int64_t>(tiles) * size;
+            const bool better = best_size == 0 || cost < best_cost || (cost == best_cost && tiles < best_tiles);
+            if (better) {
+                best_size  = size;
+                best_cost  = cost;
+                best_tiles = tiles;
+            }
+        }
+        return best_size;
+    };
+    const int capped = std::min({small_dim - 1, tile_size + tile_size / 4, limit});
+    const int widest = std::min({small_dim - 1, 2 * tile_size, limit});
+    for (bool replacement : {true, false}) {
+        int size = pick(min_tile_size, capped, replacement);
+        if (size == 0) {
+            size = pick(capped + 1, widest, replacement);
+        }
+        if (size != 0) {
             return size;
         }
     }
-    for (int size = tile_size + 1; size < small_dim && size <= 2 * tile_size; ++size) {
-        if (overlaps_enough(size)) {
-            return size;
-        }
-    }
-    return tile_size;
+    return nearest;
 }
 
 static int64_t sd_tensor_plane_size(const sd::Tensor<float>& tensor) {

@@ -454,6 +454,12 @@ void sd_tag_matmul_only_weight(ggml_tensor* weight) {
     }
 }
 
+void sd_untag_matmul_only_weight(ggml_tensor* weight) {
+    if (sd_is_matmul_only_weight(weight)) {
+        weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] = 0;
+    }
+}
+
 bool sd_is_matmul_only_weight(const ggml_tensor* weight) {
     return weight != nullptr && weight->op == GGML_OP_NONE &&
            weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] == SD_MATMUL_ONLY_TAG;
@@ -502,7 +508,7 @@ ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_
     if (ctx == nullptr) {
         return nullptr;
     }
-    // Probe supports_op with a real MUL_MAT per candidate (AMX first); the dummy buffer is only read for its type.
+    // Probe with a real 2D-F32 MUL_MAT per candidate (AMX first), the form ggml_ext_linear_matmul feeds; dummy buffer read only for its type.
     ggml_tensor* w                    = ggml_new_tensor_2d(ctx, weight->type, weight->ne[0], weight->ne[1]);
     ggml_tensor* x                    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weight->ne[0], 64);
     ggml_tensor* op                   = ggml_mul_mat(ctx, w, x);

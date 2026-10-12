@@ -983,27 +983,13 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
             if (dst_tensor == nullptr)
                 continue;
 
-            if (tensor_storage.is_f64 ||
-                tensor_storage.is_i64 ||
-#ifdef SD_USE_UPSTREAM_GGML
-                tensor_storage.is_f8_e4m3 ||
-                tensor_storage.is_f8_e5m2 ||
-#endif
-                tensor_storage.type != dst_tensor->type) {
+            if (!tensor_storage.maps_directly_to(dst_tensor)) {
+                // let load_tensors worry about this
                 continue;
             }
 
             size_t tensor_size   = tensor_storage.nbytes();
             size_t tensor_offset = tensor_storage.offset;
-
-            if (tensor_storage.ne[0] != dst_tensor->ne[0] ||
-                tensor_storage.ne[1] != dst_tensor->ne[1] ||
-                tensor_storage.ne[2] != dst_tensor->ne[2] ||
-                tensor_storage.ne[3] != dst_tensor->ne[3] ||
-                tensor_size != ggml_nbytes(dst_tensor)) {
-                // let load_tensors worry about this
-                continue;
-            }
 
             ggml_backend_buffer_t buf_mmap = buffer_for_file();
             if (buf_mmap == nullptr) {

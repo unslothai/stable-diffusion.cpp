@@ -261,6 +261,7 @@ bool ModelManager::register_param_tensors(ModelComponent component,
         state->residency_mode  = residency_mode;
         state->compute_backend = compute_backend;
         state->params_backend  = params_backend;
+        state->matmul_only     = sd_is_matmul_only_weight(tensor);
         auto split_buffer      = split_buffer_types_.find(compute_backend);
         if (allow_split_buffer && split_buffer != split_buffer_types_.end()) {
             state->split_buffer_type = split_buffer->second;
@@ -272,6 +273,7 @@ bool ModelManager::register_param_tensors(ModelComponent component,
                 state->usage_op = op_it->second;
             }
         }
+        sync_cpu_repack_tag(*state);
         new_states.push_back(std::move(state));
     }
 
@@ -843,13 +845,6 @@ bool ModelManager::mmap_params(const std::vector<TensorState*>& states,
             TensorState* state = pair.second;
             if (state != nullptr && state->tensor != nullptr && state->tensor->data != nullptr) {
                 block->states.push_back(state);
-                if (cpu_repack_allowed_ && state->usage_op == GGML_OP_NONE && state->params_backend == state->compute_backend &&
-                    sd_backend_is_cpu(state->compute_backend) &&
-                    sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state->compute_backend), state->tensor) != nullptr) {
-                    // A mapped weight stays in the file mapping, which the repacked layout cannot use: say so once.
-                    static std::once_flag logged;
-                    std::call_once(logged, [] { LOG_INFO("cpu weight repack: skipped for mmapped weights (drop --mmap to repack)"); });
-                }
             }
         }
 
@@ -859,6 +854,41 @@ bool ModelManager::mmap_params(const std::vector<TensorState*>& states,
         }
     }
     return true;
+}
+
+// The matmul-only tag both selects the repack buffer and sends a not yet allocated weight down the repacked-CPU
+// graph path, so keep it only on weights this context will repack. An allocated weight keeps its tag: its buffer decides.
+void ModelManager::sync_cpu_repack_tag(TensorState& state) const {
+    if (!state.matmul_only || state.tensor->buffer != nullptr) {
+        return;
+    }
+    sd_tag_matmul_only_weight(state.tensor);
+    bool repack = cpu_repack_allowed_ && state.usage_op == GGML_OP_NONE && state.params_backend == state.compute_backend &&
+                  sd_backend_is_cpu(state.compute_backend) &&
+                  sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state.compute_backend), state.tensor) != nullptr;
+    if (repack && can_mmap_storage(state) && state.sources.size() == 1 && state.sources[0].maps_directly_to(state.tensor)) {
+        // Mapped weights cannot be repacked: log once.
+        static std::once_flag logged;
+        std::call_once(logged, [] { LOG_INFO("cpu weight repack: skipped for mmapped weights (drop --mmap to repack)"); });
+        repack = false;
+    }
+    if (!repack) {
+        sd_untag_matmul_only_weight(state.tensor);
+    }
+}
+
+void ModelManager::set_enable_mmap(bool enable_mmap) {
+    enable_mmap_ = enable_mmap;
+    for (auto& state : tensor_states_) {
+        sync_cpu_repack_tag(*state);
+    }
+}
+
+void ModelManager::set_cpu_repack_allowed(bool allowed) {
+    cpu_repack_allowed_ = allowed;
+    for (auto& state : tensor_states_) {
+        sync_cpu_repack_tag(*state);
+    }
 }
 
 bool ModelManager::can_mmap_storage(const TensorState& state) const {
@@ -1421,6 +1451,7 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
         if (params_follow_compute) {
             state->params_backend = compute_backend;
         }
+        sync_cpu_repack_tag(*state);
     }
 
     return true;
