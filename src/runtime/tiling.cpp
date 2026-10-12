@@ -105,7 +105,6 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
         return tile_size;
     }
     const int max_tiles = tile_count(nearest);
-    // Fewest latents decoded (tiles * size) wins, then fewer tiles; 62 latents -> 2 x 35.
     auto pick = [&](int lowest, int highest, bool replacement) {
         int best_size     = 0;
         int64_t best_cost = 0;

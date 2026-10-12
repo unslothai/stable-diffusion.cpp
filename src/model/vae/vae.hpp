@@ -166,7 +166,7 @@ protected:
     }
 
 public:
-    // Upper bound on latent tile sizes while retrying after an out-of-memory failure (0 = none).
+    // OOM-retry cap on latent tile sizes (0 = none).
     int retry_tile_limit_w = 0;
     int retry_tile_limit_h = 0;
 
