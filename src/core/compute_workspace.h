@@ -28,7 +28,6 @@ namespace sd {
 
         ggml_backend_sched_t make_scheduler(size_t graph_size);
         bool needs_scheduler(ggml_cgraph* graph) const;
-        bool uses_blas() const { return blas_backend_ != nullptr && extra_backends_.empty(); }
 
     public:
         struct Measurement {
@@ -55,6 +54,7 @@ namespace sd {
         void synchronize() const;
         bool segment_end() noexcept;
         bool release();
+        bool uses_blas() const { return blas_backend_ != nullptr && extra_backends_.empty(); }
         bool active() const { return active_; }
         ggml_backend_sched_t scheduler() const { return scheduler_; }
         ggml_backend_t cpu_backend() const { return cpu_backend_; }

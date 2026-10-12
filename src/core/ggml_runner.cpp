@@ -770,10 +770,13 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
     auto scheduler = workspace_.scheduler();
     ggml_status status;
     if (scheduler != nullptr) {
-        if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
+        // CPU + BLAS keeps every tensor in host memory, so callbacks see the same data as on the plain CPU path.
+        auto eval_callback = workspace_.uses_blas() ? sd_get_backend_eval_callback() : nullptr;
+        if (eval_callback == nullptr && sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
             LOG_WARN("%s: eval callback is not supported with the backend scheduler; ignoring", get_desc().c_str());
             multi_device_eval_callback_warned = true;
         }
+        ggml_backend_sched_set_eval_callback(scheduler, eval_callback, sd_get_backend_eval_callback_data());
         status = ggml_backend_sched_graph_compute(scheduler, graph);
     } else {
         status = sd_backend_graph_compute_with_eval_callback(runtime_backend, graph,
