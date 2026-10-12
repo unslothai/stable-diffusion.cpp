@@ -78,7 +78,7 @@ index 490dd83a..d61e0fcb 100644
      uint64_t nb1;
      int      dim;
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 708703e5..e11d7c25 100644
+index 708703e5..031adb8a 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
 @@ -410,6 +410,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -92,7 +92,7 @@ index 708703e5..e11d7c25 100644
          case GGML_OP_IM2COL:
              {
                  n_fuse = ggml_metal_op_im2col(ctx, idx);
-@@ -4977,6 +4981,48 @@ int ggml_metal_op_roll(ggml_metal_op_t ctx, int idx) {
+@@ -4977,6 +4981,47 @@ int ggml_metal_op_roll(ggml_metal_op_t ctx, int idx) {
      return 1;
  }
  
@@ -124,7 +124,6 @@ index 708703e5..e11d7c25 100644
 +
 +    auto pipeline = ggml_metal_library_get_pipeline_rope_apply(lib, op);
 +
-+    // one threadgroup per (token, head, batch) row, threads over the d/2 rotation pairs
 +    const int nth = std::max(1, std::min(ne00/2, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)));
 +
 +    ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -154,16 +153,15 @@ index 583d1156..ef6be30f 100644
  int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 diff --git a/src/ggml-metal/kernels/rope.metal b/src/ggml-metal/kernels/rope.metal
-index 401ceacb..bdcc1283 100644
+index 401ceacb..b47563c6 100644
 --- a/src/ggml-metal/kernels/rope.metal
 +++ b/src/ggml-metal/kernels/rope.metal
-@@ -331,3 +331,47 @@ template [[host_name("kernel_rope_multi_f16")]] kernel kernel_rope_multi_t kerne
+@@ -331,3 +331,46 @@ template [[host_name("kernel_rope_multi_f16")]] kernel kernel_rope_multi_t kerne
  
  template [[host_name("kernel_rope_vision_f32")]] kernel kernel_rope_vision_t kernel_rope_vision<float>;
  template [[host_name("kernel_rope_vision_f16")]] kernel kernel_rope_vision_t kernel_rope_vision<half>;
 +
-+// precomputed RoPE: x [d, n_head, L, N] (any strides), pe [2, 2, d/2, L] rotation matrices
-+// [[cos, -sin], [sin, cos]]; dst is contiguous [d, L, n_head*N]
++// x [d, n_head, L, N] (any strides), pe [2, 2, d/2, L] of [[cos, -sin], [sin, cos]]; dst contiguous [d, L, n_head*N]
 +kernel void kernel_rope_apply_f32(
 +        constant ggml_metal_kargs_rope_apply & args,
 +        device const char * src0,

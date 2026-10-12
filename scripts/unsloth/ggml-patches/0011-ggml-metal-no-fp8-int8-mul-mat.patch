@@ -1,14 +1,12 @@
 diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
-index 498ee7ca..418e6f04 100644
+index 498ee7ca..80aaf0ec 100644
 --- a/src/ggml-metal/ggml-metal-device.m
 +++ b/src/ggml-metal/ggml-metal-device.m
-@@ -1507,6 +1507,15 @@ static bool ggml_metal_supports_mul_mat_op(
+@@ -1507,6 +1507,13 @@ static bool ggml_metal_supports_mul_mat_op(
          return false;
      }
  
-+    // no mul_mv / mul_mm kernels exist for FP8 or INT8 weights: claiming support here makes the
-+    // pipeline lookup fail and abort at encode time instead of letting the caller cast the weight
-+    // (sd.cpp casts FP8 to BF16 when this returns false) or the scheduler run the op elsewhere
++    // no FP8/INT8 mul_mv/mul_mm kernels: claiming support aborts at encode instead of letting sd.cpp cast or the op fall back
 +    if (op->src[0]->type == GGML_TYPE_F8_E4M3 ||
 +        op->src[0]->type == GGML_TYPE_F8_E5M2 ||
 +        op->src[0]->type == GGML_TYPE_I8) {
