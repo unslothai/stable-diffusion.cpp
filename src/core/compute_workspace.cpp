@@ -63,9 +63,7 @@ namespace sd {
         std::vector<ggml_backend_t> backends{backend_};
         backends.insert(backends.end(), extra_backends_.begin(), extra_backends_.end());
         if (uses_blas()) {
-            // Higher priority than the CPU backend: the scheduler hands it every MUL_MAT whose weight
-            // sits in a host buffer and that it supports (large F32-activation products). Weights in
-            // a CPU repack buffer are not host buffers, so those matmuls stay on the repack kernels.
+            // Repacked weights are not host buffers, so their matmuls stay on the repack kernels.
             backends.insert(backends.begin(), blas_backend_);
         }
         if (!sd_backend_is_cpu(backend_)) {
@@ -245,8 +243,7 @@ namespace sd {
             assign_nodes(scheduler, copy_graph);
             std::vector<size_t> sizes(extra_backends_.size() + 3);
             ggml_backend_sched_reserve_size(scheduler, copy_graph, sizes.data());
-            // The BLAS backend computes into host memory next to the CPU backend: count its share
-            // as the CPU backend's, so the residency bookkeeping sees one host device.
+            // BLAS shares host memory: count it as the CPU backend's for residency.
             const size_t first = uses_blas() ? 1 : 0;
             result.buffers.push_back({backend_, sizes[first] + (first ? sizes[0] : 0)});
             for (size_t i = 0; i < extra_backends_.size(); ++i) {
