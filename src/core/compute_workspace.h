@@ -54,6 +54,7 @@ namespace sd {
         void synchronize() const;
         bool segment_end() noexcept;
         bool release();
+        void release_blas_scratch();
         bool uses_blas() const { return blas_backend_ != nullptr && extra_backends_.empty(); }
         bool active() const { return active_; }
         ggml_backend_sched_t scheduler() const { return scheduler_; }

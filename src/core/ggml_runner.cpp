@@ -482,6 +482,7 @@ void GGMLRunner::runner_end() {
         return;
     }
     workspace_.release();
+    workspace_.release_blas_scratch();
     cache_.clear();
     logged_compute_bytes_.clear();
     logged_segment_count_ = 0;

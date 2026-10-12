@@ -298,6 +298,15 @@ namespace sd {
         return true;
     }
 
+    void ComputeWorkspace::release_blas_scratch() {
+        if (blas_backend_ == nullptr || active_ || scheduler_ != nullptr) {
+            return;
+        }
+        // ggml-blas keeps its F32 dequantization buffer until the backend is freed.
+        ggml_backend_free(blas_backend_);
+        blas_backend_ = sd_backend_blas_init();
+    }
+
     size_t ComputeWorkspace::bytes(ggml_backend_t backend) const {
         if (scheduler_ != nullptr) {
             size_t total = ggml_backend_sched_get_buffer_size(scheduler_, backend);
