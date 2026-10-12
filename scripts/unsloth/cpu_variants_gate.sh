@@ -43,7 +43,13 @@ case "$mode" in
     esac
     prefix="libggml-cpu-"
     [ "$ext" = dll ] && prefix="ggml-cpu-"
-    variants="$(cd "$dir" && ls ${prefix}*.${ext} 2>/dev/null | sed -e "s/^${prefix}//" -e "s/\.${ext}\$//" | sort | tr '\n' ' ')"
+    variants=""
+    for f in "$dir"/"$prefix"*."$ext"; do
+      [ -f "$f" ] || continue
+      v="${f##*/}"
+      v="${v#"$prefix"}"
+      variants="$variants${v%."$ext"} "
+    done
     echo "variants: $variants"
     case " $variants " in
       *" $floor "*) ;;
