@@ -866,7 +866,7 @@ void ModelManager::sync_cpu_repack_tag(TensorState& state) const {
     bool repack = cpu_repack_allowed_ && state.usage_op == GGML_OP_NONE && state.params_backend == state.compute_backend &&
                   sd_backend_is_cpu(state.compute_backend) &&
                   sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state.compute_backend), state.tensor) != nullptr;
-    if (repack && can_mmap_storage(state)) {
+    if (repack && can_mmap_storage(state) && state.sources.size() == 1 && state.sources[0].maps_directly_to(state.tensor)) {
         // A mapped weight stays in the file mapping, which the repacked layout cannot use: say so once.
         static std::once_flag logged;
         std::call_once(logged, [] { LOG_INFO("cpu weight repack: skipped for mmapped weights (drop --mmap to repack)"); });

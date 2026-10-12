@@ -67,6 +67,19 @@ struct TensorStorage {
         }
     }
 
+    // True when dst can point straight into the file bytes (no conversion, same layout).
+    bool maps_directly_to(const ggml_tensor* dst) const {
+        if (is_f64 || is_i64 ||
+#ifdef SD_USE_UPSTREAM_GGML
+            is_f8_e4m3 || is_f8_e5m2 ||
+#endif
+            type != dst->type) {
+            return false;
+        }
+        return ne[0] == dst->ne[0] && ne[1] == dst->ne[1] && ne[2] == dst->ne[2] && ne[3] == dst->ne[3] &&
+               static_cast<size_t>(nbytes()) == ggml_nbytes(dst);
+    }
+
     void unsqueeze() {
         if (n_dims == 2) {
             n_dims = 4;
