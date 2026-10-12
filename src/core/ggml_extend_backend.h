@@ -87,6 +87,15 @@ private:
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
 bool sd_backend_is_cpu(ggml_backend_t backend);
+
+// CPU weight repacking into ggml extra buffers (MUL_MAT-only, so only weights tagged matmul-only). SD_CPU_REPACK=0 disables.
+bool sd_cpu_weight_repack_enabled();
+void sd_tag_matmul_only_weight(ggml_tensor* weight);
+void sd_untag_matmul_only_weight(ggml_tensor* weight);
+bool sd_is_matmul_only_weight(const ggml_tensor* weight);
+// Unallocated weight: answers whether repacking is enabled.
+bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight);
+ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_dev, const ggml_tensor* weight);
 bool sd_backend_supports_cuda_mma(ggml_backend_t backend);
 ggml_backend_buffer_t sd_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device,
                                                           void* ptr,

@@ -211,6 +211,25 @@ ggml_tensor* ggml_ext_linear_matmul(ggml_context* ctx,
                                     ggml_tensor* x,
                                     ggml_tensor* w,
                                     bool force_prec_f32) {
+    if (sd_weight_may_be_cpu_repacked(w) && w->ne[2] == 1 && w->ne[3] == 1) {
+        // Repacked CPU matmuls (AMX, CPU_REPACK) get batch dims wrong and only take F32 activations
+        // (the type sd_cpu_repack_buffer_type_for probes with): feed contiguous 2D F32 rows.
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F32);
+        }
+        if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx, x);
+        }
+        const int64_t ne1 = x->ne[1];
+        const int64_t ne2 = x->ne[2];
+        const int64_t ne3 = x->ne[3];
+        x                 = ggml_reshape_2d(ctx, x, x->ne[0], ne1 * ne2 * ne3);
+        x                 = ggml_mul_mat(ctx, w, x);
+        if (force_prec_f32) {
+            ggml_prec_set_acc(x, GGML_PREC_F32);
+        }
+        return ggml_reshape_4d(ctx, x, x->ne[0], ne1, ne2, ne3);
+    }
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];

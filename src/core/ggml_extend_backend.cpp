@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #ifdef SD_USE_CUDA
@@ -432,6 +434,103 @@ bool sd_backend_is_cpu(ggml_backend_t backend) {
     }
     auto dev = ggml_backend_get_device(backend);
     return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+bool sd_cpu_weight_repack_enabled() {
+    static const bool env_enabled = [] {
+        const char* v = std::getenv("SD_CPU_REPACK");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    return env_enabled;
+}
+
+// Tag lives in an unused op_params slot of the leaf weight, so a reused address cannot inherit it (unlike a pointer set).
+static constexpr int32_t SD_MATMUL_ONLY_TAG     = 0x53444d4d;  // "SDMM"
+static constexpr size_t SD_MATMUL_ONLY_TAG_SLOT = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+
+void sd_tag_matmul_only_weight(ggml_tensor* weight) {
+    if (weight != nullptr && weight->op == GGML_OP_NONE) {
+        weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] = SD_MATMUL_ONLY_TAG;
+    }
+}
+
+void sd_untag_matmul_only_weight(ggml_tensor* weight) {
+    if (sd_is_matmul_only_weight(weight)) {
+        weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] = 0;
+    }
+}
+
+bool sd_is_matmul_only_weight(const ggml_tensor* weight) {
+    return weight != nullptr && weight->op == GGML_OP_NONE &&
+           weight->op_params[SD_MATMUL_ONLY_TAG_SLOT] == SD_MATMUL_ONLY_TAG;
+}
+
+bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight) {
+    if (!sd_is_matmul_only_weight(weight)) {
+        return false;
+    }
+    if (weight->buffer == nullptr) {
+        return sd_cpu_weight_repack_enabled();
+    }
+    // Buffer first: a later context disabling repack must not hide already-repacked weights.
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+    ggml_backend_dev_t dev          = ggml_backend_buft_get_device(buft);
+    return !ggml_backend_buft_is_host(buft) && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_dev, const ggml_tensor* weight) {
+    if (cpu_dev == nullptr || ggml_backend_dev_type(cpu_dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+        !sd_is_matmul_only_weight(weight) || !sd_cpu_weight_repack_enabled() ||
+        ggml_n_dims(weight) != 2 || !ggml_is_quantized(weight->type)) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto get_extra_bufts   = reg == nullptr ? nullptr
+                                            : (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts == nullptr) {
+        return nullptr;
+    }
+    static std::mutex cache_mutex;
+    static std::map<std::tuple<ggml_backend_dev_t, int, int64_t, int64_t>, ggml_backend_buffer_type_t> cache;
+    const auto key = std::make_tuple(cpu_dev, (int)weight->type, weight->ne[0], weight->ne[1]);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+    ggml_init_params params;
+    params.mem_size   = ggml_tensor_overhead() * 4;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = true;
+    ggml_context* ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    // Probe with a real 2D-F32 MUL_MAT per candidate (AMX first), the form ggml_ext_linear_matmul feeds; dummy buffer read only for its type.
+    ggml_tensor* w                    = ggml_new_tensor_2d(ctx, weight->type, weight->ne[0], weight->ne[1]);
+    ggml_tensor* x                    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weight->ne[0], 64);
+    ggml_tensor* op                   = ggml_mul_mat(ctx, w, x);
+    ggml_backend_buffer_type_t chosen = nullptr;
+    for (ggml_backend_buffer_type_t* it = get_extra_bufts(cpu_dev); it != nullptr && *it != nullptr; ++it) {
+        ggml_backend_buffer_t probe = ggml_backend_buft_alloc_buffer(*it, 0);
+        if (probe == nullptr) {
+            continue;
+        }
+        w->buffer       = probe;
+        const bool good = ggml_backend_dev_supports_op(cpu_dev, op);
+        w->buffer       = nullptr;
+        ggml_backend_buffer_free(probe);
+        if (good) {
+            chosen = *it;
+            break;
+        }
+    }
+    ggml_free(ctx);
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache.emplace(key, chosen);
+    return chosen;
 }
 
 ggml_backend_buffer_t sd_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device,

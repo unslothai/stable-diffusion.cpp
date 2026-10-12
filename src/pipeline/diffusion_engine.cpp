@@ -1059,7 +1059,18 @@ void StableDiffusionGGML::configure_weight_loading() {
         const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
         const bool streaming_constrained = params_offloaded ||
                                            backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION);
-        if (have_quantized_weight || streaming_constrained || row_split_active()) {
+        // On CPU, weights quantized at load (--type / --tensor-type-rules) cannot take a merged LoRA.
+        const ggml_type target_wtype     = sd_type_to_ggml_type(sd_ctx_params->wtype);
+        bool quantized_on_load           = target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype);
+        for (const auto& rule : parse_tensor_type_rules(SAFE_STR(sd_ctx_params->tensor_type_rules))) {
+            quantized_on_load = quantized_on_load || ggml_is_quantized(rule.second);
+        }
+        bool lora_module_on_cpu = false;
+        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE}) {
+            lora_module_on_cpu = lora_module_on_cpu || sd_backend_is_cpu(backend_for(module));
+        }
+        const bool cpu_quantized_on_load = quantized_on_load && lora_module_on_cpu;
+        if (have_quantized_weight || cpu_quantized_on_load || streaming_constrained || row_split_active()) {
             apply_lora_immediately = false;
         } else {
             apply_lora_immediately = true;
@@ -1081,6 +1092,9 @@ void StableDiffusionGGML::configure_weight_loading() {
     } else {
         apply_lora_immediately = false;
     }
+
+    // Merging a LoRA rewrites weights in place, which a repacked CPU weight cannot take.
+    model_manager->set_cpu_repack_allowed(!apply_lora_immediately);
 
     bool needs_writable_mmap = enable_mmap && apply_lora_immediately;
     model_manager->set_writable_mmap(needs_writable_mmap);
