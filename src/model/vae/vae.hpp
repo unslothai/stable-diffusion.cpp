@@ -255,14 +255,14 @@ public:
         if (!circular_x && !circular_x_enabled) {
             tile_size_w = sd_tiling_seam_safe_tile_size(static_cast<int>(latent_w), tile_size_w, tile_overlap,
                                                         retry_tile_limit_w);
-        } else if (retry_tile_limit_w >= 4) {
-            tile_size_w = std::min(tile_size_w, retry_tile_limit_w);
+        } else if (retry_tile_limit_w > 0) {
+            tile_size_w = std::min(tile_size_w, std::max(4, retry_tile_limit_w));
         }
         if (!circular_y && !circular_y_enabled) {
             tile_size_h = sd_tiling_seam_safe_tile_size(static_cast<int>(latent_h), tile_size_h, tile_overlap,
                                                         retry_tile_limit_h);
-        } else if (retry_tile_limit_h >= 4) {
-            tile_size_h = std::min(tile_size_h, retry_tile_limit_h);
+        } else if (retry_tile_limit_h > 0) {
+            tile_size_h = std::min(tile_size_h, std::max(4, retry_tile_limit_h));
         }
         return true;
     }

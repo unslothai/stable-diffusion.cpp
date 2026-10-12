@@ -64,7 +64,7 @@ static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
 int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor, int max_tile_size) {
     // Overlaps of 1-2 latents (32-latent tiles on a 62 axis) show as a seam; require >= half the target and >= 2.
     const int min_tile_size = 4;
-    const int limit         = max_tile_size >= min_tile_size ? max_tile_size : INT_MAX;
+    const int limit         = max_tile_size > 0 ? std::max(max_tile_size, min_tile_size) : INT_MAX;
     tile_size               = std::min(tile_size, limit);
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;

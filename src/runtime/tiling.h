@@ -44,7 +44,7 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
                                            const TileBatchProcessCallback& on_processing,
                                            bool silent = false);
 
-// tile_size adjusted so tiles never barely overlap; max_tile_size > 0 (OOM retry) caps it, ignored below 4.
+// tile_size adjusted so tiles never barely overlap; max_tile_size > 0 (OOM retry) caps it, never below 4.
 int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor, int max_tile_size = 0);
 
 #endif  // __SD_RUNTIME_TILING_H__

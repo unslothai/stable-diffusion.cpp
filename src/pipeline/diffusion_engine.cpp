@@ -2906,8 +2906,8 @@ static bool sd_vae_tile_sizes(VAE& vae,
                               int last_h,
                               int& tile_size_w,
                               int& tile_size_h) {
-    vae.retry_tile_limit_w = last_w > 0 ? last_w - 1 : 0;
-    vae.retry_tile_limit_h = last_h > 0 ? last_h - 1 : 0;
+    vae.retry_tile_limit_w = last_w > 0 ? std::max(4, last_w - 1) : 0;
+    vae.retry_tile_limit_h = last_h > 0 ? std::max(4, last_h - 1) : 0;
     tile_size_w            = static_cast<int>(latent_w);
     tile_size_h            = static_cast<int>(latent_h);
     float tile_overlap;
