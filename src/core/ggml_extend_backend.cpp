@@ -620,6 +620,33 @@ ggml_backend_t sd_backend_cpu_init() {
     return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
 }
 
+ggml_backend_t sd_backend_blas_init() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SD_CPU_BLAS");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    if (!enabled) {
+        return nullptr;
+    }
+    ggml_backend_load_all_once();
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("BLAS");
+    if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
+        return nullptr;
+    }
+    return ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr);
+}
+
+bool sd_backend_set_n_threads_any(ggml_backend_t backend, int n_threads) {
+    auto dev = backend == nullptr ? nullptr : ggml_backend_get_device(backend);
+    auto reg = dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(dev);
+    auto fn  = reg == nullptr ? nullptr : (ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (fn == nullptr) {
+        return false;
+    }
+    fn(backend, n_threads);
+    return true;
+}
+
 bool sd_backend_cpu_set_n_threads(ggml_backend_t backend, int n_threads) {
     if (backend == nullptr) {
         return false;
