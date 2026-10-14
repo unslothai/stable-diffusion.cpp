@@ -17,12 +17,25 @@ struct IMatrixStats {
     int ncall = 0;
 };
 
+// How many collected matmuls saw each src1 layout; reported when the imatrix is saved.
+struct IMatrixLayoutCounts {
+    long long calls             = 0;
+    long long contiguous_f32_2d = 0;
+    long long non_contiguous    = 0;
+    long long batched           = 0;
+    long long f16               = 0;
+    long long bf16              = 0;
+    long long rejected          = 0;
+};
+
 class IMatrixCollector {
 private:
     std::unordered_map<std::string, IMatrixStats> stats_ = {};
     std::mutex mutex_;
     int last_call_ = 0;
-    std::vector<float> src1_data_;
+    std::vector<char> src1_bytes_;
+    std::vector<float> row_f32_;
+    IMatrixLayoutCounts layout_;
     std::vector<char> ids_;  // the expert ids from ggml_mul_mat_id
 
 public:
@@ -30,6 +43,7 @@ public:
     bool collect_imatrix(struct ggml_tensor* t, bool ask, void* user_data);
     void save_imatrix(std::string fname, int ncall = -1) const;
     bool load_imatrix(const char* fname);
+    const IMatrixLayoutCounts& layout_counts() const { return layout_; }
     std::vector<float> get_values(const std::string& key) const {
         auto it = stats_.find(key);
         if (it != stats_.end()) {
