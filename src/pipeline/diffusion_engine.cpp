@@ -1285,8 +1285,10 @@ bool StableDiffusionGGML::validate_and_load_runners() {
     if (clip_vision) {
         clip_vision->set_flash_attention_enabled(flash_attention_for(SDBackendModule::CLIP_VISION));
     }
+    bool vae_fa = false;
     if (first_stage_model || preview_vae || audio_vae_model) {
         const bool enabled = flash_attention_for(SDBackendModule::VAE);
+        vae_fa             = enabled;
         if (first_stage_model) {
             first_stage_model->set_flash_attention_enabled(enabled);
         }
@@ -1314,8 +1316,10 @@ bool StableDiffusionGGML::validate_and_load_runners() {
     // The H3 video VAE decoder is a ViT whose f32 L x L attention scores dominate decode time, so on CUDA and ROCm
     // --diffusion-fa covers it too, without switching the text encoder. It decoded slower on Vulkan, so other
     // backends keep the old path unless SD_H3_VAE_FLASH_ATTN=1; SD_H3_VAE_FLASH_ATTN=0 restores it everywhere.
-    if (!sd_ctx_params->flash_attn && sd_ctx_params->diffusion_flash_attn && first_stage_model &&
-        sd_version_is_minimax_h3(version)) {
+    // Keyed on the resolved per-module state: the CLI now spells --diffusion-fa as --flash-attn off,diffusion=on and
+    // never sets the legacy diffusion_flash_attn flag. An explicit vae= assignment is the user's choice and wins.
+    const bool vae_fa_assigned = std::string(SAFE_STR(sd_ctx_params->flash_attn_mode)).find("vae=") != std::string::npos;
+    if (diffusion_fa && !vae_fa && !vae_fa_assigned && first_stage_model && sd_version_is_minimax_h3(version)) {
         const char* env                 = getenv("SD_H3_VAE_FLASH_ATTN");
         ggml_backend_t vae_backend      = backend_for(SDBackendModule::VAE);
         const bool fa_faster_by_default = sd_backend_is(vae_backend, "CUDA") || sd_backend_is(vae_backend, "ROCm");
