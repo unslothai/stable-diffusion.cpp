@@ -1,8 +1,8 @@
 diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
-index 498ee7ca..80aaf0ec 100644
+index 8634d284..1dc0d248 100644
 --- a/src/ggml-metal/ggml-metal-device.m
 +++ b/src/ggml-metal/ggml-metal-device.m
-@@ -1507,6 +1507,13 @@ static bool ggml_metal_supports_mul_mat_op(
+@@ -1521,6 +1521,13 @@ static bool ggml_metal_supports_mul_mat_op(
          return false;
      }
  

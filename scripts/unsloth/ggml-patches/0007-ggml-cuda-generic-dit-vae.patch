@@ -1,8 +1,8 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 41ac28bb..fa83c5e6 100644
+index f7ef1573..bec0b7b6 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
-@@ -2576,6 +2576,14 @@ extern "C" {
+@@ -2581,6 +2581,14 @@ extern "C" {
      // ggml_rope_pe_permute of ggml_rms_norm(a, eps) (no weight): every head row of `a` is
      // RMS-normalised first, with the same arithmetic as GGML_OP_RMS_NORM on the same backend, so
      // the result matches the two-op chain bit for bit where the backend supports it.
@@ -18,10 +18,10 @@ index 41ac28bb..fa83c5e6 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * a,
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index bdd36aea..2883f5df 100644
+index ebe6e202..f7d6b8f7 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -12397,6 +12397,7 @@ void ggml_compute_forward_rope_pe_permute(
+@@ -12703,6 +12703,7 @@ void ggml_compute_forward_rope_pe_permute(
      const float scale = ggml_get_op_params_f32(dst, 1);
      const bool  norm  = ggml_get_op_params_i32(dst, 2) != 0;
      const float eps   = ggml_get_op_params_f32(dst, 3);
@@ -29,7 +29,7 @@ index bdd36aea..2883f5df 100644
      const int   half  = n_rot / 2;
  
      const int64_t D = src0->ne[0];
-@@ -12435,17 +12436,28 @@ void ggml_compute_forward_rope_pe_permute(
+@@ -12741,17 +12742,28 @@ void ggml_compute_forward_rope_pe_permute(
  
          if (n_rot > 0) {
              const float * t = (const float *) pe->data + l * (int64_t) half * 4;
@@ -69,7 +69,7 @@ index bdd36aea..2883f5df 100644
          if (D > n_rot) {
              memcpy(y.data() + n_rot, x + n_rot, (D - n_rot) * sizeof(float));
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 831d0de8..8f4e6f3d 100644
+index f19aba44..05ac1936 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,9 @@
@@ -82,7 +82,7 @@ index 831d0de8..8f4e6f3d 100644
  #include "ggml-cuda/opt-step-adamw.cuh"
  #include "ggml-cuda/opt-step-sgd.cuh"
  #include "ggml-cuda/out-prod.cuh"
-@@ -4313,6 +4316,106 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
+@@ -4538,6 +4541,106 @@ static int ggml_cuda_try_fuse_cublas_epilogue(ggml_backend_cuda_context & ctx, g
      return consumed;
  }
  
@@ -188,10 +188,10 @@ index 831d0de8..8f4e6f3d 100644
 +
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4322,6 +4425,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
- 
-     ggml_tensor * node = cgraph->nodes[i];
+     if (ggml_cuda_fusion_disabled()) {
+@@ -4566,6 +4669,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
  
 +    if (node->op == GGML_OP_GROUP_NORM) {
 +        const int consumed = ggml_cuda_try_fuse_group_norm(*cuda_ctx, cgraph, i);
@@ -210,7 +210,7 @@ index 831d0de8..8f4e6f3d 100644
      if (node->op == GGML_OP_MUL) {
          ggml_cuda_moe_weighted_reduction_match match;
          if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-@@ -4334,6 +4451,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4578,6 +4695,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -898,7 +898,7 @@ index 00000000..da57e590
 +// GGML_CUDA_NORM_CHANNEL=0 turns it off.
 +int ggml_cuda_try_fuse_rms_norm_channel(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
-index 9c9385f8..ae2def32 100644
+index 854d47b7..7ed01b7b 100644
 --- a/src/ggml-cuda/norm.cu
 +++ b/src/ggml-cuda/norm.cu
 @@ -1,4 +1,5 @@
@@ -907,7 +907,7 @@ index 9c9385f8..ae2def32 100644
  #include <cstdint>
  
  template <int block_size>
-@@ -534,6 +535,11 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -567,6 +568,11 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      memcpy(&eps, dst->op_params + 1, sizeof(float));
      GGML_ASSERT(eps >= 0.0f);
  
@@ -1099,7 +1099,7 @@ index b6dd7a69..2fe9a599 100644
  }
  
 diff --git a/src/ggml-cuda/rope.cu b/src/ggml-cuda/rope.cu
-index d332618b..fb5f62bb 100644
+index 33cee75a..ef25d68f 100644
 --- a/src/ggml-cuda/rope.cu
 +++ b/src/ggml-cuda/rope.cu
 @@ -13,6 +13,9 @@ static __global__ void rope_apply_f32(
@@ -1113,10 +1113,10 @@ index d332618b..fb5f62bb 100644
      if (index >= pairs) {
          return;
 diff --git a/src/ggml.c b/src/ggml.c
-index 1fe59a0e..016995c0 100644
+index 1dcc8a0f..ef3c750f 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -5751,6 +5751,14 @@ struct ggml_tensor * ggml_rope_pe_permute_rms(
+@@ -5773,6 +5773,14 @@ struct ggml_tensor * ggml_rope_pe_permute_rms(
      return result;
  }
  

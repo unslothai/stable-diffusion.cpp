@@ -113,6 +113,7 @@ const char* model_version_to_str[] = {
     "Z-Image L2P",
     "Iris-3B",
     "Flux.3 Image Klein",
+    "MOSS-Image",
 };
 
 static_assert(VERSION_COUNT == sizeof(model_version_to_str) / sizeof(model_version_to_str[0]),
@@ -1058,9 +1059,15 @@ void StableDiffusionGGML::configure_weight_loading() {
     const auto& model_loader  = model_manager->loader();
     const auto wtype_stat     = model_loader.get_wtype_stat();
     bool have_int8_tensorwise = false;
+    bool have_quant_type_rule = false;
     for (const auto& [_, tensor_storage] : model_loader.get_tensor_storage_map()) {
         if (tensor_storage.is_int8_tensorwise) {
             have_int8_tensorwise = true;
+        }
+        if (tensor_storage.expected_type < GGML_TYPE_COUNT && ggml_is_quantized(tensor_storage.expected_type)) {
+            have_quant_type_rule = true;
+        }
+        if (have_int8_tensorwise && have_quant_type_rule) {
             break;
         }
     }
@@ -1077,18 +1084,8 @@ void StableDiffusionGGML::configure_weight_loading() {
         const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
         const bool streaming_constrained = params_offloaded ||
                                            backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION);
-        // On CPU, weights quantized at load (--type / --tensor-type-rules) cannot take a merged LoRA.
-        const ggml_type target_wtype     = sd_type_to_ggml_type(sd_ctx_params->wtype);
-        bool quantized_on_load           = target_wtype < GGML_TYPE_COUNT && ggml_is_quantized(target_wtype);
-        for (const auto& rule : parse_tensor_type_rules(SAFE_STR(sd_ctx_params->tensor_type_rules))) {
-            quantized_on_load = quantized_on_load || ggml_is_quantized(rule.second);
-        }
-        bool lora_module_on_cpu = false;
-        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE}) {
-            lora_module_on_cpu = lora_module_on_cpu || sd_backend_is_cpu(backend_for(module));
-        }
-        const bool cpu_quantized_on_load = quantized_on_load && lora_module_on_cpu;
-        if (have_quantized_weight || cpu_quantized_on_load || streaming_constrained || row_split_active()) {
+
+        if (have_quant_type_rule || have_quantized_weight || streaming_constrained || row_split_active()) {
             apply_lora_immediately = false;
         } else {
             apply_lora_immediately = true;
@@ -1522,9 +1519,10 @@ bool StableDiffusionGGML::build_denoiser() {
                    sd_version_is_boogu_image(version) ||
                    sd_version_is_pid(version) ||
                    sd_version_is_ideogram4(version) ||
-                   version == VERSION_IRIS) {
+                   version == VERSION_IRIS ||
+                   version == VERSION_MOSS_IMAGE) {
             pred_type = FLOW_PRED;
-            if (sd_version_is_wan(version)) {
+            if (sd_version_is_wan(version) || version == VERSION_MOSS_IMAGE) {
                 default_flow_shift = 5.f;
             } else if (sd_version_is_hunyuan_video(version)) {
                 default_flow_shift = 7.f;
@@ -2676,7 +2674,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     unet_extra.ip_scale   = ip_adapter_strength;
                 }
                 diffusion_params.extra = unet_extra;
-            } else if (sd_version_is_sd3(version)) {
+            } else if (sd_version_is_sd3(version) || version == VERSION_MOSS_IMAGE) {
                 diffusion_params.extra = SkipLayerDiffusionExtra{local_skip_layers};
             } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
                 diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
@@ -2905,9 +2903,12 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         if (uncond_out.empty() && !uncond.empty()) {
             if (!skip_uncond) {
                 const std::vector<int>* uncond_skip_layers = nullptr;
+                const std::vector<int> moss_skip_layers    = {22};
                 if (is_skiplayer_step && slg_uncond) {
                     LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
                     uncond_skip_layers = &skip_layer_guidance.layers();
+                } else if (version == VERSION_MOSS_IMAGE) {
+                    uncond_skip_layers = &moss_skip_layers;
                 }
                 uncond_out = run_condition(uncond,
                                            uncond.c_concat.empty() ? nullptr : &uncond.c_concat,

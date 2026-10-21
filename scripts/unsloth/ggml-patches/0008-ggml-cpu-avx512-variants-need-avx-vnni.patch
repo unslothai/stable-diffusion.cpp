@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/arch/x86/cpu-feats.cpp b/src/ggml-cpu/arch/x86/cpu-feats.cpp
-index d775a036..e3848609 100644
+index d775a036..a29335b9 100644
 --- a/src/ggml-cpu/arch/x86/cpu-feats.cpp
 +++ b/src/ggml-cpu/arch/x86/cpu-feats.cpp
 @@ -300,6 +300,10 @@ static int ggml_backend_cpu_x86_score() {

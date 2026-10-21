@@ -23,11 +23,14 @@ the 256-thread launch.
  src/ggml-cuda/norm.cu      |  63 ++++++++++++
  2 files changed, 262 insertions(+), 1 deletion(-)
 
+[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
+ the whole patch as one diff, regenerated from the port.]
+---
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index a153de57..72d090e3 100644
+index 8a295c19..74f3373a 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2014,8 +2014,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+@@ -2061,8 +2061,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
      static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
  };
  
@@ -102,7 +105,7 @@ index a153de57..72d090e3 100644
      using traits = batched_mul_mat_traits<compute_type>;
      using cuda_t = typename traits::cuda_type;
  
-@@ -2223,8 +2288,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -2270,8 +2335,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
  
      // Convert output back to F32 if needed
      if (cu_data_type != CUDA_R_32F) {
@@ -120,7 +123,7 @@ index a153de57..72d090e3 100644
      }
  }
  
-@@ -4111,6 +4185,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4336,6 +4410,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -153,7 +156,7 @@ index a153de57..72d090e3 100644
 +        return true;
 +    }
 +    const int64_t ne11 = src1->ne[1];
-+    return !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
++    return !ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) &&
 +           !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false);
 +}
 +
@@ -243,8 +246,8 @@ index a153de57..72d090e3 100644
 +
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4825,6 +5016,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (ggml_cuda_fusion_disabled()) {
+@@ -5083,6 +5274,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -259,10 +262,10 @@ index a153de57..72d090e3 100644
          ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
 diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
-index c3758cd5..9c9385f8 100644
+index d804b933..854d47b7 100644
 --- a/src/ggml-cuda/norm.cu
 +++ b/src/ggml-cuda/norm.cu
-@@ -301,10 +301,68 @@ static void group_norm_f32_cuda(
+@@ -332,12 +332,70 @@ static void group_norm_f32_cuda(
      }
  }
  
@@ -282,60 +285,62 @@ index c3758cd5..9c9385f8 100644
 +#endif
 +}
 +
-+template <int block_size, bool do_multiply>
++template <int block_size, bool do_multiply, bool do_scale>
 +static void rms_norm_f32_launch_small(
-+        const float * x, float * dst, const int ncols, const dim3 blocks_num,
++        const float * x, float * dst, const int ncols, const int nchannels, const int nsamples, const dim3 blocks_num,
 +        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
 +        const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
 +        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
-+        cudaStream_t stream) {
++        cudaStream_t stream, const float scale_out) {
 +    const dim3 block_dims(block_size, 1, 1);
 +    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_size > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
-+    ggml_cuda_kernel_launch(rms_norm_f32<block_size, do_multiply>, launch_params,
-+        x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
++    ggml_cuda_kernel_launch(rms_norm_f32<block_size, do_multiply, false, do_scale>, launch_params,
++        x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
 +        mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), scale_out);
 +}
 +
-+template <bool do_multiply>
++template <bool do_multiply, bool do_scale = false>
 +static bool rms_norm_f32_try_small(
-+        const float * x, float * dst, const int ncols, const dim3 blocks_num,
++        const float * x, float * dst, const int ncols, const int nchannels, const int nsamples, const dim3 blocks_num,
 +        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
 +        const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
 +        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
-+        cudaStream_t stream) {
++        cudaStream_t stream, const float scale_out = 1.0f) {
 +    if (ncols > 128 || !rms_norm_small_rows_enabled()) {
 +        return false;
 +    }
 +    if (ncols <= 32) {
-+        rms_norm_f32_launch_small<32, do_multiply>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
-+            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream);
++        rms_norm_f32_launch_small<32, do_multiply, do_scale>(x, dst, ncols, nchannels, nsamples, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
++            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream, scale_out);
 +    } else if (ncols <= 64) {
-+        rms_norm_f32_launch_small<64, do_multiply>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
-+            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream);
++        rms_norm_f32_launch_small<64, do_multiply, do_scale>(x, dst, ncols, nchannels, nsamples, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
++            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream, scale_out);
 +    } else {
-+        rms_norm_f32_launch_small<128, do_multiply>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
-+            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream);
++        rms_norm_f32_launch_small<128, do_multiply, do_scale>(x, dst, ncols, nchannels, nsamples, blocks_num, stride_row, stride_channel, stride_sample, eps, mul,
++            mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, stream, scale_out);
 +    }
 +    return true;
 +}
 +
+ template <bool do_scale = false>
  static void rms_norm_f32_cuda(
          const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
-         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
-     const dim3 blocks_num(nrows, nchannels, nsamples);
-+    if (rms_norm_f32_try_small<false>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps,
-+            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), stream)) {
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
+         const float scale_out = 1.0f) {
+     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
++    if (rms_norm_f32_try_small<false, do_scale>(x, dst, ncols, nchannels, nsamples, blocks_num, stride_row, stride_channel, stride_sample, eps,
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), stream, scale_out)) {
 +        return;
 +    }
      if (ncols < 1024) {
          const dim3 block_dims(256, 1, 1);
          const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-@@ -360,6 +418,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+@@ -393,6 +451,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
          const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
          const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
          const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
-+        if (rms_norm_f32_try_small<true>(x, dst, ncols, blocks_num, stride_row, stride_channel, stride_sample, eps,
++        if (rms_norm_f32_try_small<true>(x, dst, ncols, nchannels, nsamples, blocks_num, stride_row, stride_channel, stride_sample, eps,
 +                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
 +                mul_nchannels_packed, mul_nsamples_packed, stream)) {
 +            return;
@@ -343,6 +348,3 @@ index c3758cd5..9c9385f8 100644
          if (ncols < 1024) {
              const dim3 block_dims(256, 1, 1);
              const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
--- 
-2.43.0
-

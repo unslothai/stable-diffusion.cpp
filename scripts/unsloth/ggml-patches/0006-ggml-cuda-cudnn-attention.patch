@@ -49,11 +49,14 @@ lengths, GQA with batch, F32 K/V, permuted Q) and unmasked perf cases.
  create mode 100644 src/ggml-cuda/cudnn-attn.cu
  create mode 100644 src/ggml-cuda/cudnn-attn.cuh
 
+[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
+ the whole patch as one diff, regenerated from the port.]
+---
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 752dabbb..91e94ba3 100644
+index 35252a83..da110ce1 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -208,6 +208,9 @@ set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
+@@ -209,6 +209,9 @@ set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
                                              "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
  option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
  option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
@@ -64,10 +67,10 @@ index 752dabbb..91e94ba3 100644
                                              "ggml: cuda link binary compression mode; requires cuda 12.8+")
  set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
-index d272f6f7..ba2a2080 100644
+index 37aa6d94..7c2fb7dd 100644
 --- a/src/ggml-cuda/CMakeLists.txt
 +++ b/src/ggml-cuda/CMakeLists.txt
-@@ -115,11 +115,60 @@ if (CUDAToolkit_FOUND)
+@@ -127,11 +127,60 @@ if (CUDAToolkit_FOUND)
      ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
      list(APPEND GGML_SOURCES_CUDA ${SRCS})
  
@@ -852,7 +855,7 @@ index 00000000..067bea63
 +// so the caller runs its own kernel.
 +bool ggml_cuda_cudnn_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index f0fe5577..2eda0ccd 100644
+index 9fb380e8..84c4e653 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
 @@ -4,6 +4,7 @@
@@ -863,7 +866,7 @@ index f0fe5577..2eda0ccd 100644
  
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
  // one list per group of ncols1 queries: a column is selected if any query of the group can see it
-@@ -758,11 +759,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -760,11 +761,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
          ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
  
@@ -881,10 +884,10 @@ index f0fe5577..2eda0ccd 100644
          case BEST_FATTN_KERNEL_NONE:
              GGML_ABORT("fatal error");
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 7e98d729..831d0de8 100644
+index 5c799ccd..f19aba44 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -922,7 +922,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
+@@ -961,7 +961,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
          ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
          : ggml_nbytes(tensor);
      if (tensor->op == GGML_OP_SAGE_ATTN) {
@@ -947,12 +950,12 @@ index 126c7a74..e2648857 100644
  
  #endif
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index af772ae9..778bed20 100644
+index 108da4a2..62be5695 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11099,6 +11099,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
-     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -12008,6 +12008,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
  
 +    // unmasked F16 K/V with the MiniMax-H3 DiT head layout (42 heads x 128), the shape class the CUDA
 +    // cuDNN attention path takes: odd and tile-aligned lengths, GQA with batch, F32 K/V, head size 64.
@@ -972,8 +975,8 @@ index af772ae9..778bed20 100644
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
      test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
-@@ -11527,6 +11542,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+@@ -12469,6 +12484,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
      }
  
 +    // unmasked diffusion attention: MiniMax-H3 DiT (19315 tokens x 56 heads at 960x544x124; 22440 x 42),
@@ -989,6 +992,3 @@ index af772ae9..778bed20 100644
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
--- 
-2.43.0
-

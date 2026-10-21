@@ -1,8 +1,8 @@
 diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
-index dc6b695e..d1a624ad 100644
+index 2c7972b0..1d2e0318 100644
 --- a/src/ggml-metal/ggml-metal-device.cpp
 +++ b/src/ggml-metal/ggml-metal-device.cpp
-@@ -2391,6 +2391,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_roll(ggml_metal_
+@@ -2564,6 +2564,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_roll(ggml_metal_
      return res;
  }
  
@@ -24,10 +24,10 @@ index dc6b695e..d1a624ad 100644
      assert(op->op == GGML_OP_PAD);
  
 diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
-index 1bdaecc7..b41813a9 100644
+index 4012b9d5..48d77221 100644
 --- a/src/ggml-metal/ggml-metal-device.h
 +++ b/src/ggml-metal/ggml-metal-device.h
-@@ -171,6 +171,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale
+@@ -173,6 +173,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad               (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d    (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_roll              (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -36,10 +36,10 @@ index 1bdaecc7..b41813a9 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_timestep_embedding(ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw    (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
-index a81d3a8c..498ee7ca 100644
+index 44519903..8634d284 100644
 --- a/src/ggml-metal/ggml-metal-device.m
 +++ b/src/ggml-metal/ggml-metal-device.m
-@@ -1681,6 +1681,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+@@ -1695,6 +1695,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
          case GGML_OP_ROPE:
          case GGML_OP_ROPE_BACK:
              return true;
@@ -51,10 +51,10 @@ index a81d3a8c..498ee7ca 100644
              return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
          case GGML_OP_CONV_2D:
 diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
-index 490dd83a..d61e0fcb 100644
+index 4ffb5a77..a358e659 100644
 --- a/src/ggml-metal/ggml-metal-impl.h
 +++ b/src/ggml-metal/ggml-metal-impl.h
-@@ -1166,6 +1166,22 @@ typedef struct {
+@@ -1177,6 +1177,22 @@ typedef struct {
      int32_t  s3;
  } ggml_metal_kargs_roll;
  
@@ -78,10 +78,10 @@ index 490dd83a..d61e0fcb 100644
      uint64_t nb1;
      int      dim;
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 708703e5..031adb8a 100644
+index 53c98161..551d62b0 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -410,6 +410,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+@@ -414,6 +414,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
              {
                  n_fuse = ggml_metal_op_rope(ctx, idx);
              } break;
@@ -92,7 +92,7 @@ index 708703e5..031adb8a 100644
          case GGML_OP_IM2COL:
              {
                  n_fuse = ggml_metal_op_im2col(ctx, idx);
-@@ -4977,6 +4981,47 @@ int ggml_metal_op_roll(ggml_metal_op_t ctx, int idx) {
+@@ -5257,6 +5261,47 @@ int ggml_metal_op_roll(ggml_metal_op_t ctx, int idx) {
      return 1;
  }
  
