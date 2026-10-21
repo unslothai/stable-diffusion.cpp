@@ -15,7 +15,6 @@
 #include "core/ggml_extend.h"
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_runner.h"
-#include "core/ggml_extend_backend.h"
 #include "model.h"
 
 class GGMLBlock {

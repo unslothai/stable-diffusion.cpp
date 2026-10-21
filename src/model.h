@@ -67,6 +67,7 @@ enum SDVersion {
     VERSION_Z_IMAGE_L2P,
     VERSION_IRIS,
     VERSION_FLUX3,
+    VERSION_MOSS_IMAGE,
     VERSION_COUNT,
 };
 
@@ -291,7 +292,8 @@ static inline bool sd_version_uses_flux2_vae(SDVersion version) {
         sd_version_is_lens(version) ||
         sd_version_is_ideogram4(version) ||
         sd_version_is_sefi_image(version) ||
-        sd_version_is_llada_image(version)) {
+        sd_version_is_llada_image(version) ||
+        version == VERSION_MOSS_IMAGE) {
         return true;
     }
     return false;
@@ -348,7 +350,8 @@ static inline bool sd_version_is_dit(SDVersion version) {
         sd_version_is_mage_flow(version) ||
         sd_version_is_sensenova_u1(version) ||
         sd_version_is_pixart(version) ||
-        version == VERSION_IRIS) {
+        version == VERSION_IRIS ||
+        version == VERSION_MOSS_IMAGE) {
         return true;
     }
     return false;
@@ -360,6 +363,29 @@ static inline bool sd_version_is_unet_edit(SDVersion version) {
 
 static inline bool sd_version_is_control(SDVersion version) {
     return version == VERSION_FLUX_CONTROLS || version == VERSION_FLEX_2;
+}
+
+// These model families consume uploaded reference images as generation
+// conditioning. Inpaint and control variants keep their init-image semantics.
+static inline bool sd_version_supports_ref_image_conditioning(SDVersion version) {
+    if (sd_version_is_inpaint(version) || sd_version_is_control(version) || version == VERSION_CHROMA_RADIANCE) {
+        return false;
+    }
+
+    return sd_version_is_unet_edit(version) ||
+           sd_version_is_flux(version) ||
+           sd_version_is_flux3(version) ||
+           sd_version_is_flux2(version) ||
+           sd_version_is_qwen_image(version) ||
+           sd_version_is_longcat(version) ||
+           sd_version_is_z_image(version) ||
+           sd_version_is_boogu_image(version) ||
+           sd_version_is_llada_image(version) ||
+           sd_version_is_krea2(version) ||
+           sd_version_is_mage_flow(version) ||
+           sd_version_is_anima(version) ||
+           sd_version_is_sefi_image(version) ||
+           sd_version_is_pid(version);
 }
 
 static bool sd_version_is_inpaint_or_unet_edit(SDVersion version) {
