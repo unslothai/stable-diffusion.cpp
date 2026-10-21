@@ -42,8 +42,11 @@ partial and full rotation, F32/F16 outputs, chained segments and the scales.
  create mode 100644 src/ggml-cuda/rope-pe.cu
  create mode 100644 src/ggml-cuda/rope-pe.cuh
 
+[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
+ the whole patch as one diff, regenerated from the port.]
+---
 diff --git a/include/ggml.h b/include/ggml.h
-index 761d3f28..8c92967a 100644
+index 49a6751d..bbafe175 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -607,6 +607,9 @@ extern "C" {
@@ -56,7 +59,7 @@ index 761d3f28..8c92967a 100644
  
          GGML_OP_COUNT,
      };
-@@ -2551,6 +2554,65 @@ extern "C" {
+@@ -2556,6 +2559,65 @@ extern "C" {
          float scale,
          float tau);
  
@@ -123,7 +126,7 @@ index 761d3f28..8c92967a 100644
              struct ggml_tensor * a,
              enum ggml_prec       prec),
 diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
-index 98ba5020..426eaa86 100644
+index fb447e97..899c8ad4 100644
 --- a/src/ggml-backend-meta.cpp
 +++ b/src/ggml-backend-meta.cpp
 @@ -153,7 +153,8 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
@@ -137,10 +140,10 @@ index 98ba5020..426eaa86 100644
      }
      const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 92de0631..d4dcefdf 100644
+index fd55589f..30b8cbb5 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -2224,6 +2224,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2220,6 +2220,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_glu(params, tensor);
              } break;
@@ -159,7 +162,7 @@ index 92de0631..d4dcefdf 100644
          case GGML_OP_GET_REL_POS:
              {
                  ggml_compute_forward_get_rel_pos(params, tensor);
-@@ -2558,6 +2570,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2554,6 +2566,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_ROPE_BACK:
          case GGML_OP_ROPE_APPLY:
          case GGML_OP_ADD_REL_POS:
@@ -170,7 +173,7 @@ index 92de0631..d4dcefdf 100644
                  n_tasks = n_threads;
              } break;
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index b68afce1..f4ca82e7 100644
+index e8ef14f2..94333d30 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -12,6 +12,7 @@
@@ -181,7 +184,7 @@ index b68afce1..f4ca82e7 100644
  
  struct ggml_fp8_e4m3_cpu {
      uint8_t value;
-@@ -12380,3 +12381,156 @@ void ggml_compute_forward_quantize_i8_convrot(const ggml_compute_params * params
+@@ -12686,3 +12687,156 @@ void ggml_compute_forward_quantize_i8_convrot(const ggml_compute_params * params
          memset(dst_data + rows * dst->nb[1], 0, (size_t)(rows_padded - rows) * dst->nb[1]);
      }
  }
@@ -353,7 +356,7 @@ index 19d7075e..d731a958 100644
  void ggml_compute_forward_add_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_rwkv_wkv6(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 72d090e3..7e98d729 100644
+index cd0cee80..5c799ccd 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -47,6 +47,8 @@
@@ -365,7 +368,7 @@ index 72d090e3..7e98d729 100644
  #include "ggml-cuda/snake.cuh"
  #include "ggml-cuda/softcap.cuh"
  #include "ggml-cuda/softmax.cuh"
-@@ -3123,6 +3125,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -3253,6 +3255,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_SOL_ATTN:
              ggml_cuda_sol_attn(ctx, dst);
              break;
@@ -381,7 +384,7 @@ index 72d090e3..7e98d729 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -6492,6 +6503,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6784,6 +6795,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_sage_attn_supported(dev_ctx->device, op);
          case GGML_OP_SOL_ATTN:
              return ggml_cuda_sol_attn_supported(dev_ctx->device, op);
@@ -701,10 +704,10 @@ index 00000000..b68b6af4
 +
 +bool ggml_cuda_rope_pe_permute_supported(const ggml_tensor * op);
 diff --git a/src/ggml.c b/src/ggml.c
-index 562b6eb9..165514d9 100644
+index da9ccada..a9f0b47d 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -1118,9 +1118,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1129,9 +1129,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "SAGE_ATTN",
      "SOL_ATTN",
      "ROPE_APPLY",
@@ -718,7 +721,7 @@ index 562b6eb9..165514d9 100644
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1238,9 +1241,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1249,9 +1252,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "sage_attn(x,y,z)",
      "sol_attn(x,y,z)",
      "rope_apply(x,pe)",
@@ -732,7 +735,7 @@ index 562b6eb9..165514d9 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5699,6 +5705,125 @@ struct ggml_tensor* ggml_sol_attn(
+@@ -5721,6 +5727,125 @@ struct ggml_tensor* ggml_sol_attn(
      return result;
  }
  
@@ -859,10 +862,10 @@ index 562b6eb9..165514d9 100644
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6a6954fe..6b49765d 100644
+index 83136355..fdda5dc7 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -2188,6 +2188,118 @@ struct test_glu : public test_case {
+@@ -2192,6 +2192,118 @@ struct test_glu : public test_case {
      }
  };
  
@@ -981,7 +984,7 @@ index 6a6954fe..6b49765d 100644
  struct test_glu_split : public test_case {
      const ggml_glu_op op;
      const ggml_type type;
-@@ -9106,6 +9218,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9759,6 +9871,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -1012,9 +1015,6 @@ index 6a6954fe..6b49765d 100644
 +        }
 +    }
 +
-     for (int v : {0, 1}) {
-         for (float alpha : {.5f, 1.702f}) {
-             for (float limit : {2.0f, 7.0f}) {
--- 
-2.43.0
-
+     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+         for (int v : {0, 1}) {
+             for (float alpha : {.5f, 1.702f}) {

@@ -1,8 +1,8 @@
 diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
-index 8c348734..cc597430 100644
+index 48802d68..a1cfe7da 100644
 --- a/src/ggml-backend.cpp
 +++ b/src/ggml-backend.cpp
-@@ -1294,6 +1294,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1442,6 +1442,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          GGML_ASSERT(*cur_backend_id != -1);
      }
  

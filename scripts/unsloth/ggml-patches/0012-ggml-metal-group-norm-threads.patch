@@ -1,8 +1,8 @@
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 031adb8a..aacf12c0 100644
+index 551d62b0..1aa237bc 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -4103,13 +4103,13 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+@@ -4383,13 +4383,13 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
  
      auto pipeline = ggml_metal_library_get_pipeline_group_norm(lib, op);
  
@@ -22,7 +22,7 @@ index 031adb8a..aacf12c0 100644
  
      const size_t smem = pipeline.smem;
  
-@@ -4120,7 +4120,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+@@ -4400,7 +4400,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
  
      ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
  

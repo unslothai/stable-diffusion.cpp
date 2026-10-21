@@ -1,5 +1,5 @@
 diff --git a/src/ggml-backend-reg.cpp b/src/ggml-backend-reg.cpp
-index 1c18b82..506593d 100644
+index 4e9681c9..a92d21a5 100644
 --- a/src/ggml-backend-reg.cpp
 +++ b/src/ggml-backend-reg.cpp
 @@ -418,7 +418,8 @@ static fs::path get_executable_path() {
@@ -55,7 +55,7 @@ index 1c18b82..506593d 100644
 -        std::error_code cwd_ec;
 -        const fs::path cwd = fs::current_path(cwd_ec);
 -        if (cwd_ec) {
--            GGML_LOG_DEBUG("%s: current_path() failure, error-message: %s\n", __func__, cwd_ec.message().c_str());
+-            GGML_LOG_DEBUG("%s: failed to get current directory: %s\n", __func__, cwd_ec.message().c_str());
 -        } else {
 -            search_paths.push_back(cwd);
 +        // Unsloth: default search path is the executable directory only. Every matching library is
