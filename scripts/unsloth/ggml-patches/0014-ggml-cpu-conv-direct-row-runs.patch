@@ -39,7 +39,7 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
                  for (int64_t ky = 0; ky < knl_h; ++ky) {
 +                    const int64_t sy  = oy * stride_y + ky * dilation_y - pad_y;
 +                    const bool    row = sy >= 0 && sy < src_h;
-+                    const char *  src_row = src_base + sy * src->nb[1] + ic * src->nb[2];
++                    const char *  src_row = row ? src_base + sy * src->nb[1] + ic * src->nb[2] : nullptr;
                      for (int64_t kx = 0; kx < knl_w; ++kx) {
 -                        const int64_t sy = src_x * stride_y + ky * dilation_y - pad_y;
 -                        const int64_t sx = src_y * stride_x + kx * dilation_x - pad_x;
@@ -140,7 +140,7 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
                      for (int64_t ky = 0; ky < knl_h; ++ky) {
 +                        const int64_t sy  = dst_y * s1 + ky * d1 - p1;
 +                        const bool    row = sz >= 0 && sz < src_d && sy >= 0 && sy < src_h;
-+                        const char *  src_row = (const char *) src_data + sy * src->nb[1] + sz * src->nb[2] + cn_idx * src->nb[3];
++                        const char *  src_row = row ? (const char *) src_data + sy * src->nb[1] + sz * src->nb[2] + cn_idx * src->nb[3] : nullptr;
                          for (int64_t kx = 0; kx < knl_w; ++kx) {
 -                            const int64_t sz = dst_z * s2 + kz * d2 - p2;
 -                            const int64_t sy = dst_y * s1 + ky * d1 - p1;
