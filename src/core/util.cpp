@@ -29,6 +29,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "stable-diffusion.h"
@@ -340,20 +344,33 @@ bool MmapWrapper::copy_data(void* buf, size_t n, size_t offset) const {
 // LICENSE: https://github.com/ggerganov/llama.cpp/blob/master/LICENSE
 int32_t sd_get_num_physical_cores() {
 #ifdef __linux__
-    // enumerate the set of thread siblings, num entries is num cores
-    std::unordered_set<std::string> siblings;
-    for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
-        if (!thread_siblings.is_open()) {
-            break;  // no more cpus
+    // One thread per physical core this process may run on: the distinct thread-sibling sets among the CPUs in
+    // the affinity mask (a taskset / container cpuset leaves fewer CPUs than the machine has). The old loop read
+    // "/sys/devices/system/cpu<N>/..." (missing "/cpu"), never found a file and always fell through to half the
+    // logical CPUs, which on a host without SMT is half its cores.
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        std::unordered_set<std::string> siblings;
+        int allowed = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &mask)) {
+                continue;
+            }
+            allowed++;
+            std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
+            std::string line;
+            if (thread_siblings.is_open() && std::getline(thread_siblings, line) && !line.empty()) {
+                siblings.insert(line);
+            }
         }
-        std::string line;
-        if (std::getline(thread_siblings, line)) {
-            siblings.insert(line);
+        if (!siblings.empty()) {
+            return static_cast<int32_t>(siblings.size());
         }
-    }
-    if (siblings.size() > 0) {
-        return static_cast<int32_t>(siblings.size());
+        if (allowed > 0) {
+            // No topology in sysfs (some containers): assume 2-way SMT above 4 CPUs, as below.
+            return allowed <= 4 ? allowed : allowed / 2;
+        }
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     int32_t num_physical_cores;
