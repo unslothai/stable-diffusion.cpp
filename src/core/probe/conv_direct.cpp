@@ -83,6 +83,13 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
                      dims, name, result.candidate_faster ? "on" : "off", result.reference_ms, result.candidate_ms);
             return result.candidate_faster;
         }
+        if (sd_backend_is_cpu(backend)) {
+            // ggml-cpu's direct kernels produce the same values as im2col + mul_mat (bit-identical) and work through a
+            // fixed 16 MB patch buffer instead of materialising the whole im2col matrix, which in a VAE decoder at
+            // 1024x1024 is 2.8 GB for one 128-channel conv and 5.6 GB for a 256-channel one.
+            LOG_INFO("conv%dd direct auto: %s -> on (CPU)", dims, name);
+            return true;
+        }
         if (sd_backend_supports_conv_implicit_gemm(backend, conv3d)) {
             LOG_INFO("conv%dd direct auto: %s -> on (implicit GEMM)", dims, name);
             return true;
