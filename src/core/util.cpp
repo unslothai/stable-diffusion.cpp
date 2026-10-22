@@ -345,9 +345,8 @@ bool MmapWrapper::copy_data(void* buf, size_t n, size_t offset) const {
 int32_t sd_get_num_physical_cores() {
 #ifdef __linux__
     // One thread per physical core this process may run on: the distinct thread-sibling sets among the CPUs in
-    // the affinity mask (a taskset / container cpuset leaves fewer CPUs than the machine has). The old loop read
-    // "/sys/devices/system/cpu<N>/..." (missing "/cpu"), never found a file and always fell through to half the
-    // logical CPUs, which on a host without SMT is half its cores.
+    // the affinity mask (a taskset / container cpuset leaves fewer CPUs than the machine has). Upstream's loop
+    // counts every CPU of the machine, so a 4-CPU cpuset on a 192-CPU host still gets 96 threads.
     cpu_set_t mask;
     CPU_ZERO(&mask);
     if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
