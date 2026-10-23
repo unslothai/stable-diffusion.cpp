@@ -65,6 +65,15 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
             return false;
         }
         if (sd_backend_is(backend, "Vulkan")) {
+            // The decision must not depend on how busy the machine is. The two probe shapes run in well under a
+            // millisecond, so on a loaded host both paths measure the same submit overhead and the old 5% race
+            // flipped from run to run, changing the pixels of a fixed seed. Direct 3D convolution stays off: it is
+            // a tie on NVIDIA in the probe and fails its output check on RADV. Direct 2D convolution is on whenever its
+            // output matches im2col: measured faster and far smaller in VAE decodes on RADV (gfx1151) and NVIDIA.
+            if (conv3d) {
+                LOG_INFO("conv3d direct auto: %s -> off (Vulkan)", name);
+                return false;
+            }
             std::vector<BackendProbeCase> cases;
             for (const auto& shape : {std::pair<int, int>{32, 64}, {16, 128}}) {
                 BackendProbeCase test;
@@ -74,14 +83,18 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
                 test.initialize = [conv3d](BackendProbeGraph& graph) { return initialize_conv_probe(graph, conv3d); };
                 cases.push_back(std::move(test));
             }
-            const auto result = sd_run_backend_probe(backend, 0, cases);
+            // Only the output check decides, so one timed run each and no time budget a busy host could exhaust.
+            BackendProbeOptions options;
+            options.measurement_runs = 1;
+            options.time_budget_ms   = 1e9;
+            const auto result        = sd_run_backend_probe(backend, 0, cases, options);
             if (!result.completed) {
                 LOG_WARN("conv%dd direct auto: %s -> off (%s)", dims, name, result.error.c_str());
                 return false;
             }
-            LOG_INFO("conv%dd direct auto: %s -> %s (probe: im2col %.3f ms, direct %.3f ms)",
-                     dims, name, result.candidate_faster ? "on" : "off", result.reference_ms, result.candidate_ms);
-            return result.candidate_faster;
+            LOG_INFO("conv%dd direct auto: %s -> on (output check passed; probe: im2col %.3f ms, direct %.3f ms)",
+                     dims, name, result.reference_ms, result.candidate_ms);
+            return true;
         }
         if (sd_backend_supports_conv_implicit_gemm(backend, conv3d)) {
             LOG_INFO("conv%dd direct auto: %s -> on (implicit GEMM)", dims, name);
