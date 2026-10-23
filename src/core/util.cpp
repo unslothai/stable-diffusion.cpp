@@ -30,6 +30,7 @@
 #endif
 
 #ifdef __linux__
+#include <errno.h>
 #include <sched.h>
 #endif
 
@@ -347,13 +348,26 @@ int32_t sd_get_num_physical_cores() {
     // One thread per physical core this process may run on: the distinct thread-sibling sets among the CPUs in
     // the affinity mask (a taskset / container cpuset leaves fewer CPUs than the machine has). Upstream's loop
     // counts every CPU of the machine, so a 4-CPU cpuset on a 192-CPU host still gets 96 threads.
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+    // The mask is sized dynamically: a kernel built for more than CPU_SETSIZE (1024) CPUs rejects a smaller one
+    // with EINVAL, so grow it until the call succeeds.
+    for (int ncpus = CPU_SETSIZE; ncpus <= (1 << 20); ncpus *= 2) {
+        cpu_set_t* mask   = CPU_ALLOC(ncpus);
+        const size_t size = CPU_ALLOC_SIZE(ncpus);
+        if (mask == nullptr) {
+            break;
+        }
+        CPU_ZERO_S(size, mask);
+        if (sched_getaffinity(0, size, mask) != 0) {
+            CPU_FREE(mask);
+            if (errno == EINVAL) {
+                continue;
+            }
+            break;
+        }
         std::unordered_set<std::string> siblings;
         int allowed = 0;
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-            if (!CPU_ISSET(cpu, &mask)) {
+        for (int cpu = 0; cpu < ncpus; ++cpu) {
+            if (!CPU_ISSET_S(cpu, size, mask)) {
                 continue;
             }
             allowed++;
@@ -363,6 +377,7 @@ int32_t sd_get_num_physical_cores() {
                 siblings.insert(line);
             }
         }
+        CPU_FREE(mask);
         if (!siblings.empty()) {
             return static_cast<int32_t>(siblings.size());
         }
@@ -370,6 +385,7 @@ int32_t sd_get_num_physical_cores() {
             // No topology in sysfs (some containers): assume 2-way SMT above 4 CPUs, as below.
             return allowed <= 4 ? allowed : allowed / 2;
         }
+        break;
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     int32_t num_physical_cores;

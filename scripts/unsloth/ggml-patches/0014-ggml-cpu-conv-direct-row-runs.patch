@@ -1,3 +1,17 @@
+diff --git a/include/ggml-cpu.h b/include/ggml-cpu.h
+--- a/include/ggml-cpu.h
++++ b/include/ggml-cpu.h
+@@ -3,6 +3,10 @@
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ 
++// The direct conv_2d / conv_3d kernels fill and scatter their patches in row runs (bit-identical to the
++// per-element loops); stable-diffusion.cpp defaults CPU convolution to direct only when this is defined.
++#define GGML_CPU_CONV_DIRECT_ROW_RUNS 1
++
+ #ifdef  __cplusplus
+ extern "C" {
+ #endif
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
