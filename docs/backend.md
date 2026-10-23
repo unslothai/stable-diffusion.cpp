@@ -233,10 +233,10 @@ sd-cli -m model.safetensors -p "a cat" --conv-direct off,diffusion=on
 - `on` requests direct 2D and 3D convolution.
 - `off` uses the existing im2col-based convolution paths.
 - `auto` first checks support for a representative F16-weight/F32-input direct
-  convolution graph. Vulkan then benchmarks direct convolution against im2col
-  using two small shapes per dimension, with warmup, output validation, and five
-  interleaved measurements per shape. Direct convolution must improve the sum of
-  median times by at least 5%; a failed probe defaults to `off`.
+  convolution graph. On Vulkan, direct 2D convolution is then enabled when its
+  output on two small shapes matches im2col (a failed probe defaults to `off`),
+  and direct 3D convolution stays `off`. The decision does not depend on timing,
+  so the same seed renders the same pixels on a busy and on an idle machine.
   Other backends retain their implicit GEMM checks without benchmarking:
   CUDA 2D requires a compiled Turing-or-newer MMA architecture; HIP 2D requires
   the supported CDNA MFMA or RDNA WMMA architectures described below for flash
