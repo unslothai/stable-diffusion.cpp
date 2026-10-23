@@ -2,14 +2,15 @@ diff --git a/src/ggml-cpu/arch/x86/cpu-feats.cpp b/src/ggml-cpu/arch/x86/cpu-fea
 index d775a036..a29335b9 100644
 --- a/src/ggml-cpu/arch/x86/cpu-feats.cpp
 +++ b/src/ggml-cpu/arch/x86/cpu-feats.cpp
-@@ -300,6 +300,10 @@ static int ggml_backend_cpu_x86_score() {
+@@ -300,6 +300,11 @@ static int ggml_backend_cpu_x86_score() {
      if (!is.AVX512VL()) { return 0; }
      if (!is.AVX512DQ()) { return 0; }
      if (!is.AVX512BW()) { return 0; }
-+    // Unsloth: the AVX512 variants are only offered on CPUs that also have AVX-VNNI (Zen 5,
-+    // Sapphire Rapids and newer). On Zen 4, which has AVX512 but not AVX-VNNI, they ran
-+    // stable-diffusion.cpp 15 to 50% slower than the AVX2 variant; the AVX2 one is picked there.
-+    if (!is.AVX_VNNI()) { return 0; }
++    // Unsloth: on AMD the AVX512 variants are only offered with AVX-VNNI (Zen 5). On Zen 4, which
++    // has AVX512 but not AVX-VNNI, they ran stable-diffusion.cpp 15 to 50% slower than the AVX2
++    // variant, so the AVX2 one is picked there. Intel AVX512 CPUs without AVX-VNNI (Skylake-SP,
++    // Cascade Lake, Ice Lake) keep them: cascadelake ran Z-Image 1.7x faster than haswell.
++    if (is.is_amd && !is.AVX_VNNI()) { return 0; }
      score += 1<<7;
  #endif
  #ifdef GGML_AVX512_VBMI

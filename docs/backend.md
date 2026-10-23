@@ -241,9 +241,13 @@ sd-cli -m model.safetensors -p "a cat" --conv-direct off,diffusion=on
   CUDA 2D requires a compiled Turing-or-newer MMA architecture; HIP 2D requires
   the supported CDNA MFMA or RDNA WMMA architectures described below for flash
   attention. MUSA 2D has a SIMT implementation. CUDA, HIP, and MUSA 3D also have
-  a SIMT implementation, so they do not require MMA. Other backends default to
-  `off`. Results and decision logs are cached per compute backend and dimension
-  in the context, as with flash attention. Each dimension is selected independently,
+  a SIMT implementation, so they do not require MMA. The CPU backend selects
+  `on` for 2D and 3D when ggml carries the row-run direct kernels
+  (`scripts/unsloth/ggml-patches/0014`, applied by the prebuilt workflow) and
+  `off` otherwise: the direct kernels use a fixed patch buffer instead of the
+  full im2col matrix and match im2col bit for bit with F16 weights. Other
+  backends default to `off`. Results and decision logs are cached per compute
+  backend and dimension in the context, as with flash attention. Each dimension is selected independently,
   and all compute devices in a module must qualify. Parameter-storage devices do
   not affect this choice.
 

@@ -1,0 +1,231 @@
+diff --git a/include/ggml-cpu.h b/include/ggml-cpu.h
+--- a/include/ggml-cpu.h
++++ b/include/ggml-cpu.h
+@@ -3,6 +3,10 @@
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ 
++// The direct conv_2d / conv_3d kernels fill and scatter their patches in row runs (bit-identical to the
++// per-element loops); stable-diffusion.cpp defaults CPU convolution to direct only when this is defined.
++#define GGML_CPU_CONV_DIRECT_ROW_RUNS 1
++
+ #ifdef  __cplusplus
+ extern "C" {
+ #endif
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -7464,6 +7464,8 @@
+ // ggml_compute_forward_conv_2d
+ 
+ 
++#define CONV_2D_RUN 64
++
+ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
+                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
+                                               const ggml_tensor *         src,     // [W, H, C, N]
+@@ -7521,40 +7523,44 @@
+         const int64_t patch_start       = patch_start_batch + params->ith * patch_per_thread;
+         const int64_t patch_end         = std::min(patch_start + patch_per_thread, patch_end_batch);
+ 
+-        //im2col for a patch
+-        for (int64_t p = patch_start; p < patch_end; ++p) {
+-            const int64_t  batch_n     =  p / (dst_w * dst_h);
+-            const int64_t  src_x       = (p / dst_w) % dst_h;
+-            const int64_t  src_y       =  p % dst_w;
++        // im2col for this thread's patches, a run of up to CONV_2D_RUN consecutive patches of one output row at a
++        // time: each (ic, ky) source row is then read once, contiguously, for the whole run instead of once per patch
++        // (one patch touches c_in planes; one plane per patch was a cache and TLB miss per element). Same values,
++        // same conversions as the per-patch loop, so the result is bit-identical.
++        const size_t ts = traits->type_size;
++        for (int64_t p = patch_start; p < patch_end;) {
++            const int64_t n_idx = p / (dst_w * dst_h);
++            const int64_t oy    = (p / dst_w) % dst_h;
++            const int64_t ox0   = p % dst_w;
++            const int64_t run   = std::min<int64_t>({ patch_end - p, dst_w - ox0, (int64_t) CONV_2D_RUN });
+ 
+-            const float * src_base = (const float *)((const char *)src_data + batch_n * src->nb[3]);
+-            char *        dst_row  = (char *) tmp + (p % patches_per_batch) * knl_n * traits->type_size;
++            const char * src_base = (const char *) src_data + n_idx * src->nb[3];
++            char *       dst_base = (char *) tmp + (p % patches_per_batch) * knl_n * ts;
+ 
+             for (int64_t ic = 0; ic < c_in; ++ic) {
+                 for (int64_t ky = 0; ky < knl_h; ++ky) {
++                    const int64_t sy  = oy * stride_y + ky * dilation_y - pad_y;
++                    const bool    row = sy >= 0 && sy < src_h;
++                    const char *  src_row = row ? src_base + sy * src->nb[1] + ic * src->nb[2] : nullptr;
+                     for (int64_t kx = 0; kx < knl_w; ++kx) {
+-                        const int64_t sy = src_x * stride_y + ky * dilation_y - pad_y;
+-                        const int64_t sx = src_y * stride_x + kx * dilation_x - pad_x;
+-
+-                        int64_t dst_idx = ic * (knl_h * knl_w) + ky * knl_w + kx;
+-
+-                        float src_val;
+-                        if (sy < 0 || sy >= src_h || sx < 0 || sx >= src_w) {
+-                            src_val = 0.0f;
+-                        } else {
+-                            const float * src_ptr = (const float *)((const char *)src_base + sx * src->nb[0] + sy * src->nb[1] + ic * src->nb[2]);
+-                            src_val               = *src_ptr;
+-                        }
+-
+-                        char * element_ptr = dst_row + dst_idx * traits->type_size;
+-                        if (kernel_type == GGML_TYPE_F32) {
+-                            *(float *) element_ptr = src_val;
+-                        } else if (kernel_type == GGML_TYPE_F16) {
+-                            *(ggml_fp16_t *) element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
++                        char * dst_col = dst_base + (ic * (knl_h * knl_w) + ky * knl_w + kx) * ts;
++                        for (int64_t j = 0; j < run; ++j) {
++                            const int64_t sx = (ox0 + j) * stride_x + kx * dilation_x - pad_x;
++                            float src_val = 0.0f;
++                            if (row && sx >= 0 && sx < src_w) {
++                                src_val = *(const float *) (src_row + sx * src->nb[0]);
++                            }
++                            char * element_ptr = dst_col + j * knl_n * ts;
++                            if (kernel_type == GGML_TYPE_F32) {
++                                *(float *) element_ptr = src_val;
++                            } else {
++                                *(ggml_fp16_t *) element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
++                            }
+                         }
+                     }
+                 }
+             }
++            p += run;
+         }   // patches handled by this thread
+ 
+         ggml_barrier(params->threadpool);
+@@ -7574,17 +7580,23 @@
+         const int64_t permute_start = params->ith * permute_per_thread;
+         const int64_t permute_end = std::min(permute_start + permute_per_thread, patch_n);
+ 
+-        for (int64_t i = permute_start; i < permute_end; ++i) {
+-            const int64_t p       = patch_start_batch + i;
+-            const int64_t batch_n = p / (dst_w * dst_h);
+-            const int64_t dst_y   = (p / dst_w) % dst_h;
+-            const int64_t dst_x   = p % dst_w;
++        // Same run blocking for the transpose back: one output plane at a time per run, so each write is a contiguous
++        // row segment rather than one element in each of c_out planes.
++        for (int64_t i = permute_start; i < permute_end;) {
++            const int64_t p     = patch_start_batch + i;
++            const int64_t n_idx = p / (dst_w * dst_h);
++            const int64_t oy    = (p / dst_w) % dst_h;
++            const int64_t ox0   = p % dst_w;
++            const int64_t run   = std::min<int64_t>({ permute_end - i, dst_w - ox0, (int64_t) CONV_2D_RUN });
+ 
+             for (int64_t oc = 0; oc < c_out; ++oc) {
+-                const float value = gemm_output[i * c_out + oc];
+-                float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
+-                *dst_ptr = value;
++                char *        dst_row = (char *) dst_data + ox0 * dst->nb[0] + oy * dst->nb[1] + oc * dst->nb[2] + n_idx * dst->nb[3];
++                const float * col     = gemm_output + i * c_out + oc;
++                for (int64_t j = 0; j < run; ++j) {
++                    *(float *) (dst_row + j * dst->nb[0]) = col[j * c_out];
++                }
+             }
++            i += run;
+         }
+     }
+ }
+@@ -7662,45 +7674,48 @@
+         const int64_t patch_start       = patch_start_batch + params->ith * patch_per_thread;
+         const int64_t patch_end         = std::min(patch_start + patch_per_thread, patch_end_batch);
+ 
+-        for (int64_t p = patch_start; p < patch_end; ++p) {
++        // Runs of consecutive patches along one output row, as in conv_2d: each (ic, kz, ky) source row is read once
++        // per run. Same values and conversions as the per-patch loop (bit-identical).
++        const size_t ts = traits->type_size;
++        for (int64_t p = patch_start; p < patch_end;) {
+             const int64_t p_in_batch = p % (dst_w * dst_h * dst_d);
+             const int64_t p_in_depth = p_in_batch % (dst_w * dst_h);
+             const int64_t batch_idx  = p / (dst_w * dst_h * dst_d);
+             const int64_t dst_z      = p_in_batch / (dst_w * dst_h);
+             const int64_t dst_y      = p_in_depth / dst_w;
+-            const int64_t dst_x      = p_in_depth % dst_w;
++            const int64_t dst_x0     = p_in_depth % dst_w;
++            const int64_t run        = std::min<int64_t>({ patch_end - p, dst_w - dst_x0, (int64_t) CONV_2D_RUN });
+ 
+-            char * dst_row = (char *) tmp + (p % patches_per_batch) * knl_n_total * traits->type_size;
++            char * dst_base = (char *) tmp + (p % patches_per_batch) * knl_n_total * ts;
+ 
+             for (int64_t ic = 0; ic < c; ++ic) {
++                const int64_t cn_idx = batch_idx * c + ic;
+                 for (int64_t kz = 0; kz < knl_d; ++kz) {
++                    const int64_t sz = dst_z * s2 + kz * d2 - p2;
+                     for (int64_t ky = 0; ky < knl_h; ++ky) {
++                        const int64_t sy  = dst_y * s1 + ky * d1 - p1;
++                        const bool    row = sz >= 0 && sz < src_d && sy >= 0 && sy < src_h;
++                        const char *  src_row = row ? (const char *) src_data + sy * src->nb[1] + sz * src->nb[2] + cn_idx * src->nb[3] : nullptr;
+                         for (int64_t kx = 0; kx < knl_w; ++kx) {
+-                            const int64_t sz = dst_z * s2 + kz * d2 - p2;
+-                            const int64_t sy = dst_y * s1 + ky * d1 - p1;
+-                            const int64_t sx = dst_x * s0 + kx * d0 - p0;
+-
+-                            int64_t dst_idx = ic * knl_n_per_channel + kz * (knl_h * knl_w) + ky * knl_w + kx;
+-
+-                            float src_val;
+-                            if (sz < 0 || sz >= src_d || sy < 0 || sy >= src_h || sx < 0 || sx >= src_w) {
+-                                src_val = 0.0f;
+-                            } else {
+-                                const int64_t cn_idx = batch_idx * c + ic;
+-                                const float * src_ptr = (const float *)((const char *)src_data + sx*src->nb[0] + sy*src->nb[1] + sz*src->nb[2] + cn_idx*src->nb[3]);
+-                                src_val = *src_ptr;
+-                            }
+-
+-                            char * element_ptr = dst_row + dst_idx * traits->type_size;
+-                            if (kernel_type == GGML_TYPE_F32) {
+-                                *(float *)element_ptr = src_val;
+-                            } else if (kernel_type == GGML_TYPE_F16) {
+-                                *(ggml_fp16_t *)element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
++                            char * dst_col = dst_base + (ic * knl_n_per_channel + kz * (knl_h * knl_w) + ky * knl_w + kx) * ts;
++                            for (int64_t j = 0; j < run; ++j) {
++                                const int64_t sx = (dst_x0 + j) * s0 + kx * d0 - p0;
++                                float src_val = 0.0f;
++                                if (row && sx >= 0 && sx < src_w) {
++                                    src_val = *(const float *) (src_row + sx * src->nb[0]);
++                                }
++                                char * element_ptr = dst_col + j * knl_n_total * ts;
++                                if (kernel_type == GGML_TYPE_F32) {
++                                    *(float *) element_ptr = src_val;
++                                } else {
++                                    *(ggml_fp16_t *) element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
++                                }
+                             }
+                         }
+                     }
+                 }
+             }
++            p += run;
+         }
+ 
+         ggml_barrier(params->threadpool);
+@@ -7714,21 +7729,25 @@
+         const int64_t permute_start = params->ith * permute_per_thread;
+         const int64_t permute_end = std::min(permute_start + permute_per_thread, patch_n_in_batch);
+ 
+-        for (int64_t i = permute_start; i < permute_end; ++i) {
++        for (int64_t i = permute_start; i < permute_end;) {
+             const int64_t p = patch_start_batch + i;
+             const int64_t p_in_batch = p % (dst_w * dst_h * dst_d);
+             const int64_t p_in_depth = p_in_batch % (dst_w * dst_h);
+             const int64_t batch_idx  = p / (dst_w * dst_h * dst_d);
+             const int64_t dst_z      = p_in_batch / (dst_w * dst_h);
+             const int64_t dst_y      = p_in_depth / dst_w;
+-            const int64_t dst_x      = p_in_depth % dst_w;
++            const int64_t dst_x0     = p_in_depth % dst_w;
++            const int64_t run        = std::min<int64_t>({ permute_end - i, dst_w - dst_x0, (int64_t) CONV_2D_RUN });
+ 
+             for (int64_t ioc = 0; ioc < oc; ++ioc) {
+-                const float value = gemm_output[i * oc + ioc];
+                 const int64_t ocn_idx = batch_idx * oc + ioc;
+-                float * dst_ptr = (float *)((char *)dst_data + dst_x*dst->nb[0] + dst_y*dst->nb[1] + dst_z*dst->nb[2] + ocn_idx*dst->nb[3]);
+-                *dst_ptr = value;
++                char *        dst_row = (char *) dst_data + dst_x0 * dst->nb[0] + dst_y * dst->nb[1] + dst_z * dst->nb[2] + ocn_idx * dst->nb[3];
++                const float * col     = gemm_output + i * oc + ioc;
++                for (int64_t j = 0; j < run; ++j) {
++                    *(float *) (dst_row + j * dst->nb[0]) = col[j * oc];
++                }
+             }
++            i += run;
+         }
+     }
+ }

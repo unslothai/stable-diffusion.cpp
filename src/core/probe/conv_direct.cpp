@@ -8,6 +8,7 @@
 #include "core/ggml_extend_backend.h"
 #include "core/probe/backend_probe.h"
 #include "core/util.h"
+#include "ggml-cpu.h"
 
 static void build_conv_direct_probe(BackendProbeGraph& graph, bool conv3d, bool direct, int size = 32, int channels = 64) {
     if (conv3d) {
@@ -82,6 +83,22 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
             LOG_INFO("conv%dd direct auto: %s -> %s (probe: im2col %.3f ms, direct %.3f ms)",
                      dims, name, result.candidate_faster ? "on" : "off", result.reference_ms, result.candidate_ms);
             return result.candidate_faster;
+        }
+        if (sd_backend_is_cpu(backend)) {
+#ifdef GGML_CPU_CONV_DIRECT_ROW_RUNS
+            // ggml-cpu's direct kernels work through a fixed 16 MB patch buffer instead of materialising the whole
+            // im2col matrix, which in a VAE decoder at 1024x1024 is 2.8 GB for one 128-channel conv and 5.6 GB for a
+            // 256-channel one. With F16 weights (every Conv2d / Conv3d block) they produce the same values as im2col +
+            // mul_mat, bit for bit; F32 weights (runtime LoRA tensors) and depthwise convs keep F32 activations where
+            // im2col rounds them to F16, so those come out closer to the exact result rather than identical.
+            LOG_INFO("conv%dd direct auto: %s -> on (CPU)", dims, name);
+            return true;
+#else
+            // Without the row-run kernels (scripts/unsloth/ggml-patches/0014, applied by the prebuilt workflow) the
+            // per-element direct loops are slower than im2col on large convolutions.
+            LOG_INFO("conv%dd direct auto: %s -> off (CPU, ggml without the row-run direct kernels)", dims, name);
+            return false;
+#endif
         }
         if (sd_backend_supports_conv_implicit_gemm(backend, conv3d)) {
             LOG_INFO("conv%dd direct auto: %s -> on (implicit GEMM)", dims, name);
