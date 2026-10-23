@@ -84,9 +84,13 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
                 cases.push_back(std::move(test));
             }
             // Only the output check decides, so one timed run each and no time budget a busy host could exhaust.
+            // No free-memory cutoff either: the probe graphs need a few MB, and the default 128 MiB floor would turn
+            // direct convolution off whenever another workload holds the VRAM. A device too full to allocate them
+            // still fails the probe (allocation failure -> off).
             BackendProbeOptions options;
-            options.measurement_runs = 1;
-            options.time_budget_ms   = 1e9;
+            options.measurement_runs      = 1;
+            options.time_budget_ms        = 1e9;
+            options.min_free_device_bytes = 0;
             const auto result        = sd_run_backend_probe(backend, 0, cases, options);
             if (!result.completed) {
                 LOG_WARN("conv%dd direct auto: %s -> off (%s)", dims, name, result.error.c_str());
