@@ -28,6 +28,17 @@ namespace sd::guidance {
     AdaptiveProjectedGuidanceParams parse_adaptive_projected_guidance_args(const char* extra_sample_args);
     bool is_adaptive_projected_guidance_enabled(const AdaptiveProjectedGuidanceParams& params);
     bool parse_skip_layer_guidance_uncond_arg(const char* extra_sample_args);
+
+    // MOSS-Image's built-in negative-branch skip (block 22 on the uncond pass). extra_sample_args
+    // moss_uncond_skip=false turns it off; moss_uncond_skip_start / moss_uncond_skip_end bound it in
+    // sigma-percent of the shifted flow schedule (ComfyUI percent_to_sigma). Defaults keep every step.
+    struct MossUncondSkipParams {
+        bool enabled = true;
+        float start  = 0.0f;
+        float end    = 1.0f;
+        bool windowed() const { return start > 0.0f || end < 1.0f; }
+    };
+    MossUncondSkipParams parse_moss_uncond_skip_args(const char* extra_sample_args);
     std::vector<float> parse_guidance_schedule(const char* extra_sample_args);
 
     struct GuidanceInput {
