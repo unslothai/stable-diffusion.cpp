@@ -2502,6 +2502,10 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
     // drops that entry whenever the effective skip set flips; -1 = no negative pass yet. Never touched by default.
     int moss_prev_uncond_skip   = -1;
     int moss_cache_invalidations = 0;
+    // Spectrum extrapolates the guided output from its own history, which that drop never reaches: its history is
+    // cleared at each window edge instead. -1 = no step seen yet.
+    int moss_spectrum_window = -1;
+    int moss_spectrum_resets = 0;
 
     std::vector<float> guidance_schedule = sd::guidance::parse_guidance_schedule(extra_sample_args);
     if (!guidance_schedule.empty() && guidance_schedule.size() != sigmas.size() - 1) {
@@ -2636,6 +2640,17 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         sd::Tensor<float> noised_input = x * c_in;
         if (apply_denoise_mask && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version) || sd_version_is_lingbot_video(version))) {
             noised_input = noised_input * denoise_mask + sampling_init_latent * (1.0f - denoise_mask);
+        }
+
+        if (cache_runtime.spectrum_enabled && version == VERSION_MOSS_IMAGE && moss_uncond_skip.enabled &&
+            moss_uncond_skip.windowed() && !uncond.empty()) {
+            const int moss_window_now = static_cast<int>(sigma >= moss_skip_sigma_low && sigma <= moss_skip_sigma_high);
+            if (moss_spectrum_window >= 0 && moss_spectrum_window != moss_window_now) {
+                cache_runtime.spectrum.reset_history();
+                ++moss_spectrum_resets;
+                LOG_VERBOSE("MOSS uncond skip set changed at step %d: Spectrum history dropped\n", step);
+            }
+            moss_spectrum_window = moss_window_now;
         }
 
         if (cache_runtime.spectrum_enabled && cache_runtime.spectrum.should_predict()) {
@@ -3055,6 +3070,9 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         LOG_INFO("MOSS uncond skip: %d of %zu steps skipped block 22 on the negative branch", moss_skipped_steps, steps);
         if (moss_cache_invalidations > 0) {
             LOG_INFO("MOSS uncond skip: %d window edge(s) dropped the cached negative prediction", moss_cache_invalidations);
+        }
+        if (moss_spectrum_resets > 0) {
+            LOG_INFO("MOSS uncond skip: %d window edge(s) reset the Spectrum history", moss_spectrum_resets);
         }
     }
     if (inverse_noise_scaling) {
