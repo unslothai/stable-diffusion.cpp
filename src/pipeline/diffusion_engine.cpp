@@ -2498,6 +2498,10 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         LOG_INFO("MOSS uncond skip disabled");
     }
     int moss_skipped_steps = 0;
+    // Step caches (EasyCache / UCache / CacheDIT) key the negative prediction by &uncond only, so a windowed skip
+    // drops that entry whenever the effective skip set flips; -1 = no negative pass yet. Never touched by default.
+    int moss_prev_uncond_skip   = -1;
+    int moss_cache_invalidations = 0;
 
     std::vector<float> guidance_schedule = sd::guidance::parse_guidance_schedule(extra_sample_args);
     if (!guidance_schedule.empty() && guidance_schedule.size() != sigmas.size() - 1) {
@@ -2762,8 +2766,16 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             }
 
             sd::Tensor<float> cached_output;
+            const bool moss_trace_uncond = version == VERSION_MOSS_IMAGE && moss_uncond_skip.enabled &&
+                                           moss_uncond_skip.windowed() && &condition == &uncond;
             if (step_cache.before_condition(&condition, noised_input, &cached_output)) {
+                if (moss_trace_uncond) {
+                    LOG_VERBOSE("MOSS uncond served from step cache at step %d\n", step);
+                }
                 return std::move(cached_output);
+            }
+            if (moss_trace_uncond) {
+                LOG_VERBOSE("MOSS uncond computed at step %d\n", step);
             }
 
             // A re-enabled condition can miss the cache even when the positive pass was reused.
@@ -2933,12 +2945,22 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 if (is_skiplayer_step && slg_uncond) {
                     LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
                     uncond_skip_layers = &skip_layer_guidance.layers();
-                } else if (version == VERSION_MOSS_IMAGE && moss_uncond_skip.enabled &&
-                           (!moss_uncond_skip.windowed() ||
-                            (sigma >= moss_skip_sigma_low && sigma <= moss_skip_sigma_high))) {
-                    LOG_VERBOSE("MOSS uncond skip layers at step %d (sigma %.4f)\n", step, sigma);
-                    uncond_skip_layers = &moss_skip_layers;
-                    ++moss_skipped_steps;
+                } else if (version == VERSION_MOSS_IMAGE && moss_uncond_skip.enabled) {
+                    const bool moss_skip_now = !moss_uncond_skip.windowed() ||
+                                               (sigma >= moss_skip_sigma_low && sigma <= moss_skip_sigma_high);
+                    if (moss_uncond_skip.windowed()) {
+                        if (moss_prev_uncond_skip >= 0 && moss_prev_uncond_skip != static_cast<int>(moss_skip_now)) {
+                            step_cache.invalidate_condition(&uncond);
+                            ++moss_cache_invalidations;
+                            LOG_VERBOSE("MOSS uncond skip set changed at step %d: negative-branch step cache dropped\n", step);
+                        }
+                        moss_prev_uncond_skip = static_cast<int>(moss_skip_now);
+                    }
+                    if (moss_skip_now) {
+                        LOG_VERBOSE("MOSS uncond skip layers at step %d (sigma %.4f)\n", step, sigma);
+                        uncond_skip_layers = &moss_skip_layers;
+                        ++moss_skipped_steps;
+                    }
                 }
                 uncond_out = run_condition(uncond,
                                            uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
@@ -3031,6 +3053,9 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
     sd_sample::log_sample_cache_summary(cache_runtime, steps);
     if (version == VERSION_MOSS_IMAGE) {
         LOG_INFO("MOSS uncond skip: %d of %zu steps skipped block 22 on the negative branch", moss_skipped_steps, steps);
+        if (moss_cache_invalidations > 0) {
+            LOG_INFO("MOSS uncond skip: %d window edge(s) dropped the cached negative prediction", moss_cache_invalidations);
+        }
     }
     if (inverse_noise_scaling) {
         x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
