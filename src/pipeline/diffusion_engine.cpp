@@ -2472,6 +2472,32 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
     float img_cfg_scale = guidance.img_cfg;
     float slg_scale     = guidance.slg.scale;
     bool slg_uncond     = sd::guidance::parse_skip_layer_guidance_uncond_arg(extra_sample_args);
+    const sd::guidance::MossUncondSkipParams moss_uncond_skip =
+        version == VERSION_MOSS_IMAGE ? sd::guidance::parse_moss_uncond_skip_args(extra_sample_args)
+                                      : sd::guidance::MossUncondSkipParams{};
+    // Sigma bounds of the MOSS window (ComfyUI ModelSamplingDiscreteFlow.percent_to_sigma, multiplier 1).
+    float moss_skip_sigma_high = INFINITY;
+    float moss_skip_sigma_low  = -INFINITY;
+    if (version == VERSION_MOSS_IMAGE && moss_uncond_skip.enabled && moss_uncond_skip.windowed()) {
+        auto flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser);
+        float shift        = flow_denoiser ? flow_denoiser->shift : 5.0f;
+        auto percent_to_sigma = [shift](float percent) {
+            if (percent <= 0.0f) {
+                return 1.0f;
+            }
+            if (percent >= 1.0f) {
+                return 0.0f;
+            }
+            return time_snr_shift(shift, 1.0f - percent);
+        };
+        moss_skip_sigma_high = percent_to_sigma(moss_uncond_skip.start);
+        moss_skip_sigma_low  = percent_to_sigma(moss_uncond_skip.end);
+        LOG_INFO("MOSS uncond skip window: sigma-percent %.4f..%.4f (sigma %.4f..%.4f, shift %.3f)",
+                 moss_uncond_skip.start, moss_uncond_skip.end, moss_skip_sigma_low, moss_skip_sigma_high, shift);
+    } else if (version == VERSION_MOSS_IMAGE && !moss_uncond_skip.enabled) {
+        LOG_INFO("MOSS uncond skip disabled");
+    }
+    int moss_skipped_steps = 0;
 
     std::vector<float> guidance_schedule = sd::guidance::parse_guidance_schedule(extra_sample_args);
     if (!guidance_schedule.empty() && guidance_schedule.size() != sigmas.size() - 1) {
@@ -2907,8 +2933,12 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 if (is_skiplayer_step && slg_uncond) {
                     LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
                     uncond_skip_layers = &skip_layer_guidance.layers();
-                } else if (version == VERSION_MOSS_IMAGE) {
+                } else if (version == VERSION_MOSS_IMAGE && moss_uncond_skip.enabled &&
+                           (!moss_uncond_skip.windowed() ||
+                            (sigma >= moss_skip_sigma_low && sigma <= moss_skip_sigma_high))) {
+                    LOG_VERBOSE("MOSS uncond skip layers at step %d (sigma %.4f)\n", step, sigma);
                     uncond_skip_layers = &moss_skip_layers;
+                    ++moss_skipped_steps;
                 }
                 uncond_out = run_condition(uncond,
                                            uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
@@ -2999,6 +3029,9 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
 
     auto x0 = std::move(x0_opt);
     sd_sample::log_sample_cache_summary(cache_runtime, steps);
+    if (version == VERSION_MOSS_IMAGE) {
+        LOG_INFO("MOSS uncond skip: %d of %zu steps skipped block 22 on the negative branch", moss_skipped_steps, steps);
+    }
     if (inverse_noise_scaling) {
         x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
     }
