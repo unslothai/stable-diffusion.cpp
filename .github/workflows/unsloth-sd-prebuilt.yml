@@ -340,13 +340,12 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          CPU_VARIANTS=""
+          # sd-cli and sd-server share one libstable-diffusion instead of each embedding it.
+          # The rpath is relative, never an absolute path into the build tree.
+          if [ "$(uname -s)" = "Darwin" ]; then RPATH='@loader_path'; else RPATH='$ORIGIN'; fi
+          CPU_VARIANTS="-DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=$RPATH"
           if [ -n "${{ matrix.cpu_floor }}" ]; then
-            CPU_VARIANTS="-DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
-            # macOS: @loader_path only, never an absolute rpath into the build tree.
-            if [ "$(uname -s)" = "Darwin" ]; then
-              CPU_VARIANTS="$CPU_VARIANTS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=@loader_path"
-            fi
+            CPU_VARIANTS="$CPU_VARIANTS -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
           fi
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -561,6 +560,7 @@ jobs:
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
             -DSD_CUDA=ON \
+            -DSD_BUILD_SHARED_LIBS=ON \
             -DSD_BUILD_SHARED_GGML_LIB=ON \
             -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc" \
@@ -769,6 +769,7 @@ jobs:
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
             -DGGML_NATIVE=OFF `
             -DSD_CUDA=ON `
+            -DSD_BUILD_SHARED_LIBS=ON `
             -DSD_BUILD_SHARED_GGML_LIB=ON `
             -DBUILD_SHARED_LIBS=ON `
             -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.archs }}' `
@@ -935,6 +936,7 @@ jobs:
             -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
             -DSD_VULKAN=${{ matrix.vulkan }} `
+            -DSD_BUILD_SHARED_LIBS=ON `
             -DGGML_NATIVE=OFF `
             @cpuVariants
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
