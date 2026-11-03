@@ -43,17 +43,19 @@ index 48d77221..0bf43efd 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 1aa237bc..6f836d9f 100644
+index 1aa237bc..a05eb366 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -4696,6 +4696,26 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
+@@ -4696,6 +4696,28 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
          /*.KHW  =*/ KH * KW,
      };
  
-+    // GGML_METAL_IM2COL_LEGACY=1 restores the per-(IC, OH, OW) threadgroup kernels below
++    // 1x1 / 2x2 kernels: kernel_im2col below runs KH*KW threads per threadgroup (1 for a 1x1 conv), so use one
++    // thread per dst element. From 3x3 up the per-patch kernels are as fast or faster (test-backend-ops perf).
++    // GGML_METAL_IM2COL_LEGACY=1 keeps the per-patch kernels for every size.
 +    static const bool im2col_legacy = getenv("GGML_METAL_IM2COL_LEGACY") != nullptr;
 +
-+    if (!im2col_legacy) {
++    if (!im2col_legacy && KH*KW <= 4) {
 +        auto pipeline = ggml_metal_library_get_pipeline_im2col_flat(lib, op);
 +
 +        const int32_t  max_t = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
@@ -74,16 +76,15 @@ index 1aa237bc..6f836d9f 100644
  
      if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
 diff --git a/src/ggml-metal/kernels/conv.metal b/src/ggml-metal/kernels/conv.metal
-index a5d5aa9d..e85cbdac 100644
+index a5d5aa9d..16d7fc4f 100644
 --- a/src/ggml-metal/kernels/conv.metal
 +++ b/src/ggml-metal/kernels/conv.metal
-@@ -64,6 +64,56 @@ kernel void kernel_im2col(
+@@ -64,6 +64,55 @@ kernel void kernel_im2col(
  template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
  template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
  
-+// one thread per destination element along CHW (the contiguous dst dimension): full SIMD groups and coalesced
-+// writes for any batch size. kernel_im2col above runs KH*KW threads per threadgroup when N == 1 (9 of 32 lanes
-+// for a 3x3 conv) and strides its writes by CHW.
++// one thread per destination element along CHW (the contiguous dst dimension): full SIMD groups for small
++// kernels. kernel_im2col above runs KH*KW threads per threadgroup when N == 1, i.e. one thread for a 1x1 conv.
 +// grid: [ceil(CHW/ntg0), OH, OW], threadgroup: [ntg0, 1, 1]
 +template <typename T>
 +kernel void kernel_im2col_flat(
