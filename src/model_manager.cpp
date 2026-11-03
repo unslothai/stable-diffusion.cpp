@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <set>
@@ -858,16 +859,32 @@ bool ModelManager::mmap_params(const std::vector<TensorState*>& states,
 
 // The matmul-only tag both selects the repack buffer and sends a not yet allocated weight down the repacked-CPU
 // graph path, so keep it only on weights this context will repack. An allocated weight keeps its tag: its buffer decides.
+// --mmap on the CPU: a weight the CPU repacks is loaded and repacked instead of mapped (a mapped weight cannot be
+// repacked, and the unrepacked kernels are slower); every other weight stays mapped. SD_CPU_MMAP_REPACK=0 maps
+// repackable weights too and runs them unrepacked (the old behaviour).
+static bool sd_cpu_mmap_prefers_repack() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SD_CPU_MMAP_REPACK");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+}
+
+// Needs the matmul-only tag on the tensor (sd_cpu_repack_buffer_type_for checks it).
+bool ModelManager::cpu_repack_eligible(const TensorState& state) const {
+    return state.matmul_only && cpu_repack_allowed_ && state.usage_op == GGML_OP_NONE &&
+           state.params_backend == state.compute_backend && sd_backend_is_cpu(state.compute_backend) &&
+           sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state.compute_backend), state.tensor) != nullptr;
+}
+
 void ModelManager::sync_cpu_repack_tag(TensorState& state) const {
     if (!state.matmul_only || state.tensor->buffer != nullptr) {
         return;
     }
     sd_tag_matmul_only_weight(state.tensor);
-    bool repack = cpu_repack_allowed_ && state.usage_op == GGML_OP_NONE && state.params_backend == state.compute_backend &&
-                  sd_backend_is_cpu(state.compute_backend) &&
-                  sd_cpu_repack_buffer_type_for(ggml_backend_get_device(state.compute_backend), state.tensor) != nullptr;
+    bool repack = cpu_repack_eligible(state);
     if (repack && can_mmap_storage(state) && state.sources.size() == 1 && state.sources[0].maps_directly_to(state.tensor)) {
-        // Mapped weights cannot be repacked: log once.
+        // Only reached with SD_CPU_MMAP_REPACK=0 (can_mmap_storage refuses repackable weights otherwise): log once.
         static std::once_flag logged;
         std::call_once(logged, [] { LOG_INFO("cpu weight repack: skipped for mmapped weights (drop --mmap to repack)"); });
         repack = false;
@@ -896,6 +913,14 @@ bool ModelManager::can_mmap_storage(const TensorState& state) const {
         return false;
     }
     if (state.compute_backend == nullptr || state.params_backend == nullptr) {
+        return false;
+    }
+    if (enable_mmap_ && sd_cpu_mmap_prefers_repack() && state.tensor != nullptr && state.tensor->buffer == nullptr &&
+        sd_is_matmul_only_weight(state.tensor) && cpu_repack_eligible(state)) {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            LOG_INFO("cpu weight repack: repacked weights are loaded, the rest stay mmapped (SD_CPU_MMAP_REPACK=0 maps all, unrepacked)");
+        });
         return false;
     }
     return sd_backend_is_cpu(state.compute_backend) ||

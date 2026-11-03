@@ -143,6 +143,7 @@ private:
     static std::vector<TensorStorage> find_tensor_sources(const TensorState& state, const String2TensorStorage& sources);
     bool load_tensor_parts(TensorState& state);
     bool can_mmap_storage(const TensorState& state) const;
+    bool cpu_repack_eligible(const TensorState& state) const;
     void sync_cpu_repack_tag(TensorState& state) const;
     bool alloc_params_buffers(const std::vector<TensorState*>& states,
                               std::vector<ParamsStorageBlock*>& created_storage_blocks);
