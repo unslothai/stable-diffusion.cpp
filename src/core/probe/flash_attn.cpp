@@ -44,7 +44,7 @@ static bool is_metal(ggml_backend_t backend) {
         return false;
     }
     auto reg = ggml_backend_dev_backend_reg(device);
-    return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "Metal") == 0;
+    return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "MTL") == 0;  // ggml-metal registers as "MTL"
 }
 
 static void build_flash_attention_probe(BackendProbeGraph& graph, ggml_backend_t backend, int length, int head_size, bool flash) {
