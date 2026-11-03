@@ -35,6 +35,18 @@ static bool is_vulkan_nvidia_rtx(ggml_backend_t backend) {
     return nvidia && rtx;
 }
 
+// ggml-metal only reports FLASH_ATTN_EXT when the device has simdgroup reductions + matrix multiply (Apple7+),
+// and there its FA kernels beat the softmax path on diffusion shapes. The timing probe's small shapes differ by a
+// few percent, so on Metal it flipped run to run and made the same seed give different images.
+static bool is_metal(ggml_backend_t backend) {
+    auto device = ggml_backend_get_device(backend);
+    if (device == nullptr) {
+        return false;
+    }
+    auto reg = ggml_backend_dev_backend_reg(device);
+    return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "Metal") == 0;
+}
+
 static void build_flash_attention_probe(BackendProbeGraph& graph, ggml_backend_t backend, int length, int head_size, bool flash) {
     constexpr int heads = 4;
     auto q              = ggml_new_tensor_3d(graph.ctx, GGML_TYPE_F32, head_size * heads, length, 1);
@@ -72,6 +84,10 @@ bool sd_probe_flash_attention(ggml_backend_t backend, int n_threads) {
         }
         if (sd_backend_supports_hip_mma(backend)) {
             LOG_INFO("flash attention auto: %s -> on (HIP MMA)", name);
+            return true;
+        }
+        if (is_metal(backend)) {
+            LOG_INFO("flash attention auto: %s -> on (Metal)", name);
             return true;
         }
         if (is_vulkan_nvidia_rtx(backend)) {
