@@ -65,6 +65,22 @@ int main() {
         CHECK(v == 0 || v == 255);
     }
 
+    sd::edge::GradientEdgeParams thin;
+    thin.clip_percentile  = 0.f;
+    thin.binary_threshold = 0.2f;
+    thin.thin             = true;
+    sd::edge::gradient_magnitude(step.data(), w, h, 3, out.data(), thin);
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = out.data() + static_cast<size_t>(y) * w;
+        int on             = 0;
+        for (int x = 0; x < w; ++x) {
+            on += row[x] == 255;
+            CHECK(row[x] == 0 || row[x] == 255);
+        }
+        CHECK(on == 1);  // one line where the soft map is several pixels wide
+        CHECK(row[31] == 255 || row[32] == 255);
+    }
+
     // Timing on a busy image (deterministic noise plus gradients).
     const int sizes[2][2] = {{832, 480}, {1280, 720}};
     for (const auto& size : sizes) {
@@ -85,6 +101,17 @@ int main() {
         auto t1   = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / runs;
         std::printf("gradient_magnitude %dx%d: %.2f ms/frame (single thread, mean of %d)\n", tw, th, ms, runs);
+
+        sd::edge::GradientEdgeParams lines;
+        lines.thin             = true;
+        lines.binary_threshold = 0.2f;
+        t0                     = std::chrono::steady_clock::now();
+        for (int r = 0; r < runs; ++r) {
+            sd::edge::gradient_magnitude(rgb.data(), tw, th, 3, edges.data(), lines);
+        }
+        t1 = std::chrono::steady_clock::now();
+        ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / runs;
+        std::printf("gradient_magnitude thin %dx%d: %.2f ms/frame (single thread, mean of %d)\n", tw, th, ms, runs);
     }
 
     if (failures == 0) {
