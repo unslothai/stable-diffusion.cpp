@@ -16,7 +16,7 @@ index d347757e..9bcd6009 100644
          ggml-cpu/common.h
          ggml-cpu/binary-ops.h
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index c10f0679..446a361e 100644
+index c10f0679..d8054cab 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -15,6 +15,7 @@
@@ -32,7 +32,7 @@ index c10f0679..446a361e 100644
      }
  
 +    // ggml_cpu_iqk_mul_mat (ik_llama.cpp kernels) runs below for its weight types once src1 is in Q8_K, in place of
-+    // vec_dot. The x86 tiled K-quant path still goes first (it takes ne11 >= 8) unless GGML_CPU_IQK=2.
++    // vec_dot (on by default on ARM only). The x86 tiled K-quant path still goes first unless GGML_CPU_IQK=2.
 +    const bool iqk = !params->use_ref && ggml_cpu_iqk_type_enabled(src0->type) &&
 +                     type_traits_cpu[src0->type].vec_dot_type == GGML_TYPE_Q8_K && dst->type == GGML_TYPE_F32 &&
 +                     src0->ne[0] % 256 == 0;
@@ -866,10 +866,10 @@ index 00000000..478cf1a4
 +#endif // IQK_IMPLEMENT
 diff --git a/src/ggml-cpu/iqk/iqk_gemm.cpp b/src/ggml-cpu/iqk/iqk_gemm.cpp
 new file mode 100644
-index 00000000..f82a1c5e
+index 00000000..addc939b
 --- /dev/null
 +++ b/src/ggml-cpu/iqk/iqk_gemm.cpp
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,231 @@
 +//
 +// Copyright (C) 2024-2025 Iwan Kawrakow
 +// MIT license
@@ -995,6 +995,13 @@ index 00000000..f82a1c5e
 +void ggml_cpu_iqk_init(void) {
 +    uint64_t mask = k_iqk_built_types;
 +    const char * on = getenv("GGML_CPU_IQK");
++#if defined(__x86_64__) || defined(_M_X64)
++    // x86: off unless asked for. The tiled K-quant path takes ne11 >= 8 and measured faster than these kernels on
++    // Zen 3/4/5, Broadwell and Emerald Rapids, so turning them on by default would only change ne11 < 8 results.
++    if (on == NULL) {
++        mask = 0;
++    }
++#endif
 +    if (on != NULL && atoi(on) == 0) {
 +        mask = 0;
 +    }
@@ -1096,10 +1103,10 @@ index 00000000..f82a1c5e
 +} // extern "C"
 diff --git a/src/ggml-cpu/iqk/iqk_gemm.h b/src/ggml-cpu/iqk/iqk_gemm.h
 new file mode 100644
-index 00000000..466e942e
+index 00000000..3cf83d93
 --- /dev/null
 +++ b/src/ggml-cpu/iqk/iqk_gemm.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,41 @@
 +#pragma once
 +
 +// GEMM kernels ported from ik_llama.cpp (iqk_gemm.cpp) for the k-quant / i-quant weight types whose
@@ -1114,7 +1121,8 @@ index 00000000..466e942e
 +extern "C" {
 +#endif
 +
-+// Reads once: GGML_CPU_IQK (0 disables; 2 runs these kernels ahead of the x86 tiled K-quant path instead of after it),
++// Reads once: GGML_CPU_IQK (0 disables; 1 enables, the default on ARM, while x86 defaults to off; 2 also runs them
++// ahead of the x86 tiled K-quant path),
 +// GGML_CPU_IQK_TYPES (ggml type names or "all"; the other types keep the tiled / vec_dot paths) and GGML_CPU_IQK_DEBUG
 +// (1: print the enabled types and the first mul_mat per type to stderr).
 +void ggml_cpu_iqk_init(void);
