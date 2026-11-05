@@ -396,6 +396,71 @@ namespace LTXV {
         return ggml_reshape_4d(ctx, out, out_time, channels, 1, 1);
     }
 
+    // F32 depthwise conv without im2col or F16 input rounding; nullptr when the backend lacks CONV_2D_DW.
+    static ggml_tensor* depthwise_conv1d_direct(GGMLRunnerContext* runner_ctx,
+                                                ggml_tensor* x,
+                                                ggml_tensor* filter,
+                                                int stride,
+                                                int padding,
+                                                bool reverse) {
+        auto ctx = runner_ctx->ggml_ctx;
+        if (runner_ctx->backend == nullptr || x->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1) {
+            return nullptr;
+        }
+        const int64_t time     = x->ne[0];
+        const int64_t channels = x->ne[1];
+        ggml_tensor* f         = ggml_reshape_4d(ctx, filter, filter->ne[0], 1, 1, 1);
+        if (reverse) {
+            f = reverse_1d_filter(ctx, f);
+        }
+        if (f->type != GGML_TYPE_F32) {
+            f = ggml_cast(ctx, f, GGML_TYPE_F32);
+        }
+        auto kernel = repeat_with_vulkan_f32_workaround(runner_ctx->backend, ctx, f, f->ne[0], 1, 1, channels);  // [K, 1, 1, C]
+        auto input  = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, x), time, 1, channels, 1);                        // [W, H=1, C, N=1]
+        auto out    = ggml_conv_2d_dw_direct(ctx, kernel, input, stride, 1, padding, 0, 1, 1);
+        if (!ggml_backend_supports_op(runner_ctx->backend, out)) {
+            return nullptr;
+        }
+        return ggml_reshape_4d(ctx, out, out->ne[0], channels, 1, 1);
+    }
+
+    // depthwise_conv_transpose1d via the direct conv: same zero-stuffing, reversed filter, padding and gain.
+    static ggml_tensor* depthwise_conv_transpose1d_direct(GGMLRunnerContext* runner_ctx,
+                                                          ggml_tensor* x,
+                                                          ggml_tensor* filter,
+                                                          int stride) {
+        auto ctx = runner_ctx->ggml_ctx;
+        if (x->ne[2] != 1 || x->ne[3] != 1 || filter->ne[1] != 1 || filter->ne[2] != 1 || filter->ne[3] != 1) {
+            return nullptr;
+        }
+        const int64_t time        = x->ne[0];
+        const int64_t channels    = x->ne[1];
+        const int64_t kernel_size = filter->ne[0];
+        const int64_t out_time    = (time - 1) * stride + kernel_size;
+
+        auto x_flat = ggml_reshape_3d(ctx, x, 1, time, channels);
+        if (stride > 1) {
+            auto zero_unit = ggml_ext_scale(ctx, x_flat, 0.0f);
+            auto zero_tail = zero_unit;
+            for (int i = 1; i < stride - 1; ++i) {
+                zero_tail = ggml_concat(ctx, zero_tail, zero_unit, 0);
+            }
+            x_flat = ggml_concat(ctx, x_flat, zero_tail, 0);
+        }
+        x_flat   = ggml_reshape_4d(ctx, x_flat, time * stride, channels, 1, 1);
+        auto out = depthwise_conv1d_direct(runner_ctx, x_flat, filter, 1, static_cast<int>(kernel_size - 1), true);
+        if (out == nullptr) {
+            return nullptr;
+        }
+        if (out->ne[0] > out_time) {
+            out = ggml_ext_slice(ctx, out, 0, 0, out_time);
+        }
+        GGML_ASSERT(out->ne[0] == out_time);
+        out = ggml_ext_scale(ctx, out, static_cast<float>(stride));
+        return ggml_reshape_4d(ctx, out, out_time, channels, 1, 1);
+    }
+
     static ggml_tensor* upsample_waveform_hann(GGMLRunnerContext* runner_ctx,
                                                ggml_tensor* waveform,
                                                ggml_tensor* filter,
@@ -667,8 +732,10 @@ namespace LTXV {
         int up_kernel_size   = 12;
         int down_kernel_size = 12;
 
-        explicit Activation1D(int64_t channels)
-            : channels(channels) {
+        bool direct_dw = false;
+
+        explicit Activation1D(int64_t channels, bool direct_dw = false)
+            : channels(channels), direct_dw(direct_dw) {
             blocks["act"] = std::make_shared<SnakeBeta1D>(channels);
         }
 
@@ -690,16 +757,17 @@ namespace LTXV {
             int up_pad_right = up_pad * up_ratio + (up_kernel_size - up_ratio + 1) / 2;
 
             x = replicate_pad_1d(ctx, x, up_pad, up_pad);
-            x = depthwise_conv_transpose1d(ctx, x, up_filter, up_ratio);
-            x = ggml_ext_slice(ctx->ggml_ctx, x, 0, up_pad_left, x->ne[0] - up_pad_right);
+            ggml_tensor* up = direct_dw ? depthwise_conv_transpose1d_direct(ctx, x, up_filter, up_ratio) : nullptr;
+            x               = up != nullptr ? up : depthwise_conv_transpose1d(ctx, x, up_filter, up_ratio);
+            x               = ggml_ext_slice(ctx->ggml_ctx, x, 0, up_pad_left, x->ne[0] - up_pad_right);
 
             x = act->forward(ctx, x);
 
             int down_pad_left  = down_kernel_size / 2 - (down_kernel_size % 2 == 0 ? 1 : 0);
             int down_pad_right = down_kernel_size / 2;
             x                  = replicate_pad_1d(ctx, x, down_pad_left, down_pad_right);
-            x                  = depthwise_conv1d(ctx, x, down_filter, down_ratio, 0);
-            return x;
+            ggml_tensor* down  = direct_dw ? depthwise_conv1d_direct(ctx, x, down_filter, down_ratio, 0, false) : nullptr;
+            return down != nullptr ? down : depthwise_conv1d(ctx, x, down_filter, down_ratio, 0);
         }
     };
 

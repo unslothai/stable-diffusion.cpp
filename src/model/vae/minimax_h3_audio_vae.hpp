@@ -2,6 +2,7 @@
 #define __SD_MODEL_VAE_MINIMAX_H3_AUDIO_VAE_HPP__
 
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,15 @@
 #include "model/vae/ltx_audio_vae.hpp"
 
 namespace MiniMaxH3 {
+
+    // SD_H3_AUDIO_DIRECT_DW=0: anti-aliased activations go back to the im2col + mat-vec depthwise convs.
+    static bool audio_direct_dw() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("SD_H3_AUDIO_DIRECT_DW");
+            return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+        }();
+        return enabled;
+    }
 
     struct AudioSnake1D : public UnaryBlock {
         int64_t channels;
@@ -229,9 +239,9 @@ namespace MiniMaxH3 {
             : channels(channels) {
             for (int i = 0; i < 3; ++i) {
                 blocks["activations." + std::to_string(i * 2)] =
-                    std::make_shared<LTXV::Activation1D>(channels);
+                    std::make_shared<LTXV::Activation1D>(channels, audio_direct_dw());
                 blocks["activations." + std::to_string(i * 2 + 1)] =
-                    std::make_shared<LTXV::Activation1D>(channels);
+                    std::make_shared<LTXV::Activation1D>(channels, audio_direct_dw());
                 blocks["convs1." + std::to_string(i)] =
                     std::make_shared<LTXV::Conv1D>(channels,
                                                    channels,
@@ -298,7 +308,7 @@ namespace MiniMaxH3 {
                 }
                 channels = next_channels;
             }
-            blocks["activation_post"] = std::make_shared<LTXV::Activation1D>(channels);
+            blocks["activation_post"] = std::make_shared<LTXV::Activation1D>(channels, audio_direct_dw());
             blocks["conv_post"]       = std::make_shared<LTXV::Conv1D>(channels,
                                                                  1,
                                                                  7,
@@ -363,33 +373,22 @@ namespace MiniMaxH3 {
             auto pre       = std::dynamic_pointer_cast<AudioAttentionProjection>(blocks["pre_block"]);
             auto mean_proj = std::dynamic_pointer_cast<LTXV::Conv1D>(blocks["mean_proj"]);
 
-            // GGML's batched conv1d storage interleaves the stream dimension
-            // with output channels. Subsequent layers then read stereo samples
-            // as adjacent feature channels. Run each mono stream independently,
-            // matching PyTorch's reshape(B*S, 1, samples), and concatenate only
-            // the completed normalized latents.
             const int64_t streams = waveform->ne[2] * waveform->ne[3];
             waveform              = ggml_reshape_3d(ctx->ggml_ctx,
                                                     waveform,
                                                     waveform->ne[0],
                                                     1,
                                                     streams);
-            ggml_tensor* stereo_z = nullptr;
-            for (int64_t stream = 0; stream < streams; ++stream) {
-                auto mono = ggml_ext_slice(ctx->ggml_ctx, waveform, 2, stream, stream + 1);
-                auto x    = encoder->forward(ctx, mono);
-                x         = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));
-                x         = pre->forward(ctx, x);
-                x         = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));
-                auto z    = mean_proj->forward(ctx, x);
+            auto x                = encoder->forward(ctx, waveform);
+            x                     = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));
+            x                     = pre->forward(ctx, x);
+            x                     = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));
+            auto z                = mean_proj->forward(ctx, x);
 
-                auto mean = ggml_reshape_4d(ctx->ggml_ctx, params["latents_mean"], 1, kLatentChannels, 1, 1);
-                auto std  = ggml_reshape_4d(ctx->ggml_ctx, params["latents_std"], 1, kLatentChannels, 1, 1);
-                z         = ggml_div(ctx->ggml_ctx, ggml_sub(ctx->ggml_ctx, z, mean), std);
-                z         = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 0, 2, 1, 3));
-                stereo_z  = stereo_z == nullptr ? z : ggml_concat(ctx->ggml_ctx, stereo_z, z, 1);
-            }
-            return stereo_z;
+            auto mean = ggml_reshape_4d(ctx->ggml_ctx, params["latents_mean"], 1, kLatentChannels, 1, 1);
+            auto std  = ggml_reshape_4d(ctx->ggml_ctx, params["latents_std"], 1, kLatentChannels, 1, 1);
+            z         = ggml_div(ctx->ggml_ctx, ggml_sub(ctx->ggml_ctx, z, mean), std);
+            return ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 0, 2, 1, 3));
         }
 
         ggml_tensor* decode(GGMLRunnerContext* ctx, ggml_tensor* latent) {

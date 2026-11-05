@@ -7,7 +7,7 @@
 
 #include "core/ggml_runner.h"
 #include "core/tensor_ggml.hpp"
-#include "model/common/rope.hpp"
+#include "model/common/rope_circular.hpp"
 #include "model_manager.h"
 
 enum class RefImageResizeMode {
@@ -64,6 +64,10 @@ struct FluxDiffusionExtra {
     float pulid_id_weight               = 1.0f;
 };
 
+struct Flux3DiffusionExtra {
+    const sd::Tensor<float>* target_timestep = nullptr;
+};
+
 struct AnimaDiffusionExtra {
     const sd::Tensor<int32_t>* t5_ids   = nullptr;
     const sd::Tensor<float>* t5_weights = nullptr;
@@ -71,6 +75,8 @@ struct AnimaDiffusionExtra {
 
 struct QwenImage21DiffusionExtra {
     const sd::Tensor<int32_t>* image_slots = nullptr;
+    // Nonzero IDs identify immutable prefix inputs within one sampling run.
+    uint64_t prefix_id = 0;
 };
 
 struct WanDiffusionExtra {
@@ -139,10 +145,15 @@ struct LLaDAImageDiffusionExtra {
     const sd::Tensor<float>* semantic = nullptr;
 };
 
+struct MingImageDiffusionExtra {
+    const sd::Tensor<float>* direct_context = nullptr;
+};
+
 using DiffusionExtraParams = std::variant<std::monostate,
                                           UNetDiffusionExtra,
                                           SkipLayerDiffusionExtra,
                                           FluxDiffusionExtra,
+                                          Flux3DiffusionExtra,
                                           AnimaDiffusionExtra,
                                           QwenImage21DiffusionExtra,
                                           WanDiffusionExtra,
@@ -152,7 +163,8 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           MiniT2IDiffusionExtra,
                                           SenseNovaU1DiffusionExtra,
                                           HunyuanVideoDiffusionExtra,
-                                          LLaDAImageDiffusionExtra>;
+                                          LLaDAImageDiffusionExtra,
+                                          MingImageDiffusionExtra>;
 
 struct DiffusionParams {
     const sd::Tensor<float>* x                        = nullptr;
@@ -181,6 +193,11 @@ static inline const sd::Tensor<T>& tensor_or_empty(const sd::Tensor<T>* tensor) 
 struct DiffusionModelRunner : public GGMLRunner {
 protected:
     std::string prefix;
+
+    std::vector<float> finish_rope_pe(Rope::Embedding embedding) {
+        Rope::apply_circular(embedding, circular_x_enabled, circular_y_enabled);
+        return std::move(embedding.values);
+    }
 
 public:
     DiffusionModelRunner(ggml_backend_t backend,

@@ -1,0 +1,233 @@
+From fa18cddc3f2a87bec12af3a00d4be0e28f9d514b Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Wed, 30 Sep 2026 22:28:21 -0700
+Subject: [PATCH 1/2] ggml-cuda: BF16 cuBLAS for large-batch quantized matmul,
+ cache device integrated flag
+
+GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=<rows> dequantizes a quantized weight to BF16
+and runs a cuBLAS GEMM (FP32 accumulate, FP32 output) instead of MMQ when src1
+has at least that many rows; 0 or unset keeps MMQ everywhere.
+GGML_CUDA_QUANT_CUBLAS_TYPE=f32 dequantizes to FP32 instead (accuracy oracle).
+At diffusion-transformer sizes (MiniMax-H3 960x544x124: 19108 tokens per call)
+MMQ reaches 130-240 TFLOP/s on a B200 while the BF16 GEMM reaches ~1300, and
+the result is closer to an FP32 reference because activations stay BF16
+instead of being quantized to q8_1.
+
+ggml_backend_cuda_device_get_memory / get_type called cudaGetDeviceProperties
+(~1-2 ms) on every call; stable-diffusion.cpp polls them per graph, 2798 times
+in one tiled H3 VAE decode. The flag is now read once at registration.
+---
+ src/ggml-cuda/ggml-cuda.cu | 55 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 47 insertions(+), 8 deletions(-)
+
+[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
+ the whole patch as one diff, regenerated from the port.]
+---
+diff --git a/src/ggml-cuda/cpy.cu b/src/ggml-cuda/cpy.cu
+index 5689f21b..a85d84bc 100644
+--- a/src/ggml-cuda/cpy.cu
++++ b/src/ggml-cuda/cpy.cu
+@@ -1,4 +1,5 @@
+ #include "cpy.cuh"
++#include <type_traits>
+ #include "dequantize.cuh"
+ #include "cpy-utils.cuh"
+ #include "fp8.cuh"
+@@ -203,6 +204,84 @@ cudaStream_t stream) {
+     ggml_cuda_kernel_launch(cpy_scalar_contiguous<src_t, dst_t>, launch_params, cx, cdst, ne);
+ }
+ 
++// Strided copy whose rows (dim 0) are contiguous on both sides and of equal length: one float4 per thread, the
++// 4-D index math done once per row instead of per element. cpy_scalar spends most of its time in the 64-bit
++// div/mod of that per-element math; the permuted ggml_cont copies of a DiT's Q/K/V (rows of head_dim floats) run
++// at a few percent of memory bandwidth through it. A pure copy (or the same per-element conversion), so the
++// result is bit-identical to cpy_scalar. GGML_CUDA_CPY_ROWS=0 disables it.
++template <typename dst_t>
++static __global__ void cpy_rows_vec4(const char * cx, char * cdst, const int64_t nrows, const int64_t ne00_4,
++                                     const int64_t ne01, const int64_t ne02, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++                                     const int64_t ne11, const int64_t ne12, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
++    ggml_cuda_pdl_lc();
++    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
++    if (row >= nrows) {
++        return;
++    }
++    const int64_t i01 = row % ne01;
++    const int64_t i02 = (row / ne01) % ne02;
++    const int64_t i03 = row / (ne01*ne02);
++    const int64_t i11 = row % ne11;
++    const int64_t i12 = (row / ne11) % ne12;
++    const int64_t i13 = row / (ne11*ne12);
++    const float4 * src = (const float4 *) (cx + i01*nb01 + i02*nb02 + i03*nb03);
++    char * dst_row = cdst + i11*nb11 + i12*nb12 + i13*nb13;
++    ggml_cuda_pdl_sync();
++    for (int64_t c = threadIdx.x; c < ne00_4; c += blockDim.x) {
++        const float4 v = src[c];
++        if constexpr (std::is_same_v<dst_t, float>) {
++            ((float4 *) dst_row)[c] = v;
++        } else {
++            dst_t * d = (dst_t *) dst_row + 4*c;
++            cpy_1_scalar<float, dst_t>((const char *) &v.x, (char *) (d + 0));
++            cpy_1_scalar<float, dst_t>((const char *) &v.y, (char *) (d + 1));
++            cpy_1_scalar<float, dst_t>((const char *) &v.z, (char *) (d + 2));
++            cpy_1_scalar<float, dst_t>((const char *) &v.w, (char *) (d + 3));
++        }
++    }
++}
++
++static bool ggml_cuda_cpy_rows_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_CPY_ROWS");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++// True (and launched) when src0 -> src1 is a row copy cpy_rows_vec4 can do; false leaves the copy to the caller.
++template <typename dst_t>
++static bool ggml_cpy_rows_vec4_cuda(const ggml_tensor * src0, ggml_tensor * src1, cudaStream_t stream) {
++    if (!ggml_cuda_cpy_rows_enabled() || src0->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const int64_t ne00 = src0->ne[0];
++    if (src0->nb[0] != (int64_t) sizeof(float) || src1->nb[0] != (int64_t) sizeof(dst_t) || src1->ne[0] != ne00 || ne00 % 4 != 0) {
++        return false;
++    }
++    const size_t dst_align = std::is_same_v<dst_t, float> ? 16 : 2*sizeof(dst_t);
++    if (((uintptr_t) src0->data | src0->nb[1] | src0->nb[2] | src0->nb[3]) % 16 != 0 ||
++        ((uintptr_t) src1->data | src1->nb[1] | src1->nb[2] | src1->nb[3]) % dst_align != 0) {
++        return false;
++    }
++    const int64_t nrows = ggml_nrows(src0);
++    if (nrows != ggml_nrows(src1) || src0->ne[1] == 0 || src0->ne[2] == 0 || src1->ne[1] == 0 || src1->ne[2] == 0) {
++        return false;
++    }
++    const int64_t ne00_4 = ne00 / 4;
++    const int threads_x = ne00_4 >= 32 ? 32 : (int) ne00_4;
++    const int threads_y = 256 / threads_x;
++    const int64_t blocks = (nrows + threads_y - 1) / threads_y;
++    if (blocks > INT_MAX) {
++        return false;
++    }
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3((unsigned) blocks), dim3(threads_x, threads_y), 0, stream);
++    ggml_cuda_kernel_launch(cpy_rows_vec4<dst_t>, launch_params, (const char *) src0->data, (char *) src1->data, nrows, ne00_4,
++        src0->ne[1], src0->ne[2], (int64_t) src0->nb[1], (int64_t) src0->nb[2], (int64_t) src0->nb[3],
++        src1->ne[1], src1->ne[2], (int64_t) src1->nb[1], (int64_t) src1->nb[2], (int64_t) src1->nb[3]);
++    return true;
++}
++
+ template<typename src_t, typename dst_t, bool transposed = false>
+ static void ggml_cpy_scalar_cuda(
+     const char * cx, char * cdst, const int64_t ne,
+@@ -510,6 +589,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+             ggml_cpy_scalar_cuda<ggml_fp8_e5m2_cuda, nv_bfloat16>
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+         }
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_cpy_rows_vec4_cuda<float>(src0, src1, main_stream)) {
++        // row copy done
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && !contiguous_srcs && ggml_cpy_rows_vec4_cuda<half>(src0, src1, main_stream)) {
++        // row copy with conversion done
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+         if (can_be_transposed) {
+             ggml_cpy_scalar_cuda<float, float, true>
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index c28589ae..8a295c19 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2561,6 +2561,25 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
+     return true;
+ }
+ 
++// Large-batch matmul with a quantized weight: dequantize the weight to BF16 once and run a cuBLAS
++// GEMM (FP32 accumulate, FP32 output) instead of MMQ. MMQ quantizes the activations to q8_1 and runs
++// int8 MMA, which is the right call for LLM prompt sizes, but at diffusion-transformer sizes (10^4
++// tokens per call) a tensor-core BF16 GEMM is faster on GPUs whose BF16 rate is not far below their
++// int8 rate, and it is more accurate (activations stay BF16 instead of 8-bit).
++// GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=<rows>: use the BF16 path when src1 has at least this many rows;
++// 0 disables it (stock MMQ everywhere). Unset = the per-architecture default below.
++static int64_t ggml_cuda_quant_cublas_min_batch(int cc) {
++    static const int64_t env = [] {
++        const char * e = getenv("GGML_CUDA_QUANT_CUBLAS_MIN_BATCH");
++        return e != nullptr ? (int64_t) atoll(e) : (int64_t) -1;
++    }();
++    if (env >= 0) {
++        return env;
++    }
++    GGML_UNUSED(cc);
++    return 0;
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -2625,6 +2644,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    if (ggml_is_quantized(src0->type) && ne11 > MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_NVIDIA(cc) &&
++            bf16_mma_hardware_available(cc) && ggml_get_to_bf16_cuda(src0->type) != nullptr) {
++        const int64_t min_batch = ggml_cuda_quant_cublas_min_batch(cc);
++        if (min_batch > 0 && ne11*ne12*ne13 >= min_batch) {
++            // GGML_CUDA_QUANT_CUBLAS_TYPE=f32 dequantizes to FP32 instead: slow, for accuracy oracles only.
++            static const bool f32_oracle = [] {
++                const char * e = getenv("GGML_CUDA_QUANT_CUBLAS_TYPE");
++                return e != nullptr && (strcmp(e, "f32") == 0 || strcmp(e, "fp32") == 0);
++            }();
++            if (f32_oracle) {
++                ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
++            } else {
++                ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
++            }
++            return;
++        }
++    }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+@@ -5881,6 +5917,10 @@ struct ggml_backend_cuda_device_context {
+     std::string description;
+     std::string pci_bus_id;
+     int op_offload_min_batch_size;
++    // cudaDeviceProp::integrated, read once at registration. cudaGetDeviceProperties costs ~1-2 ms per call, and
++    // get_memory / get_type are polled per graph by callers that budget VRAM (stable-diffusion.cpp asks thousands
++    // of times per tiled VAE decode, ~5 s of host time per H3 video on a B200 host).
++    bool integrated = false;
+ };
+ 
+ static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
+@@ -5984,11 +6024,8 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
+ // ref: https://github.com/ggml-org/llama.cpp/pull/17368
+ #if defined(__linux__) && !defined(GGML_USE_HIP)
+     // Check if this is a UMA (Unified Memory Architecture) system
+-    cudaDeviceProp prop;
+-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
+-
+     // Check if UMA is explicitly enabled via environment variable
+-    bool is_uma = prop.integrated > 0 || ggml_cuda_unified_memory_enabled();
++    bool is_uma = ctx->integrated || ggml_cuda_unified_memory_enabled();
+ 
+     if (is_uma) {
+         // For UMA systems (like DGX Spark), use system memory info
+@@ -6012,10 +6049,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
+ static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+ 
+-    cudaDeviceProp prop;
+-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
+-
+-    return prop.integrated
++    return ctx->integrated
+         ? GGML_BACKEND_DEVICE_TYPE_IGPU
+         : GGML_BACKEND_DEVICE_TYPE_GPU;
+ }
+@@ -6795,6 +6829,11 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
+                 dev_ctx->device = i;
+                 dev_ctx->name = GGML_CUDA_NAME + std::to_string(i);
+                 dev_ctx->description = ggml_cuda_device_description(i);
++                {
++                    cudaDeviceProp prop;
++                    CUDA_CHECK(cudaGetDeviceProperties(&prop, physical_id));
++                    dev_ctx->integrated = prop.integrated > 0;
++                }
+ 
+                 char pci_bus_id[32] = {};
+                 CUDA_CHECK(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), physical_id));

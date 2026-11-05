@@ -326,6 +326,7 @@ void sd_hires_params_init(sd_hires_params_t* hires_params) {
 void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     *sd_ctx_params                           = {};
     sd_ctx_params->n_threads                 = sd_get_num_physical_cores();
+    sd_ctx_params->conditioning_cache_size   = 4;
     sd_ctx_params->wtype                     = SD_TYPE_COUNT;
     sd_ctx_params->rng_type                  = CUDA_RNG;
     sd_ctx_params->sampler_rng_type          = RNG_TYPE_COUNT;
@@ -334,8 +335,11 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->max_vram                  = nullptr;
     sd_ctx_params->disable_prefetch          = false;
     sd_ctx_params->disable_segmented_compute = false;
+    sd_ctx_params->batched_cfg               = true;
     sd_ctx_params->eager_load                = false;
     sd_ctx_params->enable_mmap               = false;
+    sd_ctx_params->flash_attn_mode           = nullptr;
+    sd_ctx_params->conv_direct_mode          = nullptr;
     sd_ctx_params->diffusion_flash_attn      = false;
     sd_ctx_params->sage_attn                 = false;
     sd_ctx_params->linear_scale              = 0.f;
@@ -378,6 +382,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "pulid_weights_path: %s\n"
              "tensor_type_rules: %s\n"
              "n_threads: %d\n"
+             "conditioning_cache_size: %d\n"
              "wtype: %s\n"
              "rng_type: %s\n"
              "sampler_rng_type: %s\n"
@@ -392,6 +397,8 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "model_args: %s\n"
              "auto_fit: %s\n"
              "flash_attn: %s\n"
+             "flash_attn_mode: %s\n"
+             "conv_direct_mode: %s\n"
              "diffusion_flash_attn: %s\n"
              "sage_attn: %s\n"
              "linear_scale: %g\n"
@@ -418,6 +425,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->pulid_weights_path),
              SAFE_STR(sd_ctx_params->tensor_type_rules),
              sd_ctx_params->n_threads,
+             sd_ctx_params->conditioning_cache_size,
              sd_type_name(sd_ctx_params->wtype),
              sd_rng_type_name(sd_ctx_params->rng_type),
              sd_rng_type_name(sd_ctx_params->sampler_rng_type),
@@ -432,6 +440,8 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->model_args),
              BOOL_STR(sd_ctx_params->auto_fit),
              BOOL_STR(sd_ctx_params->flash_attn),
+             sd_ctx_params->flash_attn_mode && sd_ctx_params->flash_attn_mode[0] ? sd_ctx_params->flash_attn_mode : "auto (legacy flags honored)",
+             sd_ctx_params->conv_direct_mode && sd_ctx_params->conv_direct_mode[0] ? sd_ctx_params->conv_direct_mode : "auto (legacy flags honored)",
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
              BOOL_STR(sd_ctx_params->sage_attn),
              sd_ctx_params->linear_scale,
@@ -630,14 +640,6 @@ struct sd_ctx_t {
     StableDiffusionGGML* sd = nullptr;
 };
 
-static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version);
-}
-
-static bool sd_version_supports_image_generation(SDVersion version) {
-    return !sd_version_supports_video_generation(version);
-}
-
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == nullptr) {
@@ -702,6 +704,13 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx) {
     return sd_version_supports_video_generation(sd_ctx->sd->version);
 }
 
+SD_API bool sd_ctx_supports_ref_image_conditioning(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_version_supports_ref_image_conditioning(sd_ctx->sd->version);
+}
+
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || path == nullptr) {
         return false;
@@ -759,28 +768,20 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            int* num_frames_out,
                            sd_audio_t** audio_out,
                            int* fps_out) {
-    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_vid_gen_params == nullptr) {
-        if (fps_out != nullptr) {
-            *fps_out = 0;
-        }
-        return false;
-    }
-
-    if (frames_out != nullptr) {
+    if (frames_out != nullptr)
         *frames_out = nullptr;
-    }
-    if (audio_out != nullptr) {
+    if (audio_out != nullptr)
         *audio_out = nullptr;
-    }
-    if (num_frames_out != nullptr) {
+    if (num_frames_out != nullptr)
         *num_frames_out = 0;
+    if (fps_out != nullptr)
+        *fps_out = 0;
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_vid_gen_params == nullptr) {
+        return false;
     }
 
     StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
     if (!execution.ready) {
-        if (fps_out != nullptr) {
-            *fps_out = 0;
-        }
         return false;
     }
 

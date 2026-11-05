@@ -21,21 +21,21 @@ if(SD_SERVER_BUILD_FRONTEND AND EXISTS "${FRONTEND_DIR}")
         set(HAVE_FRONTEND_BUILD ON)
 
         add_custom_target(${TARGET}_frontend_install
-            COMMAND "${PNPM_EXECUTABLE}" -C "${FRONTEND_DIR}" install
+            COMMAND "${PNPM_EXECUTABLE}" --ignore-workspace -C "${FRONTEND_DIR}" install
             WORKING_DIRECTORY "${FRONTEND_DIR}"
             COMMENT "Installing frontend dependencies"
             VERBATIM
         )
 
         add_custom_target(${TARGET}_frontend_build
-            COMMAND "${PNPM_EXECUTABLE}" -C "${FRONTEND_DIR}" run build
+            COMMAND "${PNPM_EXECUTABLE}" --ignore-workspace -C "${FRONTEND_DIR}" run build
             WORKING_DIRECTORY "${FRONTEND_DIR}"
             COMMENT "Building frontend"
             VERBATIM
         )
 
         add_custom_target(${TARGET}_frontend_header
-            COMMAND "${PNPM_EXECUTABLE}" -C "${FRONTEND_DIR}" run build:header
+            COMMAND "${PNPM_EXECUTABLE}" --ignore-workspace -C "${FRONTEND_DIR}" run build:header
             WORKING_DIRECTORY "${FRONTEND_DIR}"
             COMMENT "Generating gen_index_html.h"
             VERBATIM
@@ -68,6 +68,8 @@ add_executable(${TARGET}
     ../common/media_io.cpp
     main.cpp
     runtime.cpp
+    model_catalog.cpp
+    routes_models.cpp
     async_jobs.cpp
     routes_index.cpp
     routes_openai.cpp
@@ -87,6 +89,17 @@ if(HAVE_FRONTEND_BUILD)
 else()
     message(STATUS "HAVE_INDEX_HTML disabled")
 endif()
+
+file(GLOB BUILTIN_RECIPE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/recipes/*.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${BUILTIN_RECIPE_FILES})
+# Keep recipes in separate literals to stay within MSVC's string size limit.
+set(SD_BUILTIN_RECIPES "")
+foreach(RECIPE_FILE IN LISTS BUILTIN_RECIPE_FILES)
+    file(READ "${RECIPE_FILE}" RECIPE_JSON)
+    string(APPEND SD_BUILTIN_RECIPES "R\"recipes(${RECIPE_JSON})recipes\",\n")
+endforeach()
+configure_file(recipes_builtin.h.in "${CMAKE_CURRENT_BINARY_DIR}/recipes_builtin.h" @ONLY)
+target_include_directories(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})

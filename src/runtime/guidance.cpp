@@ -64,6 +64,34 @@ namespace sd::guidance {
         return uncond;
     }
 
+    MossUncondSkipParams parse_moss_uncond_skip_args(const char* extra_sample_args) {
+        MossUncondSkipParams params;
+        for (const auto& [key, value] : parse_key_value_args(extra_sample_args, "extra sample arg")) {
+            if (key == "moss_uncond_skip") {
+                bool parsed = true;
+                if (!parse_strict_bool(value, parsed)) {
+                    LOG_WARN("ignoring invalid MOSS extra sample arg '%s=%s'", key.c_str(), value.c_str());
+                    continue;
+                }
+                params.enabled = parsed;
+            } else if (key == "moss_uncond_skip_start" || key == "moss_uncond_skip_end") {
+                float parsed = 0.0f;
+                if (!parse_strict_float(value, parsed) || !(parsed >= 0.0f && parsed <= 1.0f)) {
+                    LOG_WARN("ignoring invalid MOSS extra sample arg '%s=%s' (expected 0..1)", key.c_str(), value.c_str());
+                    continue;
+                }
+                (key == "moss_uncond_skip_start" ? params.start : params.end) = parsed;
+            }
+        }
+        if (params.start > params.end) {
+            LOG_WARN("moss_uncond_skip_start %.4f > moss_uncond_skip_end %.4f: keeping the skip on every step",
+                     params.start, params.end);
+            params.start = 0.0f;
+            params.end   = 1.0f;
+        }
+        return params;
+    }
+
     std::vector<float> parse_guidance_schedule_from_spec(std::string spec) {
         std::vector<float> schedule;
 

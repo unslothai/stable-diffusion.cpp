@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/ggml_extend_backend.h"
@@ -26,6 +27,7 @@ class RNG;
 struct Denoiser;
 struct LoraModel;
 struct ConditionerParams;
+class ConditioningCache;
 struct SDCondition;
 struct RefImageParams;
 namespace Wav2Vec2 {
@@ -47,6 +49,11 @@ static inline bool sd_version_supports_ref_latent_img_cfg(SDVersion version) {
 class StableDiffusionGGML {
 public:
     SDBackendManager backend_manager;
+    std::unordered_map<ggml_backend_t, bool> flash_attn_by_backend;
+    SDBackendAssignment flash_attn_assignment;
+    SDBackendAssignment conv_direct_assignment;
+    std::unordered_map<ggml_backend_t, bool> conv2d_direct_by_backend;
+    std::unordered_map<ggml_backend_t, bool> conv3d_direct_by_backend;
 
     SDVersion version;
     bool external_vae_is_invalid = false;
@@ -130,7 +137,7 @@ public:
                                 &sd_ctx_params_t::clip_g_path, &sd_ctx_params_t::clip_vision_path,
                                 &sd_ctx_params_t::t5xxl_path, &sd_ctx_params_t::llm_path,
                                 &sd_ctx_params_t::llm_vision_path, &sd_ctx_params_t::diffusion_model_path,
-                                &sd_ctx_params_t::tokenizer,
+                                &sd_ctx_params_t::tokenizer, &sd_ctx_params_t::flash_attn_mode, &sd_ctx_params_t::conv_direct_mode,
                                 &sd_ctx_params_t::high_noise_diffusion_model_path, &sd_ctx_params_t::uncond_diffusion_model_path,
                                 &sd_ctx_params_t::embeddings_connectors_path, &sd_ctx_params_t::vae_path,
                                 &sd_ctx_params_t::audio_vae_path, &sd_ctx_params_t::taesd_path,
@@ -178,6 +185,8 @@ public:
     std::recursive_mutex execution_mutex;
     std::unique_ptr<ModelConfig> config_;
     RunnerState runner_state_;
+    std::unique_ptr<ConditioningCache> conditioning_cache_;
+    std::vector<ModelManager::LoraSpec> conditioning_loras_;
     bool executing_ = false;
 
     std::shared_ptr<Denoiser> denoiser;
@@ -331,6 +340,8 @@ public:
     bool build_extension_runners();
 
     bool validate_and_load_runners();
+    bool flash_attention_for(SDBackendModule module);
+    bool conv_direct_for(SDBackendModule module, bool conv3d);
 
     bool build_denoiser();
 
@@ -360,6 +371,8 @@ public:
     void lora_stat();
 
     bool apply_loras(const sd_lora_t* loras, uint32_t lora_count);
+
+    SDCondition get_learned_condition(const ConditionerParams& params);
 
     void reset_generation_extensions();
 

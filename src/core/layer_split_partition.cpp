@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "core/layer_split_ranges.h"
 #include "core/util.h"
 
 namespace sd {
@@ -84,14 +85,20 @@ namespace sd {
             if (dev != nullptr) {
                 ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
             }
-            if (free_bytes > 0) {
-                capacities[i] = std::max<int64_t>((int64_t)free_bytes - compute_headroom_bytes, 0);
-            }
             size_t limit_bytes = graph_cut_layer_split_backend_vram_limit(backend_vram_limits,
                                                                           i,
                                                                           primary_backend_vram_limit);
+            // The headroom comes off whichever bound applies: an explicit --max-vram budget also has to hold the
+            // compute buffers of the segments this device runs, so weights alone may not fill it.
+            int64_t bound = -1;
+            if (free_bytes > 0) {
+                bound = (int64_t)free_bytes;
+            }
             if (limit_bytes > 0) {
-                capacities[i] = std::min<int64_t>(capacities[i], (int64_t)limit_bytes);
+                bound = bound < 0 ? (int64_t)limit_bytes : std::min<int64_t>(bound, (int64_t)limit_bytes);
+            }
+            if (bound >= 0) {
+                capacities[i] = std::max<int64_t>(bound - compute_headroom_bytes, 0);
             }
         }
         return capacities;
@@ -151,27 +158,33 @@ namespace sd {
             return param_assignments.count(param) != 0;
         });
 
-        std::vector<ggml_backend_t> backend_by_segment(plan.segments.size(), split_backends[0]);
-        size_t current_backend = 0;
-        int64_t current_used   = 0;
-        for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
-            int64_t bytes = segment_param_bytes[seg_idx];
-            while (!reuse_assignments && current_backend + 1 < split_backends.size() &&
-                   bytes > 0 &&
-                   current_used + bytes > backend_capacities[current_backend]) {
-                current_backend++;
-                current_used = 0;
-            }
-            if (!reuse_assignments && bytes > 0 && current_used + bytes > backend_capacities[current_backend]) {
+        LayerSplitRangesResult ranges;
+        if (!reuse_assignments) {
+            ranges = plan_layer_split_ranges(segment_param_bytes, backend_capacities);
+            if (!ranges.ok) {
                 LOG_ERROR("%s graph-cut layer split: segment %zu needs %.1f MB on %s, but only %.1f MB is available under current VRAM limits",
                           desc,
-                          seg_idx,
-                          (current_used + bytes) / (1024.0 * 1024.0),
-                          layer_split_backend_device_display_name(split_backends[current_backend]).c_str(),
-                          backend_capacities[current_backend] / (1024.0 * 1024.0));
+                          ranges.failed_segment,
+                          ranges.failed_need / (1024.0 * 1024.0),
+                          layer_split_backend_device_display_name(split_backends[ranges.failed_device]).c_str(),
+                          backend_capacities[ranges.failed_device] / (1024.0 * 1024.0));
                 return false;
             }
-            current_used += bytes;
+            for (size_t i = 0; i < split_backends.size(); i++) {
+                LOG_INFO("%s graph-cut layer split: %s weight capacity %.1f MB (%s)",
+                         desc,
+                         layer_split_backend_device_display_name(split_backends[i]).c_str(),
+                         backend_capacities[i] / (1024.0 * 1024.0),
+                         ranges.used_fill_first ? "fill-first plan, proportional plan did not fit" : "proportional plan");
+            }
+        }
+
+        std::vector<ggml_backend_t> backend_by_segment(plan.segments.size(), split_backends[0]);
+        size_t current_backend = 0;
+        for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
+            if (!reuse_assignments) {
+                current_backend = ranges.device_by_segment[seg_idx];
+            }
 
             for (ggml_tensor* param : segment_params[seg_idx]) {
                 ggml_backend_t target_backend = split_backends[current_backend];

@@ -38,8 +38,7 @@ private:
         std::string name;
         ggml_tensor* tensor      = nullptr;
         ModelComponent component = ModelComponent::Count;
-        TensorStorage source;
-        bool has_source                 = false;
+        std::vector<TensorStorage> sources;
         ModelLoader::FileId source_file = 0;
         SDVersion source_version        = VERSION_COUNT;
 
@@ -50,6 +49,7 @@ private:
         bool params_follow_compute_backend           = false;
         bool metadata_validated                      = false;
         enum ggml_op usage_op                        = GGML_OP_NONE;
+        bool matmul_only                             = false;  // tagged by its block: may be CPU-repacked
 
         int pin_count = 0;
 
@@ -94,6 +94,7 @@ private:
     std::vector<std::unique_ptr<TensorState>> tensor_states_;
     std::map<const ggml_tensor*, TensorState*> tensor_states_by_tensor_;
     mutable std::list<ResolvedTensorStates> resolved_tensor_states_;
+    mutable std::map<std::pair<uintptr_t, ggml_backend_dev_t>, std::pair<size_t, size_t>> device_query_cache_;
     std::vector<std::unique_ptr<ParamsStorageBlock>> params_storage_blocks_;
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
@@ -113,6 +114,7 @@ private:
     int n_threads_                   = 0;
     bool enable_mmap_                = false;
     bool writable_mmap_              = false;
+    bool cpu_repack_allowed_         = true;
     bool segmented_compute_disabled_ = false;
     bool prefetch_disabled_          = false;
 
@@ -138,7 +140,10 @@ private:
     bool apply_loras_to_params(const std::vector<TensorState*>& states);
     bool mmap_params(const std::vector<TensorState*>& states,
                      std::vector<ParamsStorageBlock*>& created_storage_blocks);
+    static std::vector<TensorStorage> find_tensor_sources(const TensorState& state, const String2TensorStorage& sources);
+    bool load_tensor_parts(TensorState& state);
     bool can_mmap_storage(const TensorState& state) const;
+    void sync_cpu_repack_tag(TensorState& state) const;
     bool alloc_params_buffers(const std::vector<TensorState*>& states,
                               std::vector<ParamsStorageBlock*>& created_storage_blocks);
     bool load_tensors(const std::vector<TensorState*>& states);
@@ -151,13 +156,15 @@ private:
         size_t required_budget_bytes  = 0;
         size_t available_device_bytes = SIZE_MAX;
         size_t available_budget_bytes = SIZE_MAX;
+        bool requires_reclamation     = false;
         bool fits() const {
             return required_device_bytes <= available_device_bytes &&
                    required_budget_bytes <= available_budget_bytes;
         }
     };
     CapacityCheck check_capacity(const DeviceMemoryRequest& request,
-                                 const std::vector<TensorState*>& states) const;
+                                 const std::vector<TensorState*>& states,
+                                 bool log_details = false) const;
 
     ggml_backend_buffer_type_t params_buffer_type_for(const TensorState& state) const;
     ggml_backend_buffer_type_t split_buffer_type_for(const TensorState& state) const;
@@ -198,8 +205,10 @@ public:
         segmented_compute_disabled_ = disabled;
     }
     void set_prefetch_disabled(bool disabled) { prefetch_disabled_ = disabled; }
-    void set_enable_mmap(bool enable_mmap) { enable_mmap_ = enable_mmap; }
+    void set_enable_mmap(bool enable_mmap);
     void set_writable_mmap(bool writable_mmap) { writable_mmap_ = writable_mmap; }
+    // Per context: an 'immediately' LoRA merge rewrites weights in place, which a repacked CPU weight cannot take.
+    void set_cpu_repack_allowed(bool allowed);
     void set_common_ignore_tensors(std::set<std::string> ignore_tensors);
     bool prepare_lora_sources(std::vector<LoraSpec>& loras);
     bool set_loras(std::vector<LoraSpec> loras, SDVersion version);

@@ -17,6 +17,7 @@ namespace sd {
         ggml_backend_t backend_;
         std::vector<ggml_backend_t> extra_backends_;
         ggml_backend_t cpu_backend_     = nullptr;
+        ggml_backend_t blas_backend_    = nullptr;
         ggml_gallocr_t allocator_       = nullptr;
         ggml_backend_sched_t scheduler_ = nullptr;
         size_t scheduler_capacity_      = 0;
@@ -34,8 +35,7 @@ namespace sd {
         };
         using AssignNodes = std::function<void(ggml_backend_sched_t, ggml_cgraph*)>;
 
-        explicit ComputeWorkspace(ggml_backend_t backend)
-            : backend_(backend) {}
+        explicit ComputeWorkspace(ggml_backend_t backend);
         ~ComputeWorkspace();
         ComputeWorkspace(const ComputeWorkspace&)            = delete;
         ComputeWorkspace& operator=(const ComputeWorkspace&) = delete;
@@ -53,9 +53,12 @@ namespace sd {
         void synchronize() const;
         bool segment_end() noexcept;
         bool release();
+        void release_blas_scratch();
+        bool uses_blas() const { return blas_backend_ != nullptr && extra_backends_.empty(); }
         bool active() const { return active_; }
         ggml_backend_sched_t scheduler() const { return scheduler_; }
         ggml_backend_t cpu_backend() const { return cpu_backend_; }
+        void set_accelerator_threads(int n_threads) const;
         size_t bytes(ggml_backend_t backend) const;
         size_t reservation_count() const { return reservations_; }
     };

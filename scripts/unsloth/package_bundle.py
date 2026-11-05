@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -59,19 +60,30 @@ def _is_runtime_lib(name: str) -> bool:
     return ".so." in lowered
 
 
-def _collect(bin_dir: Path, keep_layout: bool) -> list[tuple[Path, str]]:
-    """(file, archive-relative name) for the binaries + sibling runtime libs to ship. Recurse
-    so a nested bin/ layout (some generators emit build/bin/, some build/bin/Release/) is still
-    captured and flattened. With keep_layout, every file ships at its path under bin_dir."""
-    found: list[tuple[Path, str]] = []
-    for p in sorted(bin_dir.rglob("*")):
-        if not p.is_file():
-            continue
-        if keep_layout:
-            found.append((p, p.relative_to(bin_dir).as_posix()))
-        elif p.name in _BINARIES or _is_runtime_lib(p.name):
-            found.append((p, p.name))
-    return found
+# libggml-cuda.so.0, the name DT_NEEDED spells. The fully versioned file behind it and the bare
+# libggml-cuda.so link are build-time names only.
+_SONAME_RE = re.compile(r"lib.+\.so\.\d+")
+
+
+def _collect(bin_dir: Path, keep_layout: bool = False) -> list[tuple[str, Path]]:
+    """(name in the bundle, file) for the binaries + sibling runtime libs. Recurse so a nested bin/
+    layout (some generators emit build/bin/, some build/bin/Release/) is still captured.
+
+    A shared-ggml build leaves each library as a real file plus two symlinks, and zipfile follows
+    links, so shipping all three stores the 100+ MB CUDA library three times. Ship it once, under
+    its soname. With keep_layout, every file ships at its path under bin_dir."""
+    if keep_layout:
+        return [(p.relative_to(bin_dir).as_posix(), p) for p in sorted(bin_dir.rglob("*")) if p.is_file()]
+    wanted = [
+        p for p in sorted(bin_dir.rglob("*"))
+        if p.is_file() and (p.name in _BINARIES or _is_runtime_lib(p.name))
+    ]
+    found = {p.name: p.resolve() for p in wanted if p.is_symlink() and _SONAME_RE.fullmatch(p.name)}
+    under_soname = set(found.values())
+    for p in wanted:
+        if p.name not in found and p.resolve() not in under_soname:
+            found[p.name] = p
+    return sorted(found.items())
 
 
 def main() -> int:
@@ -88,11 +100,11 @@ def main() -> int:
         return 2
 
     files = _collect(bin_dir, os.environ.get("KEEP_LAYOUT", "").strip() == "1")
-    have_cli = any(f.name in ("sd-cli", "sd-cli.exe") for f, _ in files)
+    have_cli = any(Path(name).name in ("sd-cli", "sd-cli.exe") for name, _ in files)
     if not have_cli:
         print(f"package_bundle: no sd-cli under {bin_dir}; refusing to package", file = sys.stderr)
         return 1
-    have_server = any(f.name in ("sd-server", "sd-server.exe") for f, _ in files)
+    have_server = any(Path(name).name in ("sd-server", "sd-server.exe") for name, _ in files)
 
     out_dir.mkdir(parents = True, exist_ok = True)
     stem = f"sd-{tag}-bin-{label}"
@@ -113,8 +125,9 @@ def main() -> int:
     # Deterministic-ish: sort members; drop the archive if it already exists.
     zip_path.unlink(missing_ok = True)
     with zipfile.ZipFile(zip_path, "w", compression = zipfile.ZIP_DEFLATED) as zf:
-        for f, name in files:
-            # Under sd-<tag>-bin-<label>/, flat unless KEEP_LAYOUT.
+        for name, f in files:
+            # Under sd-<tag>-bin-<label>/: flat (binaries at <stem>/<name> regardless of build
+            # layout) unless KEEP_LAYOUT.
             zf.write(f, arcname = f"{stem}/{name}")
         zf.writestr(f"{stem}/UNSLOTH_BUILD.txt", provenance)
         if license_file and Path(license_file).is_file():

@@ -16,7 +16,20 @@ namespace sd::backend_fit {
                               std::string& params_spec);
 
     bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params,
-                                         bool prefer_temporal_tiling);
+                                         bool prefer_temporal_tiling,
+                                         ggml_status status,
+                                         int latent_tile_size_w,
+                                         int latent_tile_size_h,
+                                         int scale_factor);
+
+    // Same as prepare_vae_decode_retry_tiling, for an encode when encode is true (only the log differs).
+    bool prepare_vae_retry_tiling(sd_tiling_params_t& tiling_params,
+                                  bool prefer_temporal_tiling,
+                                  ggml_status status,
+                                  int latent_tile_size_w,
+                                  int latent_tile_size_h,
+                                  int scale_factor,
+                                  bool encode);
 
 }  // namespace sd::backend_fit
 

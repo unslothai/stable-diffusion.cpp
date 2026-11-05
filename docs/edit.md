@@ -14,6 +14,7 @@ Depending on the architecture, different models handle reference images differen
 | [**Qwen Image Edit**](./qwen_image_edit.md) | `qwen` |
 | **Qwen Image LAYERED** | `qwen_layered` |
 | [**Flux.2 [Dev] / Flux.2 [Klein]**](./flux2.md) | `flux2` |
+| [**FLUX.3 Image Klein / Klein Base**](./flux3.md) | `flux2` |
 | [**Boogu Image Edit**](./boogu_image.md) | `z_image_omni` |
 | **Krea2 (Community Edit LoRAs)** | `krea2_ostris_edit` |
 | [**Mage-Flow-Edit**](./mage_flow.md#image-editing) | `mage_flow` |
@@ -25,6 +26,9 @@ Stable-diffusion.spp also supports basic Unet-based editing models like instruct
 ---
 
 ## Configuring Reference Modes (`--ref-image-args`)
+
+For a one-time input transform before reference presets and model processing,
+including cropping, padding, and resizing algorithms, see [Image preprocessing](./image_preprocessing.md).
 
 Different DiT-based editing models require different configurations to process reference images correctly (e.g., whether to use a Vision Language Model (VLM) encoder or pass VAE-encoded images directly to the DiT).
 

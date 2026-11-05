@@ -12,6 +12,10 @@ If you want to update a third-party dependency, please open an issue first inste
 
 ## Pull Requests
 
+When contributing from a fork, use a fork under your personal GitHub account and enable **Allow edits from maintainers**. This lets maintainers make follow-up fixes directly on the PR branch.
+
+PRs from organization-owned forks are automatically closed when opened or reopened because GitHub does not support this maintainer-edit option for those forks. Submit the changes from a personal fork instead. See [GitHub's documentation](https://docs.github.com/en/pull-requests/how-tos/work-with-forks/allowing-changes-to-a-pull-request-branch-created-from-a-fork).
+
 Keep each PR focused on one clear change. Large or overly complex PRs are harder to review and may not be merged.
 
 Do not include test code or test scripts in commits or PRs. Keep them local and report verification results in the PR description.
@@ -24,6 +28,21 @@ PRs should include:
 - Verification evidence when applicable (commands and key outputs).
 - Linked issue/PR context when applicable.
 - Screenshots or sample outputs for UI/visual behavior changes.
+
+## README UI Listings
+
+The [UIs list in the README](README.md#uis) only includes open-source projects that use `stable-diffusion.cpp` as a backend. Do not submit PRs to add closed-source UIs.
+
+## Server Recipes
+
+Before adding or changing a built-in server recipe, read and follow the
+[built-in recipe policy](examples/server/recipes/README.md). The policy governs
+native editing, community editing LoRAs, distinct task checkpoints, external
+adapters, native components and layer-count variants. Do not add recipes solely
+for style or acceleration LoRAs, separately stored native components, or added
+or removed model layers. Explain the task, component compatibility or capability
+difference that justifies a new recipe, and verify its required components,
+feature declarations and embedded API representation.
 
 ## Code Style
 

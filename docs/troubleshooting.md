@@ -1,5 +1,14 @@
 # Troubleshooting
 
+## Video model used in image generation mode
+
+If generation reports that a model cannot be run with `generate_image()`, add
+`--mode vid_gen` to the CLI command. `--video-frames` alone does not select video
+mode. Video models require this mode even when generating a single frame.
+Library callers must use `generate_video()` for these models; use
+`sd_ctx_supports_image_generation()` and `sd_ctx_supports_video_generation()` to
+check the available generation modes.
+
 ## Completely black or white images or videos / NaNs
 
 Some ggml backends can encounter numerical overflow during inference, producing
@@ -31,8 +40,7 @@ the intended output scale:
 - `--linear-scale` scales Linear inputs before matrix multiplication and rescales
   the result.
 - `--attn-scale` scales attention keys and values (K/V). It takes effect only in
-  the Flash Attention path, where `--fa` or `--diffusion-fa` is enabled and the
-  backend supports it.
+  the Flash Attention path, when selected and supported by the backend.
 
 The two values can be set independently and apply across model components. The
 default `0` preserves each model's built-in settings; `1` explicitly disables the

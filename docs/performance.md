@@ -5,10 +5,15 @@ eg.:
  - flux 768x768 ~600mb
  - SD2 768x768 ~1400mb
 
-For most backends, it slows things down, but for cuda it generally speeds it up too.
-At the moment, it is only supported for some models and some backends (like cpu, cuda/rocm, metal).
+`--flash-attn on|off|auto` controls flash attention. Its effect on speed depends
+on GPU architecture, backend, driver, model, and tensor shapes. Automatic
+selection uses backend rules and, for some paths, small probes; it does not
+guarantee the fastest end-to-end generation. Compare `on` and `off` with the
+same model and generation settings over repeated runs, separating startup/probe
+time from steady-state generation time. See [backend selection](backend.md)
+for automatic selection rules and per-module overrides.
 
-Run by adding `--diffusion-fa` to the arguments and watch for:
+Watch for:
 ```
 [INFO ] stable-diffusion.cpp:312  - Using flash attention in the diffusion model
 ```
@@ -20,6 +25,87 @@ This reports the actual peak compute workspace capacity per backend, including
 CPU fallback. It excludes weights and cache buffers. Within a runner lifecycle,
 the summary is printed only on the first graph or when backend capacities or the
 segment count change.
+
+## Tune direct convolution.
+
+`--conv-direct on|off|auto` selects direct convolution or the im2col-based
+path. Performance depends on GPU architecture, backend, driver, model, and
+tensor shapes, so enabling direct convolution can either improve or reduce speed.
+
+Automatic selection uses small benchmarks on Vulkan and implicit GEMM checks
+on other backends. It does not guarantee the fastest end-to-end generation.
+Compare `on` and `off` with the same model and generation settings over
+repeated runs, keeping flash attention unchanged and separating startup/probe
+time from steady-state generation time. See [backend selection](backend.md)
+for automatic selection rules and per-module overrides.
+
+## Run conditional and unconditional CFG in one batched UNet forward.
+
+For UNet models, the conditional and unconditional guidance branches are
+concatenated into a single batch of two and run through one UNet forward per
+step instead of two separate forwards. This is enabled by default whenever the
+run qualifies for it.
+
+Use `--batched-cfg off` to force separate conditional and unconditional
+forwards.
+
+## Use VAE tiling to reduce encode and decode memory usage.
+
+`--vae-tiling` enables spatial tiling for both VAE encoding and decoding. The
+default tile size is 256x256 **image pixels**, independent of the VAE scale factor:
+
+```shell
+--vae-tiling --vae-tile-size 256x256 --vae-tile-overlap 0.5
+```
+
+`--vae-tile-size` accepts one size or `WIDTHxHEIGHT`. A zero dimension uses the
+256-pixel default. Sizes are rounded down to a multiple of the VAE scale factor
+and capped at the current input dimensions. Explicit sizes below four latent
+pixels per axis (or the full axis when it is smaller) are rejected. Encoding and
+decoding use the same spatial sizes, without an additional encoding multiplier.
+Inputs that fit within a tile are processed as one tile.
+
+For a 512x512 image with the default 50% overlap, both encoding and decoding use
+3x3 tiles. A 256-pixel tile corresponds to 32 latent pixels for an 8x VAE, 16 for
+a 16x VAE, and 8 for a 32x VAE. Smaller tiles reduce each graph's memory demand,
+but overlapping work can increase processing time and tiling can affect image
+quality, especially during encoding. Use larger tiles when more context is needed.
+
+`--vae-relative-tile-size` overrides the absolute size on each axis with a positive
+value. Values up to and including 1 specify a fraction of the current input size;
+values greater than 1 specify a target number of tiles per axis, accounting for
+overlap. For example, `0.5x0.5` uses half the width and height in both encode and
+decode. The target overlap is clamped to 0 through 0.5 and the actual overlap is
+adjusted to fit the image. On an axis that does not wrap, a tile size that would leave
+neighboring tiles overlapping by less than half the target (or by fewer than 2 latent
+pixels) is replaced. The replacement is the size that decodes the fewest latent pixels
+along the axis (tiles times size) among sizes whose overlaps reach the full target overlap,
+capped at 8 latent pixels, preferring sizes within 25% above the request. It never uses
+more tiles than the nearest size that overlaps by half the target (smaller first, larger
+only up to twice the request), and falls back to that size when nothing better qualifies.
+Without it, a tile a little over half of the axis gives two tiles that barely overlap and
+the tile edge shows as a line. Size and overlap options
+require `--vae-tiling`.
+
+**Migration:** `--vae-tile-size` and the C/JSON fields `tile_size_w` and
+`tile_size_h` now use image pixels instead of latent units. The C/JSON fields
+`tile_size_x/y` have been renamed to `tile_size_w/h`, and `rel_size_x/y` to
+`rel_size_w/h`. The command-line option names are unchanged. For example, an old
+decode tile size of 32 corresponds to 256 pixels for an 8x VAE or 512 pixels for a
+16x VAE. Encoding no longer enlarges explicit or relative tile sizes.
+
+The main VAE decode and encode paths retry allocation failures with smaller tiles,
+even without `--vae-tiling`. Supported video VAEs first try temporal tiling; spatial
+retries use at most 256-pixel tiles initially and then halve the effective tile
+dimensions down to the minimum size. Each spatial retry must reduce the effective
+tile size. These runtime adjustments do not change the caller's parameters.
+Execution failures are not retried. Encoding retries the same way, without the
+temporal step.
+
+`--temporal-tiling` remains independent of spatial tiling. MiniMax H3 always uses
+spatial tiling (256x256 pixels and 25% overlap by default) and its own temporal
+windows. With `--vae-tiling`, its overlap follows `--vae-tile-overlap`; explicit
+spatial sizes are honored.
 
 ## Offload weights to the CPU to save VRAM without reducing generation speed.
 
@@ -63,6 +149,12 @@ See [backend selection](./backend.md) for full syntax.
 
 When a graph has cut markers and its missing weights plus incremental compute workspace exceed the available device headroom, it runs its fixed segment list in order. A reusable monolithic compute buffer is not counted as a new allocation. An explicit `--max-vram` budget deducts already-resident managed weights and compute/cache buffers registered by every runner sharing the device, so later graph runs remain segmented when the full graph exceeds the budget. The current segment's weights are pinned during compute, and the next parameter-bearing segment is prefetched when the device supports asynchronous transfer. No opt-in streaming flag is required.
 
+When choosing between monolithic and segmented execution, the runner requires
+an additional 128 MiB of headroom in both available device memory and any explicit
+managed budget. This planning headroom absorbs small allocation estimate changes;
+subsequent capacity checks can consume it while still preserving the 512 MiB device
+scratch reserve and respecting the managed budget.
+
 - `--max-vram <GiB>` optionally lowers the live-memory limit. A positive value is a managed per-device budget, `0` uses the device's current free memory without an explicit budget, and a negative value snapshots free memory at startup while reserving that many GiB (`--max-vram -1` reserves about 1 GiB). Driver contexts and unrelated external allocations remain outside the managed budget.
 - `--disable-prefetch` disables asynchronous next-segment prefetch while retaining synchronous loading, eviction, and segmented execution.
 - `--disable-segmented-compute` forces monolithic graph execution for diagnostics or compatibility, even when the automatic memory check would select segments.
@@ -92,3 +184,17 @@ Use `--params-backend diffusion=disk` instead when reducing system RAM residency
 ## Use quantization to reduce memory usage.
 
 [quantization](./quantization_and_gguf.md)
+
+## Fused DiT and VAE kernels (CUDA)
+
+With the fork's ggml patches (`scripts/unsloth/ggml-patches/0007-ggml-cuda-generic-dit-vae.patch`) these run by
+default on CUDA. Each gives the same output bit for bit as the ops it replaces, and each has a switch (`=0` turns it off):
+
+| what | families | switch |
+|---|---|---|
+| Shared DiT attention (`Rope::attention`, flash attention on): RoPE, head-major relayout, kv scale and F16 cast of q / k / v in one op per tensor | FLUX.1, FLUX.2, Chroma, Z-Image, Qwen-Image, Wan, and the other DiTs using `Rope::attention` | `SD_FUSED_ROPE_ATTN` |
+| GroupNorm spread over the whole GPU, fused with the per-channel affine and the SiLU after it | SD 1.x / SDXL U-Net, every KL VAE decode (SD, SDXL, FLUX, Z-Image, Chroma) | `GGML_CUDA_GROUP_NORM_PAR` |
+| Channel RMS norm of the Wan-style VAE computed in place, without the two relayout copies around it (large layers only, so mostly untiled decodes; `=2` forces it at every size) | Qwen-Image, Qwen-Image-2.1, Wan VAE | `GGML_CUDA_NORM_CHANNEL` |
+| `x*s + y (+ z)` elementwise chains (adaLN modulate, gated residual) in one pass | most DiTs | `GGML_CUDA_FUSE_MUL_ADD` |
+
+Convolutions on a batch of one (and the Wan VAE's single-frame 2D convolutions) also skip relayout copies that move no data.
