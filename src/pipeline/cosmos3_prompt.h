@@ -38,14 +38,29 @@ namespace sd::cosmos3 {
                 i += len;
                 char buf[16];
                 switch (cp) {
-                    case '"': out += "\\\""; continue;
-                    case '\\': out += "\\\\"; continue;
-                    case '\n': out += "\\n"; continue;
-                    case '\r': out += "\\r"; continue;
-                    case '\t': out += "\\t"; continue;
-                    case '\b': out += "\\b"; continue;
-                    case '\f': out += "\\f"; continue;
-                    default: break;
+                    case '"':
+                        out += "\\\"";
+                        continue;
+                    case '\\':
+                        out += "\\\\";
+                        continue;
+                    case '\n':
+                        out += "\\n";
+                        continue;
+                    case '\r':
+                        out += "\\r";
+                        continue;
+                    case '\t':
+                        out += "\\t";
+                        continue;
+                    case '\b':
+                        out += "\\b";
+                        continue;
+                    case '\f':
+                        out += "\\f";
+                        continue;
+                    default:
+                        break;
                 }
                 if (cp >= 0x20 && cp < 0x7F) {
                     out += static_cast<char>(cp);

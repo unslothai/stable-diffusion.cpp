@@ -128,7 +128,7 @@ namespace sd::pipeline {
                 edge_params.thin             = edge_threshold > 0.f;
                 edge_params.binary_threshold = edge_threshold;
                 const int64_t edge_start     = ggml_time_ms();
-                const size_t plane = static_cast<size_t>(width) * height;
+                const size_t plane           = static_cast<size_t>(width) * height;
                 std::vector<uint8_t> pixels;
                 for (int i = 0; i < frames; ++i) {
                     const sd_image_t& frame = source.frames[i];
@@ -176,15 +176,15 @@ namespace sd::pipeline {
             LOG_ERROR("cosmos3: invalid KV window (window %" PRId64 ", sink %" PRId64 ")", history.window_frames, history.sink_frames);
             return false;
         }
-        const char* dbg   = debug_dir();
+        const char* dbg = debug_dir();
         if (const char* stop = std::getenv("SD_COSMOS3_DEBUG_STOP_LAYER"); dbg != nullptr && stop != nullptr) {
             runner->debug_stop_layer = std::strtoll(stop, nullptr, 10);
         }
-        const int width   = request.width;
-        const int height  = request.height;
-        const int frames  = request.frames;
-        const int fps     = request.fps > 0 ? request.fps : 30;
-        const int64_t t0  = ggml_time_ms();
+        const int width  = request.width;
+        const int height = request.height;
+        const int frames = request.frames;
+        const int fps    = request.fps > 0 ? request.fps : 30;
+        const int64_t t0 = ggml_time_ms();
 
         sd::Tensor<float> control = build_control_video(params, width, height, frames, runner->edge_threshold);
         if (control.empty()) {
@@ -254,25 +254,25 @@ namespace sd::pipeline {
         std::copy(text_ids.begin(), text_ids.end(), text_tensor.data());
 
         sd::cosmos3::Grid grid;
-        grid.latent_w = control_latents.shape()[0];
-        grid.latent_h = control_latents.shape()[1];
-        grid.channels = channels;
-        grid.patch    = runner->config.patch_size;
-        const int64_t n_latent = control_latents.shape()[2];
-        const int64_t tokens   = grid.tokens();
+        grid.latent_w            = control_latents.shape()[0];
+        grid.latent_h            = control_latents.shape()[1];
+        grid.channels            = channels;
+        grid.patch               = runner->config.patch_size;
+        const int64_t n_latent   = control_latents.shape()[2];
+        const int64_t tokens     = grid.tokens();
         const size_t frame_numel = static_cast<size_t>(grid.channels * grid.latent_h * grid.latent_w);
 
         Cosmos3::HistoryUpdate after_control;
-        after_control.write              = true;
-        after_control.sink_tokens        = history.sink_entries() * tokens;
-        after_control.keep_recent_tokens = history.keep_after_control() < 0 ? -1 : history.keep_after_control() * tokens;
+        after_control.write                  = true;
+        after_control.sink_tokens            = history.sink_entries() * tokens;
+        after_control.keep_recent_tokens     = history.keep_after_control() < 0 ? -1 : history.keep_after_control() * tokens;
         Cosmos3::HistoryUpdate after_refresh = after_control;
         after_refresh.keep_recent_tokens     = history.keep_after_refresh() < 0 ? -1 : history.keep_after_refresh() * tokens;
 
         const std::vector<float> sigmas = sd::cosmos3::distilled_sigmas();
         const sd::Tensor<int32_t> no_text;
         const std::vector<float> text_positions = sd::cosmos3::text_positions(text_len);
-        sd::Tensor<float> output = sd::zeros<float>({grid.latent_w, grid.latent_h, n_latent, grid.channels, 1});
+        sd::Tensor<float> output                = sd::zeros<float>({grid.latent_w, grid.latent_h, n_latent, grid.channels, 1});
 
         runner->reset_stream();
         int64_t denoise_ms = 0;
@@ -390,7 +390,7 @@ namespace sd::pipeline {
                 for (int64_t y = 0; y < H; ++y) {
                     for (int64_t x = 0; x < W; ++x) {
                         for (int64_t c = 0; c < 3; ++c) {
-                            const float v = std::min(std::max(video.index(x, y, t, c, 0), 0.f), 1.f);
+                            const float v                                             = std::min(std::max(video.index(x, y, t, c, 0), 0.f), 1.f);
                             bytes[static_cast<size_t>(((t * H + y) * W + x) * 3 + c)] = static_cast<uint8_t>(v * 255.f);
                         }
                     }
@@ -402,7 +402,7 @@ namespace sd::pipeline {
                 std::fclose(f);
             }
         }
-        const int count = static_cast<int>(video.shape()[2]);
+        const int count    = static_cast<int>(video.shape()[2]);
         sd_image_t* images = static_cast<sd_image_t*>(calloc(static_cast<size_t>(count), sizeof(sd_image_t)));
         if (images == nullptr) {
             return false;

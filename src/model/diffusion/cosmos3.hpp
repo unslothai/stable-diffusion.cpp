@@ -108,8 +108,8 @@ namespace Cosmos3 {
 
         explicit Attention(const Cosmos3Config& config)
             : config(config) {
-            const int64_t q_dim  = config.num_heads * config.head_dim;
-            const int64_t kv_dim = config.num_kv_heads * config.head_dim;
+            const int64_t q_dim    = config.num_heads * config.head_dim;
+            const int64_t kv_dim   = config.num_kv_heads * config.head_dim;
             blocks["to_q"]         = std::make_shared<Linear>(config.hidden_size, q_dim, false);
             blocks["to_k"]         = std::make_shared<Linear>(config.hidden_size, kv_dim, false);
             blocks["to_v"]         = std::make_shared<Linear>(config.hidden_size, kv_dim, false);
@@ -296,13 +296,13 @@ namespace Cosmos3 {
                 float parsed_float = 0.f;
                 bool ok            = true;
                 if (key == "cosmos3_window") {
-                    ok = parse_strict_int(value, parsed_int) && parsed_int >= 0;
+                    ok            = parse_strict_int(value, parsed_int) && parsed_int >= 0;
                     window_frames = ok ? parsed_int : window_frames;
                 } else if (key == "cosmos3_sink") {
-                    ok = parse_strict_int(value, parsed_int) && parsed_int >= 0;
+                    ok          = parse_strict_int(value, parsed_int) && parsed_int >= 0;
                     sink_frames = ok ? parsed_int : sink_frames;
                 } else if (key == "cosmos3_edge_threshold") {
-                    ok = parse_strict_float(value, parsed_float) && parsed_float < 1.f;
+                    ok             = parse_strict_float(value, parsed_float) && parsed_float < 1.f;
                     edge_threshold = ok ? parsed_float : edge_threshold;
                 }
                 if (!ok) {
@@ -345,8 +345,8 @@ namespace Cosmos3 {
                     ids[i][axis] = positions[static_cast<size_t>(axis * length + i)];
                 }
             }
-            storage   = Rope::embed_interleaved_mrope(ids, 1, config.rope_theta, static_cast<int>(config.head_dim), config.mrope_section);
-            auto pe   = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.head_dim / 2, length);
+            storage = Rope::embed_interleaved_mrope(ids, 1, config.rope_theta, static_cast<int>(config.head_dim), config.mrope_section);
+            auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.head_dim / 2, length);
             ggml_set_name(pe, name);
             set_backend_tensor_data(pe, storage.data());
             return pe;
@@ -406,10 +406,10 @@ namespace Cosmos3 {
             ggml_tensor* und_pe  = nullptr;
             ggml_tensor* mask    = nullptr;
             if (with_text) {
-                auto ids = make_input(text_ids);
-                und      = model.get<Embedding>("embed_tokens")->forward(ctx, ids);
-                und      = ggml_reshape_2d(gctx, und, und->ne[0], und->ne[1] * und->ne[2]);
-                und_pe   = make_pe(text_positions, und_pe_vec, "cosmos3.und_pe");
+                auto ids        = make_input(text_ids);
+                und             = model.get<Embedding>("embed_tokens")->forward(ctx, ids);
+                und             = ggml_reshape_2d(gctx, und, und->ne[0], und->ne[1] * und->ne[2]);
+                und_pe          = make_pe(text_positions, und_pe_vec, "cosmos3.und_pe");
                 const int64_t n = und->ne[1];
                 causal_mask_vec.assign(static_cast<size_t>(n * n), 0.f);
                 for (int64_t q = 0; q < n; ++q) {

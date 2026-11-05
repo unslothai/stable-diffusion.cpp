@@ -79,7 +79,7 @@ namespace sd::edge {
                 if (params.thin) {
                     // 0: horizontal gradient, 1: 45 deg, 2: vertical, 3: 135 deg (tan 22.5 = 0.4142).
                     const float ax = std::fabs(gx), ay = std::fabs(gy);
-                    uint8_t d      = 0;
+                    uint8_t d = 0;
                     if (ay > 2.4142f * ax) {
                         d = 2;
                     } else if (ay > 0.4142f * ax) {

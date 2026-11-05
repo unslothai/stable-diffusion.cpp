@@ -105,10 +105,10 @@ namespace sd::cosmos3 {
         std::vector<float> ids(static_cast<size_t>(3 * n));
         for (int64_t hp = 0; hp < g.patch_h(); ++hp) {
             for (int64_t wp = 0; wp < g.patch_w(); ++wp) {
-                const int64_t i                         = hp * g.patch_w() + wp;
-                ids[static_cast<size_t>(i)]             = t;
-                ids[static_cast<size_t>(n + i)]         = static_cast<float>(hp);
-                ids[static_cast<size_t>(2 * n + i)]     = static_cast<float>(wp);
+                const int64_t i                     = hp * g.patch_w() + wp;
+                ids[static_cast<size_t>(i)]         = t;
+                ids[static_cast<size_t>(n + i)]     = static_cast<float>(hp);
+                ids[static_cast<size_t>(2 * n + i)] = static_cast<float>(wp);
             }
         }
         return ids;
