@@ -329,7 +329,8 @@ if (NOT SD_USE_SYSTEM_GGML)
 endif()
 
 # x86 CPU: build llamafile's tinyBLAS GEMM (as llama.cpp does). ggml-patches/0017 limits it to Q8_0 (same bits as
-# the default vec_dot path), F16 and BF16 weights; GGML_CPU_SGEMM_TYPES overrides the set.
+# the default vec_dot path) and, in AVX512 builds and on Intel AVX2 hosts, F16 and BF16 weights (AMD AVX2 and MSVC
+# builds measured slower there); GGML_CPU_SGEMM_TYPES overrides the set.
 if (NOT DEFINED GGML_LLAMAFILE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
     set(GGML_LLAMAFILE_DEFAULT ON)
 endif()
