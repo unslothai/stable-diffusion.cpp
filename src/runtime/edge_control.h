@@ -89,23 +89,7 @@ namespace sd::edge {
                 }
             }
         }
-        if (params.thin) {
-            static const int kOffsets[4][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}};
-            std::vector<float> thinned(n, 0.f);
-            for (int y = 0; y < height; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    const size_t i = static_cast<size_t>(y) * width + x;
-                    const int* o   = kOffsets[dir[i]];
-                    const float a  = tmp[static_cast<size_t>(clamp_y(y + o[1])) * width + clamp_x(x + o[0])];
-                    const float b  = tmp[static_cast<size_t>(clamp_y(y - o[1])) * width + clamp_x(x - o[0])];
-                    if (tmp[i] >= a && tmp[i] > b) {
-                        thinned[i] = tmp[i];
-                    }
-                }
-            }
-            tmp.swap(thinned);
-        }
-
+        // Scale from the full magnitude map: after thinning most pixels are zero.
         float scale_ref = max_mag;
         if (params.clip_percentile > 0.f && params.clip_percentile < 100.f && max_mag > 0.f) {
             constexpr int kBins = 2048;
@@ -124,6 +108,23 @@ namespace sd::edge {
                 }
             }
         }
+        if (params.thin) {
+            static const int kOffsets[4][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}};
+            std::vector<float> thinned(n, 0.f);
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    const size_t i = static_cast<size_t>(y) * width + x;
+                    const int* o   = kOffsets[dir[i]];
+                    const float a  = tmp[static_cast<size_t>(clamp_y(y + o[1])) * width + clamp_x(x + o[0])];
+                    const float b  = tmp[static_cast<size_t>(clamp_y(y - o[1])) * width + clamp_x(x - o[0])];
+                    if (tmp[i] >= a && tmp[i] > b) {
+                        thinned[i] = tmp[i];
+                    }
+                }
+            }
+            tmp.swap(thinned);
+        }
+
         const float inv = scale_ref > 0.f ? 1.f / scale_ref : 0.f;
         for (size_t i = 0; i < n; ++i) {
             float v = std::min(tmp[i] * inv, 1.f);

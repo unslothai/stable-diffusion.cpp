@@ -410,10 +410,17 @@ namespace sd::pipeline {
         for (int i = 0; i < count; ++i) {
             images[i] = tensor_to_sd_image(video, i);
         }
-        *frames_out = images;
         if (num_frames_out != nullptr) {
             *num_frames_out = count;
         }
+        if (frames_out == nullptr) {
+            for (int i = 0; i < count; ++i) {
+                free(images[i].data);
+            }
+            free(images);
+            return true;
+        }
+        *frames_out = images;
         return true;
     }
 

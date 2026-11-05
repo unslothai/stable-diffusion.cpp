@@ -81,6 +81,36 @@ int main() {
         CHECK(row[31] == 255 || row[32] == 255);
     }
 
+    // Thinned edges under 1% of the image: the threshold must still drop the weak edge.
+    {
+        const int sw = 200, sh = 200;
+        std::vector<uint8_t> sparse(static_cast<size_t>(sw) * sh * 3);
+        for (int y = 0; y < sh; ++y) {
+            for (int x = 0; x < sw; ++x) {
+                const uint8_t v = x >= 100 ? 255 : (y >= 150 ? 20 : 0);
+                for (int c = 0; c < 3; ++c) {
+                    sparse[(static_cast<size_t>(y) * sw + x) * 3 + c] = v;
+                }
+            }
+        }
+        std::vector<uint8_t> edges(static_cast<size_t>(sw) * sh);
+        sd::edge::GradientEdgeParams lines;
+        lines.thin             = true;
+        lines.binary_threshold = 0.2f;
+        sd::edge::gradient_magnitude(sparse.data(), sw, sh, 3, edges.data(), lines);
+        int weak = 0, strong = 0;
+        for (int y = 145; y < 155; ++y) {
+            for (int x = 10; x < 80; ++x) {
+                weak += edges[static_cast<size_t>(y) * sw + x] != 0;
+            }
+        }
+        for (int y = 0; y < sh; ++y) {
+            strong += edges[static_cast<size_t>(y) * sw + 99] == 255 || edges[static_cast<size_t>(y) * sw + 100] == 255;
+        }
+        CHECK(weak == 0);
+        CHECK(strong == sh);
+    }
+
     // Timing on a busy image (deterministic noise plus gradients).
     const int sizes[2][2] = {{832, 480}, {1280, 720}};
     for (const auto& size : sizes) {
