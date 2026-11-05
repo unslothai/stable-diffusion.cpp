@@ -169,6 +169,9 @@ namespace sd::pipeline {
             return false;
         }
         const char* dbg   = debug_dir();
+        if (const char* stop = std::getenv("SD_COSMOS3_DEBUG_STOP_LAYER"); dbg != nullptr && stop != nullptr) {
+            runner->debug_stop_layer = std::strtoll(stop, nullptr, 10);
+        }
         const int width   = request.width;
         const int height  = request.height;
         const int frames  = request.frames;
@@ -273,6 +276,13 @@ namespace sd::pipeline {
                 auto pred = runner->forward(sd->n_threads, patches, positions, sigmas[step], no_text, text_positions, {});
                 if (pred.empty()) {
                     LOG_ERROR("cosmos3: denoise failed at frame %" PRId64 " step %zu", t, step);
+                    runner->reset_stream();
+                    return false;
+                }
+                if (runner->debug_stop_layer >= 0) {
+                    write_raw(debug_path(dbg, "port_hidden_l" + std::to_string(runner->debug_stop_layer) + ".bin"),
+                              pred.data(), static_cast<size_t>(pred.numel()));
+                    runner->debug_stop_layer = -1;
                     runner->reset_stream();
                     return false;
                 }

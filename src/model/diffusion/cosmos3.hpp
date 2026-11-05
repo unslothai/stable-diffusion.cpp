@@ -269,6 +269,10 @@ namespace Cosmos3 {
         int64_t window_frames = 0;
         int64_t sink_frames   = 1;
 
+        // Numerical-comparison hook: return the generation hidden states after this
+        // layer (num_layers = after the final norm) instead of the velocity.
+        int64_t debug_stop_layer = -1;
+
         std::vector<float> und_pe_vec;
         std::vector<float> gen_pe_vec;
         std::vector<float> causal_mask_vec;
@@ -444,9 +448,17 @@ namespace Cosmos3 {
                     ctx->persist_cache_tensor(cache_name("hist", i, "v"), trim_history(gctx, past_v, update));
                 }
                 gen = layer->ffn(ctx, ggml_add(gctx, gen, gen_out), true);
+                if (i == debug_stop_layer) {
+                    ggml_build_forward_expand(graph, gen);
+                    return graph;
+                }
             }
 
             gen = model.get<LLM::LLMRMSNorm>("norm_moe_gen")->forward(ctx, gen);
+            if (debug_stop_layer == config.num_layers) {
+                ggml_build_forward_expand(graph, gen);
+                return graph;
+            }
             gen = model.get<Linear>("proj_out")->forward(ctx, gen);
             ggml_build_forward_expand(graph, gen);
             return graph;
