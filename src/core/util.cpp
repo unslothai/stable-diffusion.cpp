@@ -29,6 +29,11 @@
 #include <unistd.h>
 #endif
 
+#ifdef __linux__
+#include <errno.h>
+#include <sched.h>
+#endif
+
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "stable-diffusion.h"
@@ -340,20 +345,47 @@ bool MmapWrapper::copy_data(void* buf, size_t n, size_t offset) const {
 // LICENSE: https://github.com/ggerganov/llama.cpp/blob/master/LICENSE
 int32_t sd_get_num_physical_cores() {
 #ifdef __linux__
-    // enumerate the set of thread siblings, num entries is num cores
-    std::unordered_set<std::string> siblings;
-    for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
-        if (!thread_siblings.is_open()) {
-            break;  // no more cpus
+    // One thread per physical core this process may run on: the distinct thread-sibling sets among the CPUs in
+    // the affinity mask (a taskset / container cpuset leaves fewer CPUs than the machine has). Upstream's loop
+    // counts every CPU of the machine, so a 4-CPU cpuset on a 192-CPU host still gets 96 threads.
+    // The mask is sized dynamically: a kernel built for more than CPU_SETSIZE (1024) CPUs rejects a smaller one
+    // with EINVAL, so grow it until the call succeeds.
+    for (int ncpus = CPU_SETSIZE; ncpus <= (1 << 20); ncpus *= 2) {
+        cpu_set_t* mask   = CPU_ALLOC(ncpus);
+        const size_t size = CPU_ALLOC_SIZE(ncpus);
+        if (mask == nullptr) {
+            break;
         }
-        std::string line;
-        if (std::getline(thread_siblings, line)) {
-            siblings.insert(line);
+        CPU_ZERO_S(size, mask);
+        if (sched_getaffinity(0, size, mask) != 0) {
+            CPU_FREE(mask);
+            if (errno == EINVAL) {
+                continue;
+            }
+            break;
         }
-    }
-    if (siblings.size() > 0) {
-        return static_cast<int32_t>(siblings.size());
+        std::unordered_set<std::string> siblings;
+        int allowed = 0;
+        for (int cpu = 0; cpu < ncpus; ++cpu) {
+            if (!CPU_ISSET_S(cpu, size, mask)) {
+                continue;
+            }
+            allowed++;
+            std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
+            std::string line;
+            if (thread_siblings.is_open() && std::getline(thread_siblings, line) && !line.empty()) {
+                siblings.insert(line);
+            }
+        }
+        CPU_FREE(mask);
+        if (!siblings.empty()) {
+            return static_cast<int32_t>(siblings.size());
+        }
+        if (allowed > 0) {
+            // No topology in sysfs (some containers): assume 2-way SMT above 4 CPUs, as below.
+            return allowed <= 4 ? allowed : allowed / 2;
+        }
+        break;
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     int32_t num_physical_cores;
@@ -568,34 +600,31 @@ bool parse_strict_bool(const std::string& text, bool& value) {
 }
 
 static std::string build_progress_bar(int step, int steps, char progress_char = '=', bool show_head = true) {
-    std::string progress = "  |";
-    int max_progress     = 50;
-    int32_t current      = 0;
+    std::string progress       = "  |";
+    constexpr int max_progress = 50;
+    int32_t current            = 0;
     if (steps > 0) {
-        current = (int32_t)(step * 1.f * max_progress / steps);
+        current = (int32_t)(std::clamp(step, 0, steps) * 1.f * max_progress / steps);
     }
-    for (int i = 0; i < 50; i++) {
-        if (i > current) {
-            progress += " ";
-        } else if (show_head && i == current && i != max_progress - 1) {
-            progress += ">";
-        } else {
-            progress += progress_char;
-        }
-    }
-    progress += "|";
+    int head_length = (current == max_progress) ? 0 : 1;
+    progress += std::string(current, progress_char) + std::string(head_length, show_head ? '>' : progress_char) + std::string(max_progress - current - head_length, ' ') + "|";
     return progress;
 }
 
-static void print_progress_line(int step, int steps, const std::string& speed_text, char progress_char = '=', bool show_head = true) {
+static void print_progress_line(int step, int steps, const std::string& speed_text, char progress_char = '=', bool show_head = true, const std::string& eta_text = "") {
     if (step == 0) {
         return;
     }
     std::string progress = build_progress_bar(step, steps, progress_char, show_head);
+    int step_width       = static_cast<int>(std::to_string(steps).size());
     const char* lf       = (step == steps ? "\n" : "");
-    printf("\r%s %i/%i - %s\033[K%s", progress.c_str(), step, steps, speed_text.c_str(), lf);
+    printf("\r%s %*i/%i - %10s%s%s\033[K%s", progress.c_str(), step_width, step, steps, speed_text.c_str(),
+           eta_text.empty() ? "" : " - ETA ", eta_text.c_str(), lf);
     fflush(stdout);  // for linux
 }
+
+static int show_eta      = -1;  // -1 - estimate duration, 0 - hide, 1 - show
+static float passed_time = 0.f;
 
 void pretty_progress(int step, int steps, float time) {
     if (sd_progress_cb) {
@@ -603,7 +632,19 @@ void pretty_progress(int step, int steps, float time) {
         return;
     }
     if (step == 0) {
+        show_eta    = -1;  // reinitialize for batch generations
+        passed_time = 0.f;
         return;
+    }
+    std::string remainder_text = "";
+    if (show_eta && step < steps) {                                     // if timer is not disabled and bar is not filled,
+        if (show_eta == -1 && step)                                     // estimate the total time once, then
+            show_eta = (std::abs(time * steps / step) < 15.f) ? 0 : 1;  // hide the timer if total is less than 15 seconds
+        if (show_eta) {
+            unsigned remainder = (passed_time += time) / step * (steps - step);  // average speed; time*(steps-step) for current
+            remainder_text     = remainder < 3600 ? sd_format("%02u:%02u", remainder / 60, remainder % 60)
+                                                  : sd_format("%u:%02u:%02u", remainder / 3600, (remainder / 60) % 60, remainder % 60);
+        }
     }
     const char* unit = "s/it";
     float speed      = time;
@@ -611,7 +652,7 @@ void pretty_progress(int step, int steps, float time) {
         speed = 1.0f / speed;
         unit  = "it/s";
     }
-    print_progress_line(step, steps, sd_format("%.2f%s", speed, unit));
+    print_progress_line(step, steps, sd_format("%.2f%s", speed, unit), '=', true, remainder_text);
 }
 
 void pretty_bytes_progress(int step, int steps, uint64_t bytes_processed, float elapsed_seconds) {

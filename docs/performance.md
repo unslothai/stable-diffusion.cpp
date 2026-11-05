@@ -32,8 +32,10 @@ segment count change.
 path. Performance depends on GPU architecture, backend, driver, model, and
 tensor shapes, so enabling direct convolution can either improve or reduce speed.
 
-Automatic selection uses small benchmarks on Vulkan and implicit GEMM checks
-on other backends. It does not guarantee the fastest end-to-end generation.
+Automatic selection uses small benchmarks on Vulkan, implicit GEMM checks on
+CUDA/HIP/MUSA, and the direct kernels on CPU when ggml carries the row-run
+patch (see [backend selection](backend.md)). It does not guarantee the fastest
+end-to-end generation.
 Compare `on` and `off` with the same model and generation settings over
 repeated runs, keeping flash attention unchanged and separating startup/probe
 time from steady-state generation time. See [backend selection](backend.md)

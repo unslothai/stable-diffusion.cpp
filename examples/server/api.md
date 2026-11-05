@@ -280,7 +280,8 @@ TAE slot.
 | `model` | `checkpoints` |
 | `diffusion_model`, `high_noise_diffusion_model`, `uncond_diffusion_model` | `diffusion_models` |
 | `clip_l`, `clip_g`, `t5xxl`, `llm`, `audio_encoder`, `embeddings_connectors` | `text_encoders` |
-| `clip_vision`, `llm_vision` | `clip_vision` |
+| `clip_vision` | `clip_vision` |
+| `llm_vision` | `text_encoders` or `clip_vision` |
 | `vae`, `audio_vae` | `vae` |
 | `tae` (legacy alias: `taesd`) | `vae` or `vae_approx` |
 | `tokenizer` | `tokenizers` |
@@ -302,11 +303,15 @@ new model architectures.
 
 Optional `context` settings apply to each model load and override the matching
 startup setting. Supported fields are `vae_format` (`auto`, `flux`, `sd3`,
-`flux2`, or `wan`) and `model_args` (a string in the same format as
-`--model-args`; replaces the startup string). Other startup settings remain
-unchanged. Switching to a recipe that omits these fields restores the startup
-values. For example, PiD uses `{"vae_format": "flux"}` and Qwen Image Edit
-2511 uses `{"model_args": "qwen_image_zero_cond_t=true"}`.
+`flux2`, or `wan`), `model_args` (a string in the same format as
+`--model-args`; replaces the startup string), and `backend` / `params_backend`
+(strings in the same format as `--backend` / `--params-backend`; replace the
+startup assignments for that load, so a recipe can place components on
+specific devices, e.g. keep a large text encoder on CPU while another recipe
+uses the GPU). Other startup settings remain unchanged. Switching to a
+recipe that omits these fields restores the startup values. For example, PiD
+uses `{"vae_format": "flux"}` and Qwen Image Edit 2511 uses
+`{"model_args": "qwen_image_zero_cond_t=true"}`.
 
 Supported defaults:
 
@@ -1032,7 +1037,11 @@ Notes:
 
 #### `POST /sdcpp/v1/jobs/{id}/cancel`
 
-Attempts to cancel an accepted job.
+Cancels a queued job immediately, or requests interruption of a generating image or
+video job. A generating job returns `200 OK` with `cancel_requested: true` and
+remains `generating` until execution stops at a cancellation checkpoint. Continue
+polling until its status becomes `cancelled`. Cancelled jobs have no result.
+Repeated cancellation requests are safe; terminal jobs are returned unchanged.
 
 Typical status codes:
 

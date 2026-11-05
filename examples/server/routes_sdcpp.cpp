@@ -206,7 +206,7 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -221,7 +221,7 @@ static json make_vid_gen_features_json() {
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -381,7 +381,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json top_level_output_formats = json::array();
     json top_level_features       = {
               {"cancel_queued", true},
-              {"cancel_generating", false},
+              {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -410,9 +410,9 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     result["defaults_by_mode"]    = defaults_by_mode;
     result["limits"]              = {
                      {"min_width", 64},
-                     {"max_width", 4096},
+                     {"max_width", k_max_generation_dimension},
                      {"min_height", 64},
-                     {"max_height", 4096},
+                     {"max_height", k_max_generation_dimension},
                      {"max_batch_count", 8},
                      {"max_queue_size", manager.max_pending_jobs},
                      {"max_upscale_width", k_max_upscale_dimension},
@@ -457,7 +457,7 @@ static bool parse_img_gen_request(const json& body,
         error_message = "invalid generation parameters";
         return false;
     }
-    return true;
+    return validate_server_img_gen_request(runtime, request, error_message);
 }
 
 static bool parse_vid_gen_request(const json& body,
@@ -840,8 +840,9 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+            job.cancel_requested.store(true);
+            res.status = 200;
+            res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             return;
         }
 

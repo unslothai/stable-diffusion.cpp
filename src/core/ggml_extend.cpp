@@ -460,7 +460,8 @@ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
         p1 = 0;
     }
 
-    if (direct) {
+    // The direct kernels take F16 / F32 weights only (ggml-cpu asserts on anything else); other types keep im2col.
+    if (direct && (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32)) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
         // ggml_conv_2d, but skips the final [OC, N] -> [N, OC] relayout when N == 1 (no data moves).
@@ -503,7 +504,7 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
-    if (direct) {
+    if (direct && (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32)) {
         int64_t OC = w->ne[3] / IC;
         int64_t N  = x->ne[3] / IC;
         x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
