@@ -171,8 +171,8 @@ namespace Cosmos3 {
             auto v    = ggml_reshape_4d(gctx, v_store, v_store->ne[0], v_store->ne[1], v_store->ne[2], 1);
             if (flash_attn && mask != nullptr && mask->ne[0] > k->ne[1]) {
                 const int pad = static_cast<int>(mask->ne[0] - k->ne[1]);
-                k             = ggml_pad(gctx, k, 0, pad, 0, 0);
-                v             = ggml_pad(gctx, v, 0, 0, pad, 0);
+                k             = ggml_pad(gctx, ggml_cast(gctx, k, GGML_TYPE_F32), 0, pad, 0, 0);
+                v             = ggml_pad(gctx, ggml_cast(gctx, v, GGML_TYPE_F32), 0, 0, pad, 0);
             }
             auto out  = ggml_ext_attention_ext(gctx,
                                                ctx->backend,
