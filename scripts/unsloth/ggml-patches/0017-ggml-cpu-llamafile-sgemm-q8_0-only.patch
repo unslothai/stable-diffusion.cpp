@@ -1,21 +1,47 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 30b8cbb5..160dcf72 100644
+index 30b8cbb..a8c7511 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -49,6 +49,41 @@
+@@ -49,6 +49,67 @@
  
  #ifdef GGML_USE_LLAMAFILE
  #include "llamafile/sgemm.h"
++#if defined(__AVX2__) && !defined(__AVX512F__) && (!defined(_MSC_VER) || defined(__clang__)) && \
++    (defined(__x86_64__) || defined(__i386__) || defined(_M_X64))
++#include <cpuid.h>
++#endif
 +
 +// Weight types whose mul_mat may go through llamafile's tinyBLAS GEMM. Q8_0: its tinyBLAS kernel adds the per-block
 +// products in the same 8 lanes and the same final reduction as ggml_vec_dot_q8_0_q8_0, so it returns the same bits,
 +// only faster. F16 / BF16: both paths read the same F16 / BF16 activations and accumulate in F32, only in another
-+// order (the text encoder, VAE and DiT F16 / BF16 matmuls; 1.6-2.7x on AVX2 / AVX512). F32 doubles the rms error vs
-+// an F64 GEMM and stays opt-in. GGML_CPU_SGEMM_TYPES=q8_0,bf16,f16,f32 (ggml type names), "all" or "none" overrides;
++// order (the text encoder, VAE and DiT F16 / BF16 matmuls). F32 doubles the rms error vs an F64 GEMM and stays
++// opt-in. GGML_CPU_SGEMM_TYPES=q8_0,bf16,f16,f32 (ggml type names), "all" or "none" overrides the default below;
 +// GGML_CPU_SGEMM_TYPES=q8_0 restores the bit-identical-only set.
-+static uint64_t ggml_cpu_sgemm_types = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_F16) | (1ull << GGML_TYPE_BF16);
++//
++// Default: Q8_0 everywhere (1.07-1.11x on every x86 CPU measured). F16 / BF16 only where tinyBLAS measured faster
++// than vec_dot on SD1.5 F16 sampling: AVX512 builds (Zen 5 1.11-1.16x, Xeon 8573C 1.74x) and AVX2 builds on Intel
++// (Xeon 8573C 1.30x, Core i7-8700B 1.6x). On AMD the AVX2 kernels ran slower than vec_dot from the release
++// toolchains (GCC 11: Zen 3 0.78x, Zen 4 0.88x; MSVC: Zen 3 0.71x), so F16 / BF16 stay opt-in there and in every
++// MSVC build.
++static uint64_t ggml_cpu_sgemm_types = 1ull << GGML_TYPE_Q8_0;
++
++static uint64_t ggml_cpu_sgemm_types_default(void) {
++    uint64_t mask = 1ull << GGML_TYPE_Q8_0;
++#if !defined(_MSC_VER) || defined(__clang__)
++#if defined(__AVX512F__)
++    mask |= (1ull << GGML_TYPE_F16) | (1ull << GGML_TYPE_BF16);
++#elif defined(__AVX2__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64))
++    unsigned int a = 0, b = 0, c = 0, d = 0;
++    if (__get_cpuid(0, &a, &b, &c, &d) && b == 0x756e6547 && d == 0x49656e69 && c == 0x6c65746e) {  // GenuineIntel
++        mask |= (1ull << GGML_TYPE_F16) | (1ull << GGML_TYPE_BF16);
++    }
++#endif
++#endif
++    return mask;
++}
 +
 +static void ggml_cpu_sgemm_types_init(void) {
++    ggml_cpu_sgemm_types = ggml_cpu_sgemm_types_default();
 +    const char * env = getenv("GGML_CPU_SGEMM_TYPES");
 +    if (env == NULL) {
 +        return;
@@ -44,7 +70,7 @@ index 30b8cbb5..160dcf72 100644
  #endif
  
  #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-@@ -1460,7 +1495,7 @@ void ggml_compute_forward_mul_mat(
+@@ -1460,7 +1521,7 @@ void ggml_compute_forward_mul_mat(
  
      const bool src1_cont = ggml_is_contiguous(src1);
  
@@ -53,7 +79,7 @@ index 30b8cbb5..160dcf72 100644
          for (int64_t i13 = 0; i13 < ne13; i13++)
              for (int64_t i12 = 0; i12 < ne12; i12++)
                  if (!llamafile_sgemm(params,
-@@ -1539,7 +1574,7 @@ UseGgmlGemm1:;
+@@ -1539,7 +1600,7 @@ UseGgmlGemm1:;
      ggml_barrier(params->threadpool);
  
  #if GGML_USE_LLAMAFILE
@@ -62,7 +88,7 @@ index 30b8cbb5..160dcf72 100644
          const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
-@@ -4088,6 +4123,10 @@ void ggml_cpu_init(void) {
+@@ -4088,6 +4149,10 @@ void ggml_cpu_init(void) {
  
              const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
  
