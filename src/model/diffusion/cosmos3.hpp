@@ -247,6 +247,11 @@ namespace Cosmos3 {
         std::shared_ptr<DecoderLayer> layer(int64_t i) {
             return std::dynamic_pointer_cast<DecoderLayer>(blocks["layers." + std::to_string(i)]);
         }
+
+        template <typename T>
+        std::shared_ptr<T> get(const std::string& name) {
+            return std::dynamic_pointer_cast<T>(blocks[name]);
+        }
     };
 
     // Runs the transfer model one causal step at a time. The persistent state is
@@ -370,13 +375,13 @@ namespace Cosmos3 {
             ggml_tensor* patches = make_input(patches_tensor);
             ggml_tensor* gen_pe  = make_pe(gen_positions, gen_pe_vec, "cosmos3.gen_pe");
 
-            auto gen = std::dynamic_pointer_cast<Linear>(model.blocks["proj_in"])->forward(ctx, patches);
+            auto gen = model.get<Linear>("proj_in")->forward(ctx, patches);
             if (timestep >= 0.f) {
                 timestep_vec = {timestep * 1000.f * config.timestep_scale};
                 auto t       = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 1);
                 ggml_set_name(t, "cosmos3.timestep");
                 set_backend_tensor_data(t, timestep_vec.data());
-                auto t_emb = std::dynamic_pointer_cast<TimestepEmbedder>(model.blocks["time_embedder"])->forward(ctx, t);
+                auto t_emb = model.get<TimestepEmbedder>("time_embedder")->forward(ctx, t);
                 gen        = ggml_add(gctx, gen, t_emb);
             }
 
@@ -386,7 +391,7 @@ namespace Cosmos3 {
             ggml_tensor* mask    = nullptr;
             if (with_text) {
                 auto ids = make_input(text_ids);
-                und      = std::dynamic_pointer_cast<Embedding>(model.blocks["embed_tokens"])->forward(ctx, ids);
+                und      = model.get<Embedding>("embed_tokens")->forward(ctx, ids);
                 und      = ggml_reshape_2d(gctx, und, und->ne[0], und->ne[1] * und->ne[2]);
                 und_pe   = make_pe(text_positions, und_pe_vec, "cosmos3.und_pe");
                 const int64_t n = und->ne[1];
@@ -441,8 +446,8 @@ namespace Cosmos3 {
                 gen = layer->ffn(ctx, ggml_add(gctx, gen, gen_out), true);
             }
 
-            gen = std::dynamic_pointer_cast<LLM::LLMRMSNorm>(model.blocks["norm_moe_gen"])->forward(ctx, gen);
-            gen = std::dynamic_pointer_cast<Linear>(model.blocks["proj_out"])->forward(ctx, gen);
+            gen = model.get<LLM::LLMRMSNorm>("norm_moe_gen")->forward(ctx, gen);
+            gen = model.get<Linear>("proj_out")->forward(ctx, gen);
             ggml_build_forward_expand(graph, gen);
             return graph;
         }
