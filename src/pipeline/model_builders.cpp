@@ -548,13 +548,15 @@ namespace sd::model_builders {
             return false;
         }
 
+        // Cosmos3 uses the Wan2.2 TI2V autoencoder (48 channels, 16x).
+        const SDVersion video_vae_version = sd_version_is_cosmos3(version) ? VERSION_WAN2_2_TI2V : version;
         auto create_tae = [&](bool decode_only) -> std::shared_ptr<VAE> {
             if ((sd_version_uses_wan_vae(version) && version != VERSION_QWEN_IMAGE_2_1) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version)) {
                 return std::make_shared<TinyVideoAutoEncoder>(ctx.backends.runtime_backend(SDBackendModule::VAE),
                                                               tensor_storage_map,
                                                               "decoder",
                                                               decode_only,
-                                                              version,
+                                                              video_vae_version,
                                                               weight_manager);
 
             } else {
@@ -578,7 +580,7 @@ namespace sd::model_builders {
             vae_version = sd_vae_format_to_version(vae_format, vae_version);
         }
         if (sd_version_is_cosmos3(version)) {
-            vae_version = VERSION_WAN2_2_TI2V;
+            vae_version = video_vae_version;
         }
 
         auto create_vae = [&]() -> std::shared_ptr<VAE> {
