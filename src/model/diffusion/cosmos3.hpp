@@ -446,6 +446,14 @@ namespace Cosmos3 {
                     ggml_tensor* q_u = nullptr;
                     attn->project(ctx, layer->input_norm(ctx, und, false), und_pe, false, &q_u, &und_k, &und_v);
                     auto und_out = attn->attend(ctx, q_u, und_k, und_v, mask, false, ctx->flash_attn_enabled && text_flash_attn);
+                    if (debug_capture) {
+                        auto ss = [&](ggml_tensor* x) { return ggml_sum(gctx, ggml_sqr(gctx, ggml_cont(gctx, ggml_cast(gctx, x, GGML_TYPE_F32)))); };
+                        ctx->capture_tensor("ss_und_in_l" + std::to_string(i), ss(und));
+                        ctx->capture_tensor("ss_und_k_l" + std::to_string(i), ss(und_k));
+                        ctx->capture_tensor("ss_und_v_l" + std::to_string(i), ss(und_v));
+                        ctx->capture_tensor("ss_und_q_l" + std::to_string(i), ss(q_u));
+                        ctx->capture_tensor("ss_und_attn_l" + std::to_string(i), ss(und_out));
+                    }
                     und          = layer->ffn(ctx, ggml_add(gctx, und, und_out), false);
                     if (debug_capture) {
                         ctx->capture_tensor("und_l" + std::to_string(i), und);
