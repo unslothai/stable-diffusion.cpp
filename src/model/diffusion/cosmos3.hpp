@@ -164,16 +164,10 @@ namespace Cosmos3 {
                             ggml_tensor* k_store,
                             ggml_tensor* v_store,
                             ggml_tensor* mask,
-                            bool generation,
-                            bool flash_attn) {
+                            bool generation) {
             auto gctx = ctx->ggml_ctx;
             auto k    = ggml_cont(gctx, ggml_permute(gctx, k_store, 0, 2, 1, 3));  // [d, Lk, kv_heads]
             auto v    = ggml_reshape_4d(gctx, v_store, v_store->ne[0], v_store->ne[1], v_store->ne[2], 1);
-            if (flash_attn && mask != nullptr && mask->ne[0] > k->ne[1]) {
-                const int pad = static_cast<int>(mask->ne[0] - k->ne[1]);
-                k             = ggml_pad(gctx, ggml_cast(gctx, k, GGML_TYPE_F32), 0, pad, 0, 0);
-                v             = ggml_pad(gctx, ggml_cast(gctx, v, GGML_TYPE_F32), 0, 0, pad, 0);
-            }
             auto out  = ggml_ext_attention_ext(gctx,
                                                ctx->backend,
                                                q,
@@ -182,7 +176,7 @@ namespace Cosmos3 {
                                                config.num_heads,
                                                mask,
                                                true,
-                                               flash_attn);  // [heads * d, Lq, 1]
+                                               ctx->flash_attn_enabled);  // [heads * d, Lq, 1]
             return linear(generation ? "to_add_out" : "to_out")->forward(ctx, out);
         }
     };
@@ -278,15 +272,10 @@ namespace Cosmos3 {
         // Numerical-comparison hook: return the generation hidden states after this
         // layer (num_layers = after the final norm) instead of the velocity.
         int64_t debug_stop_layer = -1;
-        bool debug_capture       = std::getenv("SD_COSMOS3_DEBUG_CAPTURE") != nullptr;
-        bool text_flash_attn     = std::getenv("SD_COSMOS3_TEXT_FA") == nullptr || std::getenv("SD_COSMOS3_TEXT_FA")[0] != '0';
-        float mask_value         = std::getenv("SD_COSMOS3_MASK_FINITE") != nullptr ? -65504.f : -INFINITY;
 
         std::vector<float> und_pe_vec;
         std::vector<float> gen_pe_vec;
         std::vector<float> causal_mask_vec;
-        std::vector<float> kv_pad_mask_vec;
-        bool pad_gen_kv = std::getenv("SD_COSMOS3_NO_KV_PAD") == nullptr;
         std::vector<float> timestep_vec;
 
         Cosmos3Runner(ggml_backend_t backend,
@@ -413,27 +402,12 @@ namespace Cosmos3 {
                 causal_mask_vec.assign(static_cast<size_t>(n * n), 0.f);
                 for (int64_t q = 0; q < n; ++q) {
                     for (int64_t k = q + 1; k < n; ++k) {
-                        causal_mask_vec[static_cast<size_t>(q * n + k)] = mask_value;
+                        causal_mask_vec[static_cast<size_t>(q * n + k)] = -INFINITY;
                     }
                 }
                 mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
                 ggml_set_name(mask, "cosmos3.causal_mask");
                 set_backend_tensor_data(mask, causal_mask_vec.data());
-            }
-
-            // CUDA flash attention reads keys in blocks of 256; pad the generation keys
-            // to that and mask the padding off.
-            ggml_tensor* kv_pad_mask = nullptr;
-            {
-                const int64_t kv_len = (with_text ? text_ids.numel() : und_tokens) + hist_tokens + patches_tensor.shape()[1];
-                const int64_t padded = (kv_len + 255) / 256 * 256;
-                if (padded != kv_len && pad_gen_kv) {
-                    kv_pad_mask_vec.assign(static_cast<size_t>(padded), 0.f);
-                    std::fill(kv_pad_mask_vec.begin() + kv_len, kv_pad_mask_vec.end(), -INFINITY);
-                    kv_pad_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, padded, 1);
-                    ggml_set_name(kv_pad_mask, "cosmos3.kv_pad_mask");
-                    set_backend_tensor_data(kv_pad_mask, kv_pad_mask_vec.data());
-                }
             }
 
             for (int64_t i = 0; i < config.num_layers; ++i) {
@@ -445,19 +419,8 @@ namespace Cosmos3 {
                 if (with_text) {
                     ggml_tensor* q_u = nullptr;
                     attn->project(ctx, layer->input_norm(ctx, und, false), und_pe, false, &q_u, &und_k, &und_v);
-                    auto und_out = attn->attend(ctx, q_u, und_k, und_v, mask, false, ctx->flash_attn_enabled && text_flash_attn);
-                    if (debug_capture) {
-                        auto ss = [&](ggml_tensor* x) { return ggml_sum(gctx, ggml_sqr(gctx, ggml_cont(gctx, ggml_cast(gctx, x, GGML_TYPE_F32)))); };
-                        ctx->capture_tensor("ss_und_in_l" + std::to_string(i), ss(und));
-                        ctx->capture_tensor("ss_und_k_l" + std::to_string(i), ss(und_k));
-                        ctx->capture_tensor("ss_und_v_l" + std::to_string(i), ss(und_v));
-                        ctx->capture_tensor("ss_und_q_l" + std::to_string(i), ss(q_u));
-                        ctx->capture_tensor("ss_und_attn_l" + std::to_string(i), ss(und_out));
-                    }
+                    auto und_out = attn->attend(ctx, q_u, und_k, und_v, mask, false);
                     und          = layer->ffn(ctx, ggml_add(gctx, und, und_out), false);
-                    if (debug_capture) {
-                        ctx->capture_tensor("und_l" + std::to_string(i), und);
-                    }
                     ctx->persist_cache_tensor(cache_name("und", i, "k"), und_k);
                     ctx->persist_cache_tensor(cache_name("und", i, "v"), und_v);
                 } else {
@@ -479,15 +442,12 @@ namespace Cosmos3 {
 
                 auto all_k   = ggml_concat(gctx, und_k, past_k, 2);
                 auto all_v   = ggml_concat(gctx, und_v, past_v, 2);
-                auto gen_out = attn->attend(ctx, q_g, all_k, all_v, ctx->flash_attn_enabled ? kv_pad_mask : nullptr, true, ctx->flash_attn_enabled);
+                auto gen_out = attn->attend(ctx, q_g, all_k, all_v, nullptr, true);
                 if (update.write) {
                     ctx->persist_cache_tensor(cache_name("hist", i, "k"), trim_history(gctx, past_k, update));
                     ctx->persist_cache_tensor(cache_name("hist", i, "v"), trim_history(gctx, past_v, update));
                 }
                 gen = layer->ffn(ctx, ggml_add(gctx, gen, gen_out), true);
-                if (debug_capture) {
-                    ctx->capture_tensor("gen_l" + std::to_string(i), gen);
-                }
                 if (i == debug_stop_layer) {
                     ggml_build_forward_expand(graph, gen);
                     return graph;
