@@ -371,8 +371,8 @@ namespace sd::model_builders {
                                                                         "model.diffusion_model.model.net",
                                                                         weight_manager);
         } else if (sd_version_is_cosmos3(version)) {
-            // The text goes through the transformer's own understanding path.
-            result.diffusion = std::make_shared<Cosmos3::Cosmos3Runner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
+            result.conditioner = std::make_shared<Cosmos3Conditioner>();
+            result.diffusion   = std::make_shared<Cosmos3::Cosmos3Runner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
                                                                         tensor_storage_map,
                                                                         "model.diffusion_model",
                                                                         weight_manager,
