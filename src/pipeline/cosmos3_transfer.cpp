@@ -128,24 +128,26 @@ namespace sd::pipeline {
                 edge_params.thin             = edge_threshold > 0.f;
                 edge_params.binary_threshold = edge_threshold;
                 const int64_t edge_start     = ggml_time_ms();
+                const size_t plane = static_cast<size_t>(width) * height;
+                std::vector<uint8_t> pixels;
                 for (int i = 0; i < frames; ++i) {
-                    auto rgb = sd_image_to_tensor(source.frames[i], width, height);
-                    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 3);
-                    for (int y = 0; y < height; ++y) {
-                        for (int x = 0; x < width; ++x) {
+                    const sd_image_t& frame = source.frames[i];
+                    const uint8_t* rgb      = frame.data;
+                    if (static_cast<int>(frame.width) != width || static_cast<int>(frame.height) != height || frame.channel != 3) {
+                        auto resized = sd_image_to_tensor(frame, width, height);
+                        pixels.resize(plane * 3);
+                        for (size_t p = 0; p < plane; ++p) {
                             for (int c = 0; c < 3; ++c) {
-                                pixels[(static_cast<size_t>(y) * width + x) * 3 + c] =
-                                    static_cast<uint8_t>(std::lround(std::min(std::max(rgb.data()[(static_cast<size_t>(c) * height + y) * width + x], 0.f), 1.f) * 255.f));
+                                pixels[p * 3 + c] = static_cast<uint8_t>(std::lround(std::min(std::max(resized.data()[c * plane + p], 0.f), 1.f) * 255.f));
                             }
                         }
+                        rgb = pixels.data();
                     }
-                    sd::edge::gradient_magnitude(pixels.data(), width, height, 3, edges.data(), edge_params);
-                    for (int y = 0; y < height; ++y) {
-                        for (int x = 0; x < width; ++x) {
-                            const float v = edges[static_cast<size_t>(y) * width + x] / 255.f;
-                            for (int c = 0; c < 3; ++c) {
-                                video.index(x, y, i, c, 0) = v;
-                            }
+                    sd::edge::gradient_magnitude(rgb, width, height, 3, edges.data(), edge_params);
+                    for (int c = 0; c < 3; ++c) {
+                        float* dst = video.data() + (static_cast<size_t>(c) * frames + i) * plane;
+                        for (size_t p = 0; p < plane; ++p) {
+                            dst[p] = edges[p] / 255.f;
                         }
                     }
                 }
