@@ -33,8 +33,9 @@ path. Performance depends on GPU architecture, backend, driver, model, and
 tensor shapes, so enabling direct convolution can either improve or reduce speed.
 
 Automatic selection checks direct 2D convolution output against im2col on
-Vulkan (timing is not used; direct 3D stays off there) and uses implicit GEMM
-checks on other backends. It does not guarantee the fastest end-to-end generation.
+Vulkan and uses it for the VAE (timing is not used; the diffusion model keeps
+im2col and direct 3D stays off there) and uses implicit GEMM checks on other
+backends. It does not guarantee the fastest end-to-end generation.
 Compare `on` and `off` with the same model and generation settings over
 repeated runs, keeping flash attention unchanged and separating startup/probe
 time from steady-state generation time. See [backend selection](backend.md)
