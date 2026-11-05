@@ -220,6 +220,13 @@ namespace sd::pipeline {
         if (dbg_ids.empty()) {
             text_ids.push_back(151645);
             text_ids.push_back(151652);
+            if (dbg != nullptr) {
+                FILE* f = std::fopen(debug_path(dbg, "port_text_ids.bin").c_str(), "wb");
+                if (f != nullptr) {
+                    std::fwrite(text_ids.data(), sizeof(int32_t), text_ids.size(), f);
+                    std::fclose(f);
+                }
+            }
         }
         const int64_t text_len = static_cast<int64_t>(text_ids.size());
         sd::Tensor<int32_t> text_tensor({text_len, 1});
