@@ -13,6 +13,8 @@ namespace sd::edge {
         float clip_percentile = 99.f;
         // Values above this level (0..1 after normalization) become 255 and the rest 0; <= 0 keeps the soft map.
         float binary_threshold = 0.f;
+        // Keep only local maxima across the edge (Canny-style non-maximum suppression), giving 1 px lines.
+        bool thin = false;
     };
 
     // Grayscale, 5-tap binomial blur, Sobel x/y, gradient magnitude, normalized to 0..255.
@@ -57,6 +59,10 @@ namespace sd::edge {
             }
         }
 
+        std::vector<uint8_t> dir;
+        if (params.thin) {
+            dir.resize(n);
+        }
         float max_mag = 0.f;
         for (int y = 0; y < height; ++y) {
             const float* up   = gray.data() + static_cast<size_t>(clamp_y(y - 1)) * width;
@@ -70,7 +76,34 @@ namespace sd::edge {
                 const float gy = (down[xl] + 2.f * down[x] + down[xr]) - (up[xl] + 2.f * up[x] + up[xr]);
                 dst[x]         = std::sqrt(gx * gx + gy * gy);
                 max_mag        = std::max(max_mag, dst[x]);
+                if (params.thin) {
+                    // 0: horizontal gradient, 1: 45 deg, 2: vertical, 3: 135 deg (tan 22.5 = 0.4142).
+                    const float ax = std::fabs(gx), ay = std::fabs(gy);
+                    uint8_t d      = 0;
+                    if (ay > 2.4142f * ax) {
+                        d = 2;
+                    } else if (ay > 0.4142f * ax) {
+                        d = (gx > 0.f) == (gy > 0.f) ? 1 : 3;
+                    }
+                    dir[static_cast<size_t>(y) * width + x] = d;
+                }
             }
+        }
+        if (params.thin) {
+            static const int kOffsets[4][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}};
+            std::vector<float> thinned(n, 0.f);
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    const size_t i = static_cast<size_t>(y) * width + x;
+                    const int* o   = kOffsets[dir[i]];
+                    const float a  = tmp[static_cast<size_t>(clamp_y(y + o[1])) * width + clamp_x(x + o[0])];
+                    const float b  = tmp[static_cast<size_t>(clamp_y(y - o[1])) * width + clamp_x(x - o[0])];
+                    if (tmp[i] >= a && tmp[i] > b) {
+                        thinned[i] = tmp[i];
+                    }
+                }
+            }
+            tmp.swap(thinned);
         }
 
         float scale_ref = max_mag;

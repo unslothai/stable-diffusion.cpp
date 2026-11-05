@@ -108,7 +108,7 @@ namespace sd::pipeline {
 
         // Control video in [0, 1], [W, H, T, 3, 1]. Precomputed control frames win;
         // otherwise an edge map is derived from the reference video's RGB frames.
-        sd::Tensor<float> build_control_video(const sd_vid_gen_params_t* params, int width, int height, int frames) {
+        sd::Tensor<float> build_control_video(const sd_vid_gen_params_t* params, int width, int height, int frames, float edge_threshold) {
             sd::Tensor<float> video = sd::zeros<float>({width, height, frames, 3, 1});
             if (params->control_frames_size > 0) {
                 if (params->control_frames_size < frames) {
@@ -124,6 +124,10 @@ namespace sd::pipeline {
             if (params->ref_videos_count > 0 && params->ref_videos[0].frame_count >= frames) {
                 const sd_ref_video_t& source = params->ref_videos[0];
                 std::vector<uint8_t> edges(static_cast<size_t>(width) * height);
+                sd::edge::GradientEdgeParams edge_params;
+                edge_params.thin             = edge_threshold > 0.f;
+                edge_params.binary_threshold = edge_threshold;
+                const int64_t edge_start     = ggml_time_ms();
                 for (int i = 0; i < frames; ++i) {
                     auto rgb = sd_image_to_tensor(source.frames[i], width, height);
                     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 3);
@@ -135,7 +139,7 @@ namespace sd::pipeline {
                             }
                         }
                     }
-                    sd::edge::gradient_magnitude(pixels.data(), width, height, 3, edges.data());
+                    sd::edge::gradient_magnitude(pixels.data(), width, height, 3, edges.data(), edge_params);
                     for (int y = 0; y < height; ++y) {
                         for (int x = 0; x < width; ++x) {
                             const float v = edges[static_cast<size_t>(y) * width + x] / 255.f;
@@ -145,6 +149,7 @@ namespace sd::pipeline {
                         }
                     }
                 }
+                LOG_INFO("cosmos3: edge control for %d frames in %" PRId64 " ms", frames, ggml_time_ms() - edge_start);
                 return video;
             }
             LOG_ERROR("cosmos3: Sim-Transfer needs a control video (control frames) or a reference video to derive edges from");
@@ -179,7 +184,7 @@ namespace sd::pipeline {
         const int fps     = request.fps > 0 ? request.fps : 30;
         const int64_t t0  = ggml_time_ms();
 
-        sd::Tensor<float> control = build_control_video(params, width, height, frames);
+        sd::Tensor<float> control = build_control_video(params, width, height, frames, runner->edge_threshold);
         if (control.empty()) {
             return false;
         }

@@ -269,6 +269,10 @@ namespace Cosmos3 {
         int64_t window_frames = 0;
         int64_t sink_frames   = 1;
 
+        // Edge control derived from RGB input: thinned lines above this fraction of the
+        // 99th-percentile gradient become 255 (Canny-like); <= 0 keeps the soft gradient map.
+        float edge_threshold = 0.2f;
+
         // Numerical-comparison hook: return the generation hidden states after this
         // layer (num_layers = after the final norm) instead of the velocity.
         int64_t debug_stop_layer = -1;
@@ -288,12 +292,20 @@ namespace Cosmos3 {
               model(config) {
             model.init(params_ctx, tensor_storage_map, prefix);
             for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
-                int parsed = 0;
-                if (key == "cosmos3_window" && parse_strict_int(value, parsed) && parsed >= 0) {
-                    window_frames = parsed;
-                } else if (key == "cosmos3_sink" && parse_strict_int(value, parsed) && parsed >= 0) {
-                    sink_frames = parsed;
-                } else if (key == "cosmos3_window" || key == "cosmos3_sink") {
+                int parsed_int     = 0;
+                float parsed_float = 0.f;
+                bool ok            = true;
+                if (key == "cosmos3_window") {
+                    ok = parse_strict_int(value, parsed_int) && parsed_int >= 0;
+                    window_frames = ok ? parsed_int : window_frames;
+                } else if (key == "cosmos3_sink") {
+                    ok = parse_strict_int(value, parsed_int) && parsed_int >= 0;
+                    sink_frames = ok ? parsed_int : sink_frames;
+                } else if (key == "cosmos3_edge_threshold") {
+                    ok = parse_strict_float(value, parsed_float) && parsed_float < 1.f;
+                    edge_threshold = ok ? parsed_float : edge_threshold;
+                }
+                if (!ok) {
                     LOG_WARN("ignoring invalid Cosmos3 model arg '%s=%s'", key.c_str(), value.c_str());
                 }
             }
