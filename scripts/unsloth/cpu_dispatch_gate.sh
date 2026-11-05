@@ -10,7 +10,13 @@
 #   - the process dies or SDE reports an instruction the emulated CPU does not have. ggml dlopens EVERY CPU
 #     variant library while it scores them, so a static initializer that the compiler vectorised with a
 #     variant's AVX512 / SVE flags crashes every host without that ISA, before any variant is picked;
-#   - no CPU variant is loaded, or the loaded variant needs a feature the emulated CPU lacks.
+#   - no CPU variant is loaded, or the loaded variant needs a feature the emulated CPU lacks;
+#   - on a 128-bit SVE vector length (CPU names ending in -sve128) a variant other than armv8.2_2 is loaded:
+#     ggml-patches/0020 skips the SVE variants there unless GGML_CPU_ARM_SVE128=1 (names ending in +keep
+#     set it and must then load an SVE variant);
+#   - a variant that has the iqk GEMM kernels built does not enable them by default (ARM: every batch size;
+#     x86 AVX2 and up: 2-12 src1 rows, ggml-patches/0018). Variants without them (pre-AVX2 x86, Armv8.0)
+#     report built types 0x0.
 # The runner's own CPU cannot catch either: it has the newest ISA the bundle uses.
 #
 # Env: SDE_DIR (an unpacked Intel SDE; downloaded and checked against SDE_SHA256 when unset),
@@ -57,7 +63,7 @@ variant_needs() {
 X86_HSW="SSE42 AVX F16C FMA AVX2 BMI2"
 X86_SKX="$X86_HSW AVX512"
 cpu_has() {
-  case "$1" in
+  case "${1%-sve128}" in
     nhm|wsm) echo "SSE42" ;;
     snb) echo "SSE42 AVX" ;;
     ivb) echo "SSE42 AVX F16C" ;;
@@ -99,10 +105,16 @@ case "$arch" in
     emu() { emu_cmd=("$SDE_DIR/sde64" "-$1" --); }
     ;;
   aarch64)
-    cpus="${CPU_DISPATCH_GATE_CPUS:-cortex-a53 cortex-a76 neoverse-v1 max}"
+    cpus="${CPU_DISPATCH_GATE_CPUS:-cortex-a53 cortex-a76 neoverse-v1 max neoverse-v1-sve128 max-sve128 max-sve128+keep}"
     qemu="${QEMU_AARCH64:-qemu-aarch64}"
     command -v "$qemu" > /dev/null || { echo "ERROR: $qemu not installed (the workflow installs qemu-user)" >&2; exit 1; }
-    emu() { emu_cmd=("$qemu" -cpu "$1"); }
+    # -sve128: the same model with a 16-byte default SVE vector length (Neoverse N2 / V2 class hardware)
+    emu() {
+      case "$1" in
+        *-sve128) emu_cmd=("$qemu" -cpu "${1%-sve128},sve-default-vector-length=16") ;;
+        *) emu_cmd=("$qemu" -cpu "$1") ;;
+      esac
+    }
     ;;
   *)
     echo "cpu_dispatch_gate: nothing to emulate on $arch"
@@ -111,14 +123,17 @@ case "$arch" in
 esac
 
 fail=0
-printf '%-12s %-16s %-6s %s\n' cpu variant rc note
-for cpu in $cpus; do
+printf '%-18s %-16s %-6s %s\n' cpu variant rc note
+for entry in $cpus; do
+  cpu="${entry%+keep}"
+  keep=""
+  [ "$cpu" != "$entry" ] && keep=1
   has=" $(cpu_has "$cpu") "
   # Nonexistent model: sd-cli loads (and scores) every CPU variant, initialises the chosen one, then stops.
   # Empty cwd defeats ggml's cwd search. GGML_CPU_IQK_DEBUG makes the iqk GEMM report what it was built with.
   emu "$cpu"
   set +e
-  out="$(cd "$work/cwd" && env -u LD_LIBRARY_PATH GGML_CPU_IQK_DEBUG=1 \
+  out="$(cd "$work/cwd" && env -u LD_LIBRARY_PATH GGML_CPU_IQK_DEBUG=1 ${keep:+GGML_CPU_ARM_SVE128=1} \
          "${emu_cmd[@]}" "$cli" -m "$work/cwd/none.gguf" -p x -v 2>&1)"
   rc=$?
   set -e
@@ -133,11 +148,26 @@ for cpu in $cpus; do
   elif [ -z "$loaded" ]; then
     note="no CPU variant loaded"
   else
-    for f in $(variant_needs "$loaded"); do
+    needs=" $(variant_needs "$loaded") "
+    for f in $needs; do
       case "$has" in *" $f "*) ;; *) note="$note needs $f";; esac
     done
+    case "$cpu" in
+      *-sve128)
+        if [ -n "$keep" ]; then
+          case "$needs" in *" SVE "*) ;; *) note="$note expected an SVE variant with GGML_CPU_ARM_SVE128=1";; esac
+        elif [ "$loaded" != "armv8.2_2" ]; then
+          note="$note expected armv8.2_2 on 128-bit SVE"
+        fi
+        ;;
+    esac
+    built="$(printf '%s\n' "$iqk" | sed -n 's/^built types \([^ ,]*\).*/\1/p')"
+    enabled="$(printf '%s\n' "$iqk" | sed -n 's/.*enabled \([^ ,]*\).*/\1/p')"
+    if [ -n "$built" ] && [ "$built" != "0x0" ] && [ "$enabled" != "$built" ]; then
+      note="$note iqk built but not enabled by default"
+    fi
   fi
-  printf '%-12s %-16s %-6s %s\n' "$cpu" "${loaded:-none}" "$rc" "${note:-ok}${iqk:+ (iqk $iqk)}"
+  printf '%-18s %-16s %-6s %s\n' "$entry" "${loaded:-none}" "$rc" "${note:-ok}${iqk:+ (iqk $iqk)}"
   if [ -n "$note" ]; then
     fail=1
     printf '%s\n' "$out" | tail -n 15 >&2
