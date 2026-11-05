@@ -1,0 +1,34 @@
+diff --git a/src/ggml-cpu/arch/arm/cpu-feats.cpp b/src/ggml-cpu/arch/arm/cpu-feats.cpp
+index 84a11ea..79a3b2c 100644
+--- a/src/ggml-cpu/arch/arm/cpu-feats.cpp
++++ b/src/ggml-cpu/arch/arm/cpu-feats.cpp
+@@ -1,6 +1,11 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-feats.h"
+ 
++#if defined(__linux__) && defined(GGML_USE_SVE)
++#include <stdlib.h>
++#include <sys/prctl.h>
++#endif
++
+ #if defined(__aarch64__) || defined(_M_ARM64)
+ 
+ static int ggml_backend_cpu_aarch64_score() {
+@@ -18,6 +23,17 @@ static int ggml_backend_cpu_aarch64_score() {
+ #endif
+ #ifdef GGML_USE_SVE
+     if (!af.has_sve) { return 0; }
++#if defined(__linux__) && defined(PR_SVE_GET_VL)
++    // Unsloth: with 128-bit SVE (Neoverse N2 / V2, Cortex-A710 and later) the SVE variants ran stable-diffusion.cpp
++    // slower than the NEON dotprod + FP16 one (armv8.2_2) on a Neoverse N2: 1.29-1.38x slower for armv8.6_2 and about
++    // 5x slower for armv8.2_3 / armv8.6_1, F16, Q8_0, Q3_K and Q4_K alike. So they are not offered there and the best
++    // NEON variant is picked. Wider SVE (Graviton 3, A64FX) keeps them. GGML_CPU_ARM_SVE128=1 offers them again.
++    {
++        const int vl = prctl(PR_SVE_GET_VL);
++        const char * keep = getenv("GGML_CPU_ARM_SVE128");
++        if (vl > 0 && (vl & PR_SVE_VL_LEN_MASK) <= 16 && !(keep != NULL && keep[0] == '1')) { return 0; }
++    }
++#endif
+     score += 1<<3;
+ #endif
+ #ifdef GGML_USE_MATMUL_INT8
