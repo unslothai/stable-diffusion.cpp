@@ -164,7 +164,8 @@ namespace Cosmos3 {
                             ggml_tensor* k_store,
                             ggml_tensor* v_store,
                             ggml_tensor* mask,
-                            bool generation) {
+                            bool generation,
+                            bool flash_attn) {
             auto gctx = ctx->ggml_ctx;
             auto k    = ggml_cont(gctx, ggml_permute(gctx, k_store, 0, 2, 1, 3));  // [d, Lk, kv_heads]
             auto v    = ggml_reshape_4d(gctx, v_store, v_store->ne[0], v_store->ne[1], v_store->ne[2], 1);
@@ -176,7 +177,7 @@ namespace Cosmos3 {
                                                config.num_heads,
                                                mask,
                                                true,
-                                               ctx->flash_attn_enabled);  // [heads * d, Lq, 1]
+                                               flash_attn);  // [heads * d, Lq, 1]
             return linear(generation ? "to_add_out" : "to_out")->forward(ctx, out);
         }
     };
@@ -273,6 +274,8 @@ namespace Cosmos3 {
         // layer (num_layers = after the final norm) instead of the velocity.
         int64_t debug_stop_layer = -1;
         bool debug_capture       = std::getenv("SD_COSMOS3_DEBUG_CAPTURE") != nullptr;
+        bool text_flash_attn     = std::getenv("SD_COSMOS3_TEXT_FA") == nullptr || std::getenv("SD_COSMOS3_TEXT_FA")[0] != '0';
+        float mask_value         = std::getenv("SD_COSMOS3_MASK_FINITE") != nullptr ? -65504.f : -INFINITY;
 
         std::vector<float> und_pe_vec;
         std::vector<float> gen_pe_vec;
@@ -403,7 +406,7 @@ namespace Cosmos3 {
                 causal_mask_vec.assign(static_cast<size_t>(n * n), 0.f);
                 for (int64_t q = 0; q < n; ++q) {
                     for (int64_t k = q + 1; k < n; ++k) {
-                        causal_mask_vec[static_cast<size_t>(q * n + k)] = -INFINITY;
+                        causal_mask_vec[static_cast<size_t>(q * n + k)] = mask_value;
                     }
                 }
                 mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
@@ -420,7 +423,7 @@ namespace Cosmos3 {
                 if (with_text) {
                     ggml_tensor* q_u = nullptr;
                     attn->project(ctx, layer->input_norm(ctx, und, false), und_pe, false, &q_u, &und_k, &und_v);
-                    auto und_out = attn->attend(ctx, q_u, und_k, und_v, mask, false);
+                    auto und_out = attn->attend(ctx, q_u, und_k, und_v, mask, false, ctx->flash_attn_enabled && text_flash_attn);
                     und          = layer->ffn(ctx, ggml_add(gctx, und, und_out), false);
                     if (debug_capture) {
                         ctx->capture_tensor("und_l" + std::to_string(i), und);
@@ -446,7 +449,7 @@ namespace Cosmos3 {
 
                 auto all_k   = ggml_concat(gctx, und_k, past_k, 2);
                 auto all_v   = ggml_concat(gctx, und_v, past_v, 2);
-                auto gen_out = attn->attend(ctx, q_g, all_k, all_v, nullptr, true);
+                auto gen_out = attn->attend(ctx, q_g, all_k, all_v, nullptr, true, ctx->flash_attn_enabled);
                 if (update.write) {
                     ctx->persist_cache_tensor(cache_name("hist", i, "k"), trim_history(gctx, past_k, update));
                     ctx->persist_cache_tensor(cache_name("hist", i, "v"), trim_history(gctx, past_v, update));
