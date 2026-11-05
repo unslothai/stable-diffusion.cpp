@@ -389,6 +389,16 @@ jobs:
         if: ${{ matrix.cpu_floor != '' }}
         run: bash tooling/scripts/unsloth/cpu_variants_gate.sh check "dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip" "${{ matrix.cpu_floor }}"
 
+      # The runner has the newest ISA the bundle uses, so it cannot see a variant library that crashes
+      # older CPUs while ggml dlopens every variant to score it. Replay startup on emulated CPUs: Intel SDE
+      # Nehalem .. Sapphire Rapids on x86_64, qemu Cortex-A53 .. max on aarch64.
+      - name: CPU dispatch gate (emulated CPUs)
+        if: ${{ matrix.cpu_floor != '' && runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" = "aarch64" ]; then sudo apt-get install -y -qq qemu-user; fi
+          bash tooling/scripts/unsloth/cpu_dispatch_gate.sh "dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip"
+
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
