@@ -89,16 +89,21 @@ namespace sd::edge {
                 }
             }
         }
-        // Scale from the full magnitude map: after thinning most pixels are zero.
+        // Percentile over the pixels that have any gradient, before thinning: flat
+        // areas and suppressed pixels would otherwise pull it to zero on sparse frames.
         float scale_ref = max_mag;
         if (params.clip_percentile > 0.f && params.clip_percentile < 100.f && max_mag > 0.f) {
             constexpr int kBins = 2048;
             std::vector<uint32_t> hist(kBins, 0);
             const float to_bin = (kBins - 1) / max_mag;
+            size_t nonzero     = 0;
             for (size_t i = 0; i < n; ++i) {
-                hist[static_cast<size_t>(tmp[i] * to_bin)]++;
+                if (tmp[i] > 0.f) {
+                    hist[static_cast<size_t>(tmp[i] * to_bin)]++;
+                    nonzero++;
+                }
             }
-            const double target = n * (params.clip_percentile / 100.0);
+            const double target = nonzero * (params.clip_percentile / 100.0);
             double seen         = 0.0;
             for (int b = 0; b < kBins; ++b) {
                 seen += hist[b];

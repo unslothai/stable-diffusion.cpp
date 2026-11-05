@@ -111,6 +111,38 @@ int main() {
         CHECK(strong == sh);
     }
 
+    // Gradients under 1% of the image even before thinning: two small squares on black.
+    {
+        const int sw = 200, sh = 200;
+        std::vector<uint8_t> squares(static_cast<size_t>(sw) * sh * 3, 0);
+        for (int y = 0; y < 6; ++y) {
+            for (int x = 0; x < 6; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    squares[(static_cast<size_t>(50 + y) * sw + 50 + x) * 3 + c]   = 255;
+                    squares[(static_cast<size_t>(150 + y) * sw + 150 + x) * 3 + c] = 20;
+                }
+            }
+        }
+        std::vector<uint8_t> edges(static_cast<size_t>(sw) * sh);
+        sd::edge::GradientEdgeParams lines;
+        lines.thin             = true;
+        lines.binary_threshold = 0.2f;
+        sd::edge::gradient_magnitude(squares.data(), sw, sh, 3, edges.data(), lines);
+        int weak = 0, strong = 0;
+        for (int y = 140; y < 166; ++y) {
+            for (int x = 140; x < 166; ++x) {
+                weak += edges[static_cast<size_t>(y) * sw + x] != 0;
+            }
+        }
+        for (int y = 40; y < 66; ++y) {
+            for (int x = 40; x < 66; ++x) {
+                strong += edges[static_cast<size_t>(y) * sw + x] == 255;
+            }
+        }
+        CHECK(weak == 0);
+        CHECK(strong > 0);
+    }
+
     // Timing on a busy image (deterministic noise plus gradients).
     const int sizes[2][2] = {{832, 480}, {1280, 720}};
     for (const auto& size : sizes) {
