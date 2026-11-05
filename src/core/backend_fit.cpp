@@ -130,10 +130,28 @@ namespace sd::backend_fit {
     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
                                                      bool include_other_devices) {
         std::vector<Device> out;
+        // Like llama.cpp's default device list, integrated GPUs are planned for only when no discrete GPU
+        // exists, and only those of the first backend that reports one (an iGPU can appear once per backend).
+        bool has_discrete_gpu = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                has_discrete_gpu = true;
+                break;
+            }
+        }
+        ggml_backend_reg_t igpu_reg = nullptr;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             const auto type        = ggml_backend_dev_type(dev);
-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            bool auto_igpu         = false;
+            if (type == GGML_BACKEND_DEVICE_TYPE_IGPU && !include_other_devices && !has_discrete_gpu) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (igpu_reg != nullptr && reg != igpu_reg) {
+                    continue;
+                }
+                auto_igpu = true;
+            }
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && !auto_igpu &&
                 (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 continue;
             }
@@ -142,6 +160,19 @@ namespace sd::backend_fit {
             device.description = ggml_backend_dev_description(dev);
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            if (auto_igpu) {
+                // An iGPU reports its share of the unified pool. Without a reading it cannot be planned for,
+                // so keep the default backend instead of falling back to CPU.
+                if (free_bytes == 0 && total_bytes == 0) {
+                    LOG_WARN("auto-fit: %s did not report memory; not planning for it", device.name.c_str());
+                    continue;
+                }
+                // Vulkan's heap budget subtraction can wrap on iGPUs; the model manager reads that as total.
+                if (total_bytes > 0 && free_bytes > total_bytes) {
+                    free_bytes = total_bytes;
+                }
+                igpu_reg = ggml_backend_dev_backend_reg(dev);
+            }
             device.free_bytes = (int64_t)free_bytes;
 
             float gib = budgets.default_gib;
