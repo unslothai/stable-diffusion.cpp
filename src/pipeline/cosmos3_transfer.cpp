@@ -106,6 +106,22 @@ namespace sd::pipeline {
             return true;
         }
 
+        // [W, H, 3, 1] in [0, 1]: gray frames are replicated, alpha is dropped.
+        sd::Tensor<float> rgb_frame(const sd_image_t& image, int width, int height) {
+            auto frame             = sd_image_to_tensor(image, width, height);
+            const int64_t channels = frame.shape()[2];
+            if (channels == 3) {
+                return frame;
+            }
+            sd::Tensor<float> rgb = sd::zeros<float>({width, height, 3, 1});
+            const size_t plane    = static_cast<size_t>(width) * height;
+            for (int64_t c = 0; c < 3; ++c) {
+                const float* src = frame.data() + static_cast<size_t>(channels >= 3 ? c : 0) * plane;
+                std::copy(src, src + plane, rgb.data() + c * plane);
+            }
+            return rgb;
+        }
+
         // Control video in [0, 1], [W, H, T, 3, 1]. Precomputed control frames win;
         // otherwise an edge map is derived from the reference video's RGB frames.
         sd::Tensor<float> build_control_video(const sd_vid_gen_params_t* params, int width, int height, int frames, float edge_threshold) {
@@ -116,7 +132,11 @@ namespace sd::pipeline {
                     return {};
                 }
                 for (int i = 0; i < frames; ++i) {
-                    auto frame = sd_image_to_tensor(params->control_frames[i], width, height);
+                    if (params->control_frames[i].channel == 0) {
+                        LOG_ERROR("cosmos3: control frame %d has no channels", i);
+                        return {};
+                    }
+                    auto frame = rgb_frame(params->control_frames[i], width, height);
                     sd::ops::slice_assign(&video, 2, i, i + 1, frame.unsqueeze(2));
                 }
                 return video;
@@ -133,8 +153,12 @@ namespace sd::pipeline {
                 for (int i = 0; i < frames; ++i) {
                     const sd_image_t& frame = source.frames[i];
                     const uint8_t* rgb      = frame.data;
+                    if (frame.channel == 0) {
+                        LOG_ERROR("cosmos3: reference video frame %d has no channels", i);
+                        return {};
+                    }
                     if (static_cast<int>(frame.width) != width || static_cast<int>(frame.height) != height || frame.channel != 3) {
-                        auto resized = sd_image_to_tensor(frame, width, height);
+                        auto resized = rgb_frame(frame, width, height);
                         pixels.resize(plane * 3);
                         for (size_t p = 0; p < plane; ++p) {
                             for (int c = 0; c < 3; ++c) {
