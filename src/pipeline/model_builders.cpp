@@ -22,6 +22,7 @@
 #include "model/diffusion/iris.hpp"
 #include "model/diffusion/krea2.hpp"
 #include "model/diffusion/lens.hpp"
+#include "model/diffusion/cosmos3.hpp"
 #include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/llada_image.hpp"
 #include "model/diffusion/ltxv.hpp"
@@ -369,6 +370,13 @@ namespace sd::model_builders {
                                                                         tensor_storage_map,
                                                                         "model.diffusion_model.model.net",
                                                                         weight_manager);
+        } else if (sd_version_is_cosmos3(version)) {
+            // The text goes through the transformer's own understanding path.
+            result.diffusion = std::make_shared<Cosmos3::Cosmos3Runner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
+                                                                        tensor_storage_map,
+                                                                        "model.diffusion_model",
+                                                                        weight_manager,
+                                                                        sd_ctx_params->model_args);
         } else if (sd_version_is_sensenova_u1(version)) {
             result.conditioner = std::make_shared<SenseNovaU1Conditioner>();
             result.diffusion   = std::make_shared<SenseNovaU1::SenseNovaU1Runner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
@@ -568,6 +576,9 @@ namespace sd::model_builders {
         SDVersion vae_version = version;
         if (sd_version_is_pid(version) && vae_format != SD_VAE_FORMAT_AUTO) {
             vae_version = sd_vae_format_to_version(vae_format, vae_version);
+        }
+        if (sd_version_is_cosmos3(version)) {
+            vae_version = VERSION_WAN2_2_TI2V;
         }
 
         auto create_vae = [&]() -> std::shared_ptr<VAE> {

@@ -114,6 +114,7 @@ const char* model_version_to_str[] = {
     "Iris-3B",
     "Flux.3 Image Klein",
     "MOSS-Image",
+    "Cosmos3",
 };
 
 static_assert(VERSION_COUNT == sizeof(model_version_to_str) / sizeof(model_version_to_str[0]),
@@ -3100,7 +3101,7 @@ int StableDiffusionGGML::get_diffusion_model_down_factor() {
             down_factor = 32;
         } else if (sd_version_is_z_image_l2p(version) || version == VERSION_IRIS) {
             down_factor = 16;
-        } else if (version == VERSION_QWEN_IMAGE_2_1 || version == VERSION_MING_IMAGE || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version) || sd_version_is_pixart(version)) {
+        } else if (version == VERSION_QWEN_IMAGE_2_1 || version == VERSION_MING_IMAGE || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version) || sd_version_is_pixart(version) || sd_version_is_cosmos3(version)) {
             down_factor = 2;
         } else {
             down_factor = 1;
@@ -3118,7 +3119,7 @@ int StableDiffusionGGML::get_latent_channel() {
             latent_channel = 24;
         } else if (version == VERSION_QWEN_IMAGE_2_1) {
             latent_channel = 64;
-        } else if (version == VERSION_WAN2_2_TI2V) {
+        } else if (version == VERSION_WAN2_2_TI2V || sd_version_is_cosmos3(version)) {
             latent_channel = 48;
         } else if (sd_version_is_hunyuan_video(version)) {
             latent_channel = 32;
@@ -3179,7 +3180,7 @@ int StableDiffusionGGML::video_frames_to_latent_frames(int frames) {
         latent_frames = ((frames - 1) / 8) + 1;
     } else if (sd_version_is_minimax_h3(version)) {
         latent_frames = frames <= 5 ? 2 : ((frames - 5) / 17) * 5 + 2;
-    } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
+    } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version) || sd_version_is_cosmos3(version)) {
         latent_frames = ((frames - 1) / 4) + 1;
     }
     return latent_frames;
@@ -3195,7 +3196,7 @@ int StableDiffusionGGML::latent_frames_to_video_frames(int latent_frames) {
     if (sd_version_is_minimax_h3(version)) {
         return latent_frames <= 2 ? 5 : ((latent_frames - 2) / 5) * 17 + 5;
     }
-    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
+    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version) || sd_version_is_cosmos3(version)) {
         return (latent_frames - 1) * 4 + 1;
     }
     return latent_frames;

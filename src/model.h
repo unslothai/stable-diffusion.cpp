@@ -68,6 +68,7 @@ enum SDVersion {
     VERSION_IRIS,
     VERSION_FLUX3,
     VERSION_MOSS_IMAGE,
+    VERSION_COSMOS3,
     VERSION_COUNT,
 };
 
@@ -266,12 +267,16 @@ static inline bool sd_version_is_sensenova_u1(SDVersion version) {
     return version == VERSION_SENSENOVA_U1_5;
 }
 
+static inline bool sd_version_is_cosmos3(SDVersion version) {
+    return version == VERSION_COSMOS3;
+}
+
 static inline bool sd_version_is_pixart(SDVersion version) {
     return version == VERSION_PIXART;
 }
 
 static inline bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version);
+    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version) || sd_version_is_cosmos3(version);
 }
 
 static inline bool sd_version_supports_image_generation(SDVersion version) {
@@ -300,7 +305,7 @@ static inline bool sd_version_uses_flux2_vae(SDVersion version) {
 }
 
 static inline bool sd_version_uses_wan_vae(SDVersion version) {
-    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_qwen_image(version) || sd_version_is_krea2(version) || sd_version_is_anima(version) || version == VERSION_MING_IMAGE) {
+    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_cosmos3(version) || sd_version_is_qwen_image(version) || sd_version_is_krea2(version) || sd_version_is_anima(version) || version == VERSION_MING_IMAGE) {
         return true;
     }
     return false;
@@ -351,7 +356,8 @@ static inline bool sd_version_is_dit(SDVersion version) {
         sd_version_is_sensenova_u1(version) ||
         sd_version_is_pixart(version) ||
         version == VERSION_IRIS ||
-        version == VERSION_MOSS_IMAGE) {
+        version == VERSION_MOSS_IMAGE ||
+        sd_version_is_cosmos3(version)) {
         return true;
     }
     return false;
