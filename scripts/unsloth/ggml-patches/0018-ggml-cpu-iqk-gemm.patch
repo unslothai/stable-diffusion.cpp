@@ -1047,8 +1047,8 @@ index 0000000..1899fd7
 +// x86 default (GGML_CPU_IQK unset), from test-backend-ops MUL_MAT perf (m = 4096, k = 14336) on Zen 3 (EPYC 7763),
 +// Zen 4 (EPYC 9V74), Zen 5 (EPYC 9V45), Xeon 8370C / 8573C and Core i7-8700B, iqk vs the path that runs otherwise:
 +//   ne11 = 1: vec_dot; iqk was slower for iq1_m / iq2_s / iq2_xxs (0.63-0.89x) and even for the others;
-+//   ne11 = 2..7: iqk, 1.07-3.2x faster than vec_dot (lowest: q6_K at ne11 = 2 on Zen 4, 0.96x);
-+//   ne11 = 8: iqk ahead of tiled, 1.15-2.9x, except iq2_xxs / iq3_s (0.84x / 0.91x on Zen 5);
++//   ne11 = 2..7: iqk, 1.05-3.2x faster than vec_dot (lowest: q6_K at ne11 = 2 on Zen 4, 0.96x);
++//   ne11 = 8: iqk ahead of tiled, 1.02-2.9x, except iq2_xxs / iq3_s (0.84x / 0.91x on Zen 5);
 +//   ne11 = 9..12: iqk for q2_K..q6_K (1.01-2.3x); the I-quants measured slower than tiled there;
 +//   ne11 > 12: tiled (iqk 0.16-0.98x from ne11 = 16 up; ne11 = 512: 0.19-0.91x).
 +int ggml_cpu_iqk_mode(int type, int64_t ne11) {
