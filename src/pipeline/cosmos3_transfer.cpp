@@ -21,6 +21,7 @@
 #include "core/util.h"
 #include "diffusion_engine.h"
 #include "model/diffusion/cosmos3.hpp"
+#include "pipeline/cosmos3_prompt.h"
 #include "pipeline/cosmos3_transfer_utils.h"
 #include "runtime/edge_control.h"
 #include "tokenizers/qwen2_tokenizer.h"
@@ -213,7 +214,7 @@ namespace sd::pipeline {
         if (dbg != nullptr && read_raw(debug_path(dbg, "text_ids.bin"), &dbg_ids, 0)) {
             LOG_INFO("cosmos3 debug: using %zu text token ids from %s", dbg_ids.size(), dbg);
             text_ids = dbg_ids;
-        } else if (!tokenize_prompt(request.prompt, &text_ids)) {
+        } else if (!tokenize_prompt(sd::cosmos3::format_prompt(request.prompt, frames, static_cast<float>(fps), height, width), &text_ids)) {
             return false;
         }
         // Split layout: caption tokens, EOS, start-of-generation.
