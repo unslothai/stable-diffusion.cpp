@@ -272,6 +272,7 @@ namespace Cosmos3 {
         // Numerical-comparison hook: return the generation hidden states after this
         // layer (num_layers = after the final norm) instead of the velocity.
         int64_t debug_stop_layer = -1;
+        bool debug_capture       = std::getenv("SD_COSMOS3_DEBUG_CAPTURE") != nullptr;
 
         std::vector<float> und_pe_vec;
         std::vector<float> gen_pe_vec;
@@ -421,6 +422,9 @@ namespace Cosmos3 {
                     attn->project(ctx, layer->input_norm(ctx, und, false), und_pe, false, &q_u, &und_k, &und_v);
                     auto und_out = attn->attend(ctx, q_u, und_k, und_v, mask, false);
                     und          = layer->ffn(ctx, ggml_add(gctx, und, und_out), false);
+                    if (debug_capture) {
+                        ctx->capture_tensor("und_l" + std::to_string(i), und);
+                    }
                     ctx->persist_cache_tensor(cache_name("und", i, "k"), und_k);
                     ctx->persist_cache_tensor(cache_name("und", i, "v"), und_v);
                 } else {
@@ -448,6 +452,9 @@ namespace Cosmos3 {
                     ctx->persist_cache_tensor(cache_name("hist", i, "v"), trim_history(gctx, past_v, update));
                 }
                 gen = layer->ffn(ctx, ggml_add(gctx, gen, gen_out), true);
+                if (debug_capture) {
+                    ctx->capture_tensor("gen_l" + std::to_string(i), gen);
+                }
                 if (i == debug_stop_layer) {
                     ggml_build_forward_expand(graph, gen);
                     return graph;
