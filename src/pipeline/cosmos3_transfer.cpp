@@ -130,7 +130,7 @@ namespace sd::pipeline {
                         for (int x = 0; x < width; ++x) {
                             for (int c = 0; c < 3; ++c) {
                                 pixels[(static_cast<size_t>(y) * width + x) * 3 + c] =
-                                    static_cast<uint8_t>(std::lround(std::min(std::max(rgb.index(x, y, c), 0.f), 1.f) * 255.f));
+                                    static_cast<uint8_t>(std::lround(std::min(std::max(rgb.data()[(static_cast<size_t>(c) * height + y) * width + x], 0.f), 1.f) * 255.f));
                             }
                         }
                     }
@@ -198,6 +198,9 @@ namespace sd::pipeline {
             if (control_latents.empty()) {
                 LOG_ERROR("cosmos3: control video encode failed");
                 return false;
+            }
+            if (dbg != nullptr) {
+                write_raw(debug_path(dbg, "port_control_latents.bin"), control_latents.data(), static_cast<size_t>(control_latents.numel()));
             }
         }
         const int64_t t_encoded = ggml_time_ms();
@@ -330,6 +333,12 @@ namespace sd::pipeline {
 
         if (dbg != nullptr) {
             write_raw(debug_path(dbg, "port_output_latents.bin"), output.data(), static_cast<size_t>(output.numel()));
+            std::vector<float> ref_latents;
+            if (std::getenv("SD_COSMOS3_DEBUG_DECODE_REF") != nullptr &&
+                read_raw(debug_path(dbg, "ref_output_latents.bin"), &ref_latents, static_cast<size_t>(output.numel()))) {
+                LOG_INFO("cosmos3 debug: decoding the reference latents instead");
+                std::copy(ref_latents.begin(), ref_latents.end(), output.data());
+            }
         }
         const float pixel_frames = static_cast<float>((n_latent - 1) * 4 + 1);
         LOG_INFO("cosmos3: %" PRId64 " latent frames in %.2fs (%.1f ms per latent frame, %.2f output fps excluding VAE)",
@@ -344,6 +353,26 @@ namespace sd::pipeline {
         LOG_INFO("cosmos3: decoded in %.2fs, total %.2fs", (ggml_time_ms() - decode_start) / 1000.f, (ggml_time_ms() - t0) / 1000.f);
         if (video.shape()[2] > frames) {
             video = sd::ops::slice(video, 2, 0, frames);
+        }
+        if (dbg != nullptr) {
+            // [T, H, W, 3] uint8, the layout of the reference frame dump.
+            const int64_t W = video.shape()[0], H = video.shape()[1], T = video.shape()[2];
+            std::vector<uint8_t> bytes(static_cast<size_t>(T * H * W * 3));
+            for (int64_t t = 0; t < T; ++t) {
+                for (int64_t y = 0; y < H; ++y) {
+                    for (int64_t x = 0; x < W; ++x) {
+                        for (int64_t c = 0; c < 3; ++c) {
+                            const float v = std::min(std::max(video.index(x, y, t, c, 0), 0.f), 1.f);
+                            bytes[static_cast<size_t>(((t * H + y) * W + x) * 3 + c)] = static_cast<uint8_t>(v * 255.f);
+                        }
+                    }
+                }
+            }
+            FILE* f = std::fopen(debug_path(dbg, "port_frames_u8.bin").c_str(), "wb");
+            if (f != nullptr) {
+                std::fwrite(bytes.data(), 1, bytes.size(), f);
+                std::fclose(f);
+            }
         }
         const int count = static_cast<int>(video.shape()[2]);
         sd_image_t* images = static_cast<sd_image_t*>(calloc(static_cast<size_t>(count), sizeof(sd_image_t)));
