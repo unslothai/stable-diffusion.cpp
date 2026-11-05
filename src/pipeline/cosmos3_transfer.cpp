@@ -190,6 +190,19 @@ namespace sd::pipeline {
         if (control.empty()) {
             return false;
         }
+        if (dbg != nullptr) {
+            // Channel 0 of the control video as [T, H, W] uint8.
+            const size_t count = static_cast<size_t>(width) * height * frames;
+            std::vector<uint8_t> bytes(count);
+            for (size_t i = 0; i < count; ++i) {
+                bytes[i] = static_cast<uint8_t>(std::lround(std::min(std::max(control.data()[i], 0.f), 1.f) * 255.f));
+            }
+            FILE* f = std::fopen(debug_path(dbg, "port_control_u8.bin").c_str(), "wb");
+            if (f != nullptr) {
+                std::fwrite(bytes.data(), 1, bytes.size(), f);
+                std::fclose(f);
+            }
+        }
 
         sd::Tensor<float> control_latents;
         std::vector<float> dbg_latents;
