@@ -169,6 +169,11 @@ namespace Cosmos3 {
             auto gctx = ctx->ggml_ctx;
             auto k    = ggml_cont(gctx, ggml_permute(gctx, k_store, 0, 2, 1, 3));  // [d, Lk, kv_heads]
             auto v    = ggml_reshape_4d(gctx, v_store, v_store->ne[0], v_store->ne[1], v_store->ne[2], 1);
+            if (flash_attn && mask != nullptr && mask->ne[0] > k->ne[1]) {
+                const int pad = static_cast<int>(mask->ne[0] - k->ne[1]);
+                k             = ggml_pad(gctx, k, 0, pad, 0, 0);
+                v             = ggml_pad(gctx, v, 0, 0, pad, 0);
+            }
             auto out  = ggml_ext_attention_ext(gctx,
                                                ctx->backend,
                                                q,
@@ -280,6 +285,8 @@ namespace Cosmos3 {
         std::vector<float> und_pe_vec;
         std::vector<float> gen_pe_vec;
         std::vector<float> causal_mask_vec;
+        std::vector<float> kv_pad_mask_vec;
+        bool pad_gen_kv = std::getenv("SD_COSMOS3_NO_KV_PAD") == nullptr;
         std::vector<float> timestep_vec;
 
         Cosmos3Runner(ggml_backend_t backend,
@@ -414,6 +421,21 @@ namespace Cosmos3 {
                 set_backend_tensor_data(mask, causal_mask_vec.data());
             }
 
+            // CUDA flash attention reads keys in blocks of 256; pad the generation keys
+            // to that and mask the padding off.
+            ggml_tensor* kv_pad_mask = nullptr;
+            {
+                const int64_t kv_len = (with_text ? text_ids.numel() : und_tokens) + hist_tokens + patches_tensor.shape()[1];
+                const int64_t padded = (kv_len + 255) / 256 * 256;
+                if (padded != kv_len && pad_gen_kv) {
+                    kv_pad_mask_vec.assign(static_cast<size_t>(padded), 0.f);
+                    std::fill(kv_pad_mask_vec.begin() + kv_len, kv_pad_mask_vec.end(), -INFINITY);
+                    kv_pad_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, padded, 1);
+                    ggml_set_name(kv_pad_mask, "cosmos3.kv_pad_mask");
+                    set_backend_tensor_data(kv_pad_mask, kv_pad_mask_vec.data());
+                }
+            }
+
             for (int64_t i = 0; i < config.num_layers; ++i) {
                 auto layer = model.layer(i);
                 auto attn  = layer->attention();
@@ -449,7 +471,7 @@ namespace Cosmos3 {
 
                 auto all_k   = ggml_concat(gctx, und_k, past_k, 2);
                 auto all_v   = ggml_concat(gctx, und_v, past_v, 2);
-                auto gen_out = attn->attend(ctx, q_g, all_k, all_v, nullptr, true, ctx->flash_attn_enabled);
+                auto gen_out = attn->attend(ctx, q_g, all_k, all_v, ctx->flash_attn_enabled ? kv_pad_mask : nullptr, true, ctx->flash_attn_enabled);
                 if (update.write) {
                     ctx->persist_cache_tensor(cache_name("hist", i, "k"), trim_history(gctx, past_k, update));
                     ctx->persist_cache_tensor(cache_name("hist", i, "v"), trim_history(gctx, past_v, update));
