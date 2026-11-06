@@ -89,7 +89,7 @@ namespace Cosmos3 {
     };
 
     // Holds the K/V the next gen forward needs: text keys of the understanding
-    // path and the cached clean control/RGB frames, both as [d_head, kv_heads, tokens].
+    // path and the cached clean control/RGB frames, both as [d_head, tokens, kv_heads].
     struct LayerKV {
         ggml_tensor* und_k  = nullptr;
         ggml_tensor* und_v  = nullptr;
@@ -132,8 +132,8 @@ namespace Cosmos3 {
             return std::dynamic_pointer_cast<LLM::LLMRMSNorm>(blocks[name]);
         }
 
-        // x: [hidden, L]. Returns q roped as [d, L, heads], k roped as storage
-        // [d, kv_heads, L] (F16) and v as [d, kv_heads, L] (F16).
+        // x: [hidden, L]. Returns q roped as [d, L, heads] and k, v as F16 [d, L, kv_heads]: the layout
+        // flash attention reads, so the cached history is concatenated and attended without a copy.
         void project(GGMLRunnerContext* ctx,
                      ggml_tensor* x,
                      ggml_tensor* pe,
@@ -153,10 +153,9 @@ namespace Cosmos3 {
             k                    = norm(generation ? "norm_added_k" : "norm_k")->forward(ctx, k);
             q                    = Rope::apply_rope(ctx, q, pe, false);  // [d, L, heads]
             k                    = Rope::apply_rope(ctx, k, pe, false);  // [d, L, kv_heads]
-            k                    = ggml_cont(gctx, ggml_permute(gctx, k, 0, 2, 1, 3));
             *q_out               = q;
             *k_store             = ggml_cast(gctx, k, GGML_TYPE_F16);
-            *v_store             = ggml_cast(gctx, v, GGML_TYPE_F16);
+            *v_store             = ggml_cast(gctx, ggml_permute(gctx, v, 0, 2, 1, 3), GGML_TYPE_F16);
         }
 
         ggml_tensor* attend(GGMLRunnerContext* ctx,
@@ -166,12 +165,12 @@ namespace Cosmos3 {
                             ggml_tensor* mask,
                             bool generation) {
             auto gctx = ctx->ggml_ctx;
-            auto k    = ggml_cont(gctx, ggml_permute(gctx, k_store, 0, 2, 1, 3));  // [d, Lk, kv_heads]
-            auto v    = ggml_reshape_4d(gctx, v_store, v_store->ne[0], v_store->ne[1], v_store->ne[2], 1);
+            // attention_ext takes v as [d, kv_heads, Lk] and permutes it back: a view, no copy.
+            auto v    = ggml_permute(gctx, v_store, 0, 2, 1, 3);
             auto out  = ggml_ext_attention_ext(gctx,
                                                ctx->backend,
                                                q,
-                                               k,
+                                               k_store,
                                                v,
                                                config.num_heads,
                                                mask,
@@ -353,18 +352,19 @@ namespace Cosmos3 {
         }
 
         ggml_tensor* trim_history(ggml_context* ctx, ggml_tensor* x, const HistoryUpdate& update) {
-            const int64_t total = x->ne[2];
+            // x: [d, tokens, kv_heads].
+            const int64_t total = x->ne[1];
             if (update.keep_recent_tokens < 0 || total - update.sink_tokens <= update.keep_recent_tokens) {
                 return x;
             }
             const int64_t sink   = std::min(update.sink_tokens, total);
             const int64_t recent = update.keep_recent_tokens;
-            auto tail            = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], recent, x->nb[1], x->nb[2], (total - recent) * x->nb[2]);
+            auto tail            = ggml_view_3d(ctx, x, x->ne[0], recent, x->ne[2], x->nb[1], x->nb[2], (total - recent) * x->nb[1]);
             if (sink == 0) {
                 return ggml_cont(ctx, tail);
             }
-            auto head = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], sink, x->nb[1], x->nb[2], 0);
-            return ggml_concat(ctx, ggml_cont(ctx, head), ggml_cont(ctx, tail), 2);
+            auto head = ggml_view_3d(ctx, x, x->ne[0], sink, x->ne[2], x->nb[1], x->nb[2], 0);
+            return ggml_concat(ctx, ggml_cont(ctx, head), ggml_cont(ctx, tail), 1);
         }
 
         int64_t trimmed_length(int64_t total, const HistoryUpdate& update) const {
@@ -449,11 +449,11 @@ namespace Cosmos3 {
                 ggml_tensor* hist_k = hist_tokens > 0 ? ctx->load_cache_tensor(cache_name("hist", i, "k")) : nullptr;
                 ggml_tensor* hist_v = hist_tokens > 0 ? ctx->load_cache_tensor(cache_name("hist", i, "v")) : nullptr;
                 GGML_ASSERT(hist_tokens == 0 || (hist_k != nullptr && hist_v != nullptr));
-                ggml_tensor* past_k = hist_k != nullptr ? ggml_concat(gctx, hist_k, gen_k, 2) : gen_k;
-                ggml_tensor* past_v = hist_v != nullptr ? ggml_concat(gctx, hist_v, gen_v, 2) : gen_v;
+                ggml_tensor* past_k = hist_k != nullptr ? ggml_concat(gctx, hist_k, gen_k, 1) : gen_k;
+                ggml_tensor* past_v = hist_v != nullptr ? ggml_concat(gctx, hist_v, gen_v, 1) : gen_v;
 
-                auto all_k   = ggml_concat(gctx, und_k, past_k, 2);
-                auto all_v   = ggml_concat(gctx, und_v, past_v, 2);
+                auto all_k   = ggml_concat(gctx, und_k, past_k, 1);
+                auto all_v   = ggml_concat(gctx, und_v, past_v, 1);
                 auto gen_out = attn->attend(ctx, q_g, all_k, all_v, nullptr, true);
                 if (update.write) {
                     ctx->persist_cache_tensor(cache_name("hist", i, "k"), trim_history(gctx, past_k, update));
