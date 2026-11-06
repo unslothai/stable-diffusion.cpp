@@ -42,8 +42,9 @@ namespace sd::backend_fit {
     struct Device {
         std::string name;
         std::string description;
-        int64_t free_bytes   = 0;
-        int64_t budget_bytes = 0;
+        int64_t free_bytes              = 0;
+        int64_t budget_bytes            = 0;
+        enum ggml_backend_dev_type type = GGML_BACKEND_DEVICE_TYPE_GPU;
     };
 
     enum class ParamsLocation {
@@ -133,13 +134,14 @@ namespace sd::backend_fit {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             const auto type        = ggml_backend_dev_type(dev);
-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
                 (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 continue;
             }
             Device device;
             device.name        = ggml_backend_dev_name(dev);
             device.description = ggml_backend_dev_description(dev);
+            device.type        = type;
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
             device.free_bytes = (int64_t)free_bytes;
@@ -183,7 +185,7 @@ namespace sd::backend_fit {
         vm_statistics64_data_t stats{};
         mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
         const bool ok                = host_page_size(host, &page_size) == KERN_SUCCESS &&
-                        host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS;
+                                       host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS;
         mach_port_deallocate(mach_task_self(), host);
         if (ok) {
             return ((int64_t)stats.free_count + stats.inactive_count) * page_size;
@@ -193,14 +195,23 @@ namespace sd::backend_fit {
     }
 
     static size_t select_main_device(const std::vector<Device>& devices) {
-        size_t main_device = SIZE_MAX;
-        for (size_t di = 0; di < devices.size(); ++di) {
-            if (devices[di].budget_bytes > 0 &&
-                (main_device == SIZE_MAX || devices[di].budget_bytes > devices[main_device].budget_bytes)) {
-                main_device = di;
+        // Shared system memory must not make an integrated GPU outrank a discrete GPU.
+        for (bool discrete : {true, false}) {
+            size_t main_device = SIZE_MAX;
+            for (size_t di = 0; di < devices.size(); ++di) {
+                if ((devices[di].type == GGML_BACKEND_DEVICE_TYPE_GPU) != discrete) {
+                    continue;
+                }
+                if (devices[di].budget_bytes > 0 &&
+                    (main_device == SIZE_MAX || devices[di].budget_bytes > devices[main_device].budget_bytes)) {
+                    main_device = di;
+                }
+            }
+            if (main_device != SIZE_MAX) {
+                return main_device;
             }
         }
-        return main_device;
+        return SIZE_MAX;
     }
 
     static Plan compute_plan(const std::vector<Component>& components,
@@ -262,10 +273,10 @@ namespace sd::backend_fit {
 
             const auto& runtime_devices = plan.runtimes[ci].devices;
             const bool fits_runtime     = !runtime_devices.empty() &&
-                                      std::all_of(runtime_devices.begin(), runtime_devices.end(), [&](size_t di) {
+                                          std::all_of(runtime_devices.begin(), runtime_devices.end(), [&](size_t di) {
                                           const int64_t headroom = headroom_for(ci, di);
                                           return headroom <= remaining[di] && comp.params_bytes <= remaining[di] - headroom;
-                                      });
+                                          });
             if (fits_runtime) {
                 decision.params_location = ParamsLocation::MAIN_GPU;
                 decision.params_device   = runtime_devices.front();

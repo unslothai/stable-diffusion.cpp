@@ -1,10 +1,12 @@
 #include "model_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <iterator>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 
@@ -571,7 +573,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
                 ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
             if (compute_buffer == nullptr) {
                 LOG_ERROR("model manager alloc compute params backend buffer failed, num_tensors = %zu",
-                              staged_tensors.size());
+                          staged_tensors.size());
                 ggml_free(staging_ctx);
                 return false;
             }
@@ -695,8 +697,8 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
             // The temporary runner is destroyed before this manager call returns.
             auto borrowed_manager = std::shared_ptr<ModelManager>(this, [](ModelManager*) {});
             auto lora             = std::make_shared<LoraModel>(id, compute_backend, target->params_backend,
-                                                    borrowed_manager, lora_spec.file_id, lora_version_,
-                                                    target->residency_mode);
+                                                                borrowed_manager, lora_spec.file_id, lora_version_,
+                                                                target->residency_mode);
 
             LoraModel::filter_t lora_tensor_filter = nullptr;
             if (!lora_spec.tensor_name_prefix_filter.empty()) {
@@ -1466,8 +1468,8 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
 
         const bool params_follow_compute = state->params_follow_compute_backend ||
                                            state->residency_mode == ResidencyMode::Disk;
-        const bool compute_changes = state->compute_backend != compute_backend;
-        const bool params_changes  = params_follow_compute && state->params_backend != compute_backend;
+        const bool compute_changes       = state->compute_backend != compute_backend;
+        const bool params_changes        = params_follow_compute && state->params_backend != compute_backend;
         if (!compute_changes && !params_changes) {
             continue;
         }
@@ -1559,7 +1561,7 @@ size_t ModelManager::compute_backend_resident_bytes(ggml_backend_t compute_backe
                                                      ? buffer_type != nullptr && ggml_backend_buft_get_device(buffer_type) == compute_device
                                                      : std::any_of(split_devices->second.begin(), split_devices->second.end(), [&](const auto& entry) {
                                          return ggml_backend_get_device(entry.first) == compute_device;
-                                     });
+                                                       });
         if (!on_device) {
             return;
         }
@@ -1828,10 +1830,16 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
     const size_t missing = compute_backend_alloc_size(states, true);
     // Backend scratch buffers and pipelines are not included in graph measurements.
-    constexpr size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
-    result.required_device_bytes   = add(add(request.pending_allocation_bytes, missing), safety_margin);
-    result.required_budget_bytes   = add(request.runtime_peak_bytes(), missing);
-    auto available_device_bytes    = [&](ggml_backend_t backend) {
+    size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
+#ifdef _WIN32
+    if (sd_backend_is(request.compute_backend, "CUDA")) {
+        // Avoid WDDM allocation churn when transient buffers compete with reusable staging buffers.
+        safety_margin = 1024ULL * 1024ULL * 1024ULL;
+    }
+#endif
+    result.required_device_bytes = add(add(request.pending_allocation_bytes, missing), safety_margin);
+    result.required_budget_bytes = add(request.runtime_peak_bytes(), missing);
+    auto available_device_bytes  = [&](ggml_backend_t backend) {
         auto device = ggml_backend_get_device(backend);
         if (device == nullptr) {
             return SIZE_MAX;
@@ -1857,10 +1865,10 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         const size_t resident         = add(weights_resident, add(other_runtime, request.runtime_resident_bytes));
         if (log_details) {
             LOG_WARN("model manager memory on %s: reported free %.2f MB / total %.2f MB, tracked weights %.2f MB / other runtime %.2f MB / current runtime %.2f MB",
-                        ggml_backend_name(backend),
-                        free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
-                        weights_resident / (1024.0 * 1024.0), other_runtime / (1024.0 * 1024.0),
-                        request.runtime_resident_bytes / (1024.0 * 1024.0));
+                     ggml_backend_name(backend),
+                     free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
+                     weights_resident / (1024.0 * 1024.0), other_runtime / (1024.0 * 1024.0),
+                     request.runtime_resident_bytes / (1024.0 * 1024.0));
         }
         if (free_bytes == 0 && total_bytes == 0) {
             return SIZE_MAX;
@@ -1872,7 +1880,7 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             }
             // A wrapped report may reflect real pressure; reclaim before accepting the tracked estimate.
             LOG_VERBOSE("ignoring impossible free memory report on %s (%.2f MB free / %.2f MB total), using tracked residency",
-                           ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+                        ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
             free_bytes                  = total_bytes;
             result.requires_reclamation = true;
         }
@@ -1995,21 +2003,21 @@ bool ModelManager::ensure_compute_backend_capacity(
         }
         const bool reloadable = state->residency_mode == ResidencyMode::Disk ||
                                 state->compute_backend != state->params_backend;
-        const bool resident = state->compute_backend == state->params_backend
-                                  ? state->loaded_to_params_backend
-                                  : state->staged_to_compute_backend;
+        const bool resident   = state->compute_backend == state->params_backend
+                                    ? state->loaded_to_params_backend
+                                    : state->staged_to_compute_backend;
         if (reloadable && resident) {
             eviction_states.insert(state);
         }
     };
     size_t last_eviction_count   = 0;
     auto release_eviction_states = [&]() {
-        if (eviction_states.size() == last_eviction_count) {
-            return false;
+        if (eviction_states.size() != last_eviction_count) {
+            last_eviction_count = eviction_states.size();
+            release_compute_staging_blocks(false, &eviction_states);
+            release_params_storage_blocks(false, &eviction_states);
         }
-        last_eviction_count = eviction_states.size();
-        release_compute_staging_blocks(false, &eviction_states);
-        release_params_storage_blocks(false, &eviction_states);
+        // Device memory reports can lag behind releases even when no new candidates are added.
         return fits();
     };
 
@@ -2088,10 +2096,30 @@ bool ModelManager::ensure_compute_backend_capacity(
     }
     revert_demotions();
 
-    if (check_capacity(request, required_states).fits()) {
+    auto capacity = check_capacity(request, required_states);
+    if (!capacity.requires_reclamation && capacity.fits()) {
         return true;
     }
-    const auto capacity                = check_capacity(request, required_states, true);
+    if (sd_backend_is(compute_backend, "Vulkan") &&
+        capacity.required_budget_bytes <= capacity.available_budget_bytes) {
+        ggml_backend_synchronize(compute_backend);
+        sd_backend_clear_buffer_cache(compute_backend);
+        // Vulkan heap usage can lag behind buffer releases. Fast memory queries
+        // must not turn that reporting delay into an allocation failure.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        for (;;) {
+            capacity = check_capacity(request, required_states);
+            if (!capacity.requires_reclamation && capacity.fits()) {
+                return true;
+            }
+            if (capacity.required_budget_bytes > capacity.available_budget_bytes ||
+                std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    capacity                           = check_capacity(request, required_states, true);
     const std::string available_device = capacity.available_device_bytes == SIZE_MAX
                                              ? "unknown"
                                              : sd_format("%.2f MB", capacity.available_device_bytes / (1024.0 * 1024.0));
