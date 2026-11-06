@@ -1788,7 +1788,8 @@ ArgOptions SDGenerationParams::get_options() {
          on_ref_image_arg},
         {"",
          "--ref-video",
-         "MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used multiple times)",
+         "MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used multiple times); "
+         "for Cosmos3 transfer, the RGB frames to derive edge control from",
          on_ref_video_arg},
         {"",
          "--ref-video-audio",

@@ -22,6 +22,7 @@
 #include "model/diffusion/iris.hpp"
 #include "model/diffusion/krea2.hpp"
 #include "model/diffusion/lens.hpp"
+#include "model/diffusion/cosmos3.hpp"
 #include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/llada_image.hpp"
 #include "model/diffusion/ltxv.hpp"
@@ -369,6 +370,13 @@ namespace sd::model_builders {
                                                                         tensor_storage_map,
                                                                         "model.diffusion_model.model.net",
                                                                         weight_manager);
+        } else if (sd_version_is_cosmos3(version)) {
+            result.conditioner = std::make_shared<Cosmos3Conditioner>();
+            result.diffusion   = std::make_shared<Cosmos3::Cosmos3Runner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
+                                                                        tensor_storage_map,
+                                                                        "model.diffusion_model",
+                                                                        weight_manager,
+                                                                        sd_ctx_params->model_args);
         } else if (sd_version_is_sensenova_u1(version)) {
             result.conditioner = std::make_shared<SenseNovaU1Conditioner>();
             result.diffusion   = std::make_shared<SenseNovaU1::SenseNovaU1Runner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
@@ -540,13 +548,15 @@ namespace sd::model_builders {
             return false;
         }
 
+        // Cosmos3 uses the Wan2.2 TI2V autoencoder (48 channels, 16x).
+        const SDVersion video_vae_version = sd_version_is_cosmos3(version) ? VERSION_WAN2_2_TI2V : version;
         auto create_tae = [&](bool decode_only) -> std::shared_ptr<VAE> {
             if ((sd_version_uses_wan_vae(version) && version != VERSION_QWEN_IMAGE_2_1) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version)) {
                 return std::make_shared<TinyVideoAutoEncoder>(ctx.backends.runtime_backend(SDBackendModule::VAE),
                                                               tensor_storage_map,
                                                               "decoder",
                                                               decode_only,
-                                                              version,
+                                                              video_vae_version,
                                                               weight_manager);
 
             } else {
@@ -568,6 +578,9 @@ namespace sd::model_builders {
         SDVersion vae_version = version;
         if (sd_version_is_pid(version) && vae_format != SD_VAE_FORMAT_AUTO) {
             vae_version = sd_vae_format_to_version(vae_format, vae_version);
+        }
+        if (sd_version_is_cosmos3(version)) {
+            vae_version = video_vae_version;
         }
 
         auto create_vae = [&]() -> std::shared_ptr<VAE> {

@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "conditioning/wan_audio.h"
+#include "cosmos3_transfer.h"
 #include "core/rng.hpp"
 #include "core/rng_philox.hpp"
 #include "diffusion_engine.h"
@@ -1587,6 +1588,10 @@ namespace sd::pipeline {
         if (!sd->apply_loras(sd_vid_gen_params->loras, sd_vid_gen_params->lora_count))
             return false;
         sd->reset_generation_extensions();
+
+        if (sd_version_is_cosmos3(sd->version)) {
+            return generate_cosmos3_transfer_video(sd, sd_vid_gen_params, request, frames_out, num_frames_out);
+        }
 
         SamplePlan plan(sd, sd_vid_gen_params, request);
         auto latent_inputs_opt = prepare_video_generation_latents(sd, sd_vid_gen_params, &request);
