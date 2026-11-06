@@ -76,9 +76,9 @@ on a B200, logged once). cuDNN runs F16 with F32 accumulation: for the H3 DiT at
 takes about 8 ms per attention call on a B200 against 28 ms for the sage kernel and 43 ms for the
 ggml flash attention kernel, and it is closer to an exact (fp64) reference than either, so frames
 and audio differ slightly from the previous kernels. `GGML_CUDA_CUDNN_ATTN=0` restores them and
-`GGML_CUDA_CUDNN_ATTN=1` uses cuDNN for the flash attention op on any Ampere or newer GPU;
-`GGML_CUDA_CUDNN_SAGE=0` / `=1` does the same for the sage op only, and
-`GGML_CUDA_CUDNN_ATTN_BF16=1` runs cuDNN in BF16 (less accurate, same speed).
+`GGML_CUDA_CUDNN_ATTN=1` uses cuDNN for the flash attention op on any Ampere or newer GPU, and
+`GGML_CUDA_CUDNN_ATTN_BF16=1` runs cuDNN in BF16 (less accurate, same speed). The sage op no
+longer has a cuDNN path: SageAttention moved out of ggml upstream, so `GGML_CUDA_CUDNN_SAGE` is gone.
 
 The video VAE decodes one 16x16 latent tile (256x256 pixels) per decoder graph by default.
 `SD_H3_VAE_TILE=N` uses N x N latent tiles instead, overriding `--vae-tile-size` (20 decodes
