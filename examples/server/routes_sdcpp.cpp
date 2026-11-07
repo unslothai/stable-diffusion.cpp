@@ -178,6 +178,7 @@ static json make_vid_gen_defaults_json(const SDGenerationParams& defaults, const
         {"seed", defaults.seed},
         {"video_frames", defaults.video_frames},
         {"image_preprocess", defaults.image_preprocess},
+        {"ref_image_args", defaults.ref_image_args},
         {"fps", defaults.fps},
         {"moe_boundary", defaults.moe_boundary},
         {"vace_strength", defaults.vace_strength},
@@ -206,22 +207,26 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
 
+/** Builds the default feature set advertised for vid_gen requests. */
 static json make_vid_gen_features_json() {
     return {
         {"init_image", true},
         {"end_image", true},
         {"control_frames", true},
+        {"ref_videos", true},
+        {"ref_audios", true},
+        {"ref_video_audios", true},
         {"high_noise_sample_params", true},
         {"lora", true},
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -234,6 +239,7 @@ static json make_preview_modes_json() {
     return modes;
 }
 
+/** Builds the /capabilities payload: model, defaults, limits and feature maps. */
 static json make_capabilities_json(ServerRuntime& runtime) {
     refresh_lora_cache(runtime);
     refresh_upscaler_cache(runtime);
@@ -350,8 +356,10 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     const json generation_features = model_generation_features(runtime);
     auto recipe_features           = [&](json features, bool video) {
         features["init_image"] = generation_features.at(video ? "init_image" : "img2img");
-        for (const char* key : {"mask_image", "ref_images", "end_image", "control_frames", "lora", "vae_tiling", "cache", "preview"}) {
-            if (features.contains(key) || std::string(key) == "ref_images")
+        for (const char* key : {"mask_image", "ref_images", "end_image", "control_frames", "ref_videos", "ref_audios", "ref_video_audios", "lora", "vae_tiling", "cache", "preview"}) {
+            if (features.contains(key) || std::string(key) == "ref_images" ||
+                (video && (std::string(key) == "ref_videos" || std::string(key) == "ref_audios" ||
+                           std::string(key) == "ref_video_audios")))
                 features[key] = generation_features.at(key);
         }
         if (video)
@@ -380,8 +388,8 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json top_level_defaults       = json::object();
     json top_level_output_formats = json::array();
     json top_level_features       = {
-              {"cancel_queued", true},
-              {"cancel_generating", false},
+        {"cancel_queued", true},
+        {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -409,14 +417,14 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     result["defaults"]            = top_level_defaults;
     result["defaults_by_mode"]    = defaults_by_mode;
     result["limits"]              = {
-                     {"min_width", 64},
-                     {"max_width", 4096},
-                     {"min_height", 64},
-                     {"max_height", 4096},
-                     {"max_batch_count", 8},
-                     {"max_queue_size", manager.max_pending_jobs},
-                     {"max_upscale_width", k_max_upscale_dimension},
-                     {"max_upscale_height", k_max_upscale_dimension},
+        {"min_width", 64},
+        {"max_width", k_max_generation_dimension},
+        {"min_height", 64},
+        {"max_height", k_max_generation_dimension},
+        {"max_batch_count", 8},
+        {"max_queue_size", manager.max_pending_jobs},
+        {"max_upscale_width", k_max_upscale_dimension},
+        {"max_upscale_height", k_max_upscale_dimension},
     };
     result["samplers"]               = samplers;
     result["schedulers"]             = schedulers;
@@ -457,7 +465,7 @@ static bool parse_img_gen_request(const json& body,
         error_message = "invalid generation parameters";
         return false;
     }
-    return true;
+    return validate_server_img_gen_request(runtime, request, error_message);
 }
 
 static bool parse_vid_gen_request(const json& body,
@@ -519,7 +527,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 const bool valid  = value.is_number_unsigned()
                                         ? value.get<uint64_t>() <= static_cast<uint64_t>(std::numeric_limits<int>::max())
                                         : value.is_number_integer() && value.get<int64_t>() >= std::numeric_limits<int>::min() &&
-                                             value.get<int64_t>() <= std::numeric_limits<int>::max();
+                                              value.get<int64_t>() <= std::numeric_limits<int>::max();
                 if (!valid) {
                     res.status = 400;
                     res.set_content(json({{"error", std::string(key) + " must be a 32-bit integer"}}).dump(), "application/json");
@@ -608,19 +616,20 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
 
             SDImageOwner current(input.release());
+            std::string generation_info;
             for (int i = 0; i < repeats; ++i) {
-                sd_image_t* out_images = nullptr;
-                int out_count          = 0;
-                if (!upscale(upscaler_ctx.get(), current.get(), (uint32_t)factor, &out_images, &out_count) ||
-                    out_count <= 0 || out_images[0].data == nullptr) {
-                    free_sd_images(out_images, out_count);
+                sd_image_generation_result_t* generated = nullptr;
+                if (!upscale(upscaler_ctx.get(), current.get(), (uint32_t)factor, &generated) ||
+                    !generated || generated->count <= 0 || generated->items[0].image.data == nullptr) {
+                    free_sd_image_generation_result(generated);
                     res.status = 500;
                     res.set_content(R"({"error":"upscale failed"})", "application/json");
                     return;
                 }
-                sd_image_t produced = out_images[0];
-                out_images[0]       = {0, 0, 0, nullptr};
-                free_sd_images(out_images, out_count);
+                generation_info           = merge_generation_info(generation_info, generated->items[0].generation_info);
+                sd_image_t produced       = generated->items[0].image;
+                generated->items[0].image = {};
+                free_sd_image_generation_result(generated);
                 current.reset(produced);
             }
 
@@ -630,12 +639,12 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             auto image_bytes          = encode_image_to_vector(format == "jpeg"   ? EncodedImageFormat::JPEG
                                                                : format == "webp" ? EncodedImageFormat::WEBP
                                                                                   : EncodedImageFormat::PNG,
-                                                      result.data,
-                                                      result.width,
-                                                      result.height,
-                                                      result.channel,
-                                                      "",
-                                                      compression);
+                                                               result.data,
+                                                               result.width,
+                                                               result.height,
+                                                               result.channel,
+                                                               generation_info,
+                                                               compression);
             if (image_bytes.empty()) {
                 res.status = 500;
                 res.set_content(R"({"error":"the result could not be encoded"})", "application/json");
@@ -643,13 +652,14 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
 
             json out;
-            out["upscaler"]      = used_name;
-            out["scale"]         = factor;
-            out["repeats"]       = repeats;
-            out["width"]         = result.width;
-            out["height"]        = result.height;
-            out["output_format"] = format;
-            json images          = json::array();
+            out["generation_info"] = json::parse(generation_info);
+            out["upscaler"]        = used_name;
+            out["scale"]           = factor;
+            out["repeats"]         = repeats;
+            out["width"]           = result.width;
+            out["height"]          = result.height;
+            out["output_format"]   = format;
+            json images            = json::array();
             images.push_back({{"index", 0}, {"b64_json", base64_encode(image_bytes)}});
             out["images"] = std::move(images);
             res.set_content(out.dump(), "application/json");
@@ -840,8 +850,9 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+            job.cancel_requested.store(true);
+            res.status = 200;
+            res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             return;
         }
 

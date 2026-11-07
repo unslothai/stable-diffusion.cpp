@@ -17,6 +17,7 @@
 #include "model/te/llada_image_te.hpp"
 #include "model/te/llm.hpp"
 #include "model/te/ming_image_te.hpp"
+#include "model/te/ph3_image_connector.hpp"
 #include "model/te/t5.hpp"
 #include "model_loader.h"
 #include "tokenizers/sensenova_u1_tokenizer.h"
@@ -141,6 +142,7 @@ struct ConditionerParams {
 };
 
 struct Conditioner {
+    virtual int resolve_clip_skip(int) const { return 0; }
     virtual ~Conditioner() = default;
 
 public:
@@ -172,6 +174,10 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::vector<uint8_t> token_embed_custom;
     std::vector<uint8_t> token_embed_custom2;
     std::map<std::string, std::pair<int, int>> embedding_pos_map;
+
+    int resolve_clip_skip(int value) const override {
+        return value > 0 ? value : ((sd_version_is_sd2(version) || sd_version_is_sdxl(version)) ? 2 : 1);
+    }
 
     FrozenCLIPEmbedderWithCustomWords(ggml_backend_t backend,
                                       const String2TensorStorage& tensor_storage_map,
@@ -456,10 +462,6 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         sd::Tensor<float> hidden_states;  // [n_token, hidden_size] or [n_token, hidden_size + hidden_size2]
         sd::Tensor<float> pooled;
 
-        if (clip_skip <= 0) {
-            clip_skip = (sd_version_is_sd2(version) || sd_version_is_sdxl(version)) ? 2 : 1;
-        }
-
         size_t chunk_len   = 77;
         size_t chunk_count = tokens.size() / chunk_len;
         for (int chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
@@ -650,6 +652,8 @@ struct SD3CLIPEmbedder : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> clip_l;
     std::shared_ptr<CLIPTextModelRunner> clip_g;
     std::shared_ptr<T5Runner> t5;
+
+    int resolve_clip_skip(int value) const override { return value > 0 ? value : 2; }
 
     SD3CLIPEmbedder(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -898,10 +902,6 @@ struct SD3CLIPEmbedder : public Conditioner {
         auto& t5_tokens      = token_and_weights[2].first;
         auto& t5_weights     = token_and_weights[2].second;
 
-        if (clip_skip <= 0) {
-            clip_skip = 2;
-        }
-
         size_t chunk_len = 77;
         int64_t t0       = ggml_time_ms();
         sd::Tensor<float> hidden_states;
@@ -1096,6 +1096,8 @@ struct FluxCLIPEmbedder : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> clip_l;
     std::shared_ptr<T5Runner> t5;
     size_t chunk_len = 256;
+
+    int resolve_clip_skip(int value) const override { return value > 0 ? value : 2; }
 
     FluxCLIPEmbedder(ggml_backend_t backend,
                      const String2TensorStorage& tensor_storage_map      = {},
@@ -1292,10 +1294,6 @@ struct FluxCLIPEmbedder : public Conditioner {
         auto& clip_l_weights = token_and_weights[0].second;
         auto& t5_tokens      = token_and_weights[1].first;
         auto& t5_weights     = token_and_weights[1].second;
-
-        if (clip_skip <= 0) {
-            clip_skip = 2;
-        }
 
         int64_t t0 = ggml_time_ms();
         sd::Tensor<float> hidden_states;  // [N, n_token, 4096]
@@ -1833,11 +1831,11 @@ struct AnimaConditioner : public Conditioner {
                      std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
                      const TokenizerConfig& tokenizers                   = {}) {
         llm            = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::QWEN3,
-                                               backend,
-                                               tensor_storage_map,
-                                               "text_encoders.llm",
-                                               false,
-                                               weight_manager);
+                                                          backend,
+                                                          tensor_storage_map,
+                                                          "text_encoders.llm",
+                                                          false,
+                                                          weight_manager);
         qwen_tokenizer = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 151643);
         if (!qwen_tokenizer) {
             qwen_tokenizer = std::make_shared<Qwen2Tokenizer>();
@@ -1979,6 +1977,7 @@ struct LLMEmbedder : public Conditioner {
     std::shared_ptr<Tokenizer> tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
     std::shared_ptr<T5Runner> byt5;
+    std::shared_ptr<PH3ImageTextConnectorRunner> ph3_connector;
 
     LLMEmbedder(ggml_backend_t backend,
                 const String2TensorStorage& tensor_storage_map      = {},
@@ -2008,7 +2007,8 @@ struct LLMEmbedder : public Conditioner {
             arch = LLM::LLMArch::GPT_OSS_20B;
         } else if (sd_version_is_pid(version)) {
             arch = LLM::LLMArch::GEMMA2_2B;
-        } else if (version == VERSION_QWEN_IMAGE_2_1 ||
+        } else if (version == VERSION_FIBO2 ||
+                   version == VERSION_QWEN_IMAGE_2_1 ||
                    sd_version_is_flux3(version) ||
                    sd_version_is_lingbot_video(version) ||
                    sd_version_is_ideogram4(version) ||
@@ -2024,12 +2024,18 @@ struct LLMEmbedder : public Conditioner {
         } else if (version == VERSION_MOSS_IMAGE) {
             arch = LLM::LLMArch::QWEN3_5;
         }
-        llm        = std::make_shared<LLM::LLMRunner>(arch,
+        llm = std::make_shared<LLM::LLMRunner>(arch,
                                                backend,
                                                tensor_storage_map,
                                                "text_encoders.llm",
                                                enable_vision,
                                                weight_manager);
+        if (version == VERSION_P_H3_IMAGE) {
+            if (llm->config.num_layers != 36 || llm->config.hidden_size != 2560) {
+                throw std::runtime_error("P-H3-Image requires the Qwen3-VL-4B text encoder");
+            }
+            ph3_connector = std::make_shared<PH3ImageTextConnectorRunner>(backend, tensor_storage_map, weight_manager);
+        }
         int pad_id = 151643;
         if (arch == LLM::LLMArch::MISTRAL_SMALL_3_2 || arch == LLM::LLMArch::MINISTRAL_3_3B) {
             pad_id = 11;
@@ -2065,6 +2071,9 @@ struct LLMEmbedder : public Conditioner {
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         llm->get_param_tensors(tensors, "text_encoders.llm");
+        if (ph3_connector) {
+            ph3_connector->get_param_tensors(tensors);
+        }
         if (byt5) {
             byt5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
         }
@@ -2076,6 +2085,9 @@ struct LLMEmbedder : public Conditioner {
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
         llm->set_max_graph_vram_bytes(max_vram_bytes);
+        if (ph3_connector) {
+            ph3_connector->set_max_graph_vram_bytes(max_vram_bytes);
+        }
         if (byt5) {
             byt5->set_max_graph_vram_bytes(max_vram_bytes);
         }
@@ -2083,6 +2095,9 @@ struct LLMEmbedder : public Conditioner {
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends) override {
         llm->set_runtime_backends(backends);
+        if (ph3_connector) {
+            ph3_connector->set_runtime_backends(backends);
+        }
         if (byt5) {
             byt5->set_runtime_backends(backends);
         }
@@ -2115,6 +2130,9 @@ struct LLMEmbedder : public Conditioner {
 
     void set_flash_attention_enabled(bool enabled) override {
         llm->set_flash_attention_enabled(enabled);
+        if (ph3_connector) {
+            ph3_connector->set_flash_attention_enabled(enabled);
+        }
         if (byt5) {
             byt5->set_flash_attention_enabled(enabled);
         }
@@ -2122,12 +2140,18 @@ struct LLMEmbedder : public Conditioner {
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
         llm->set_scale_overrides(linear_scale, attn_scale);
+        if (ph3_connector) {
+            ph3_connector->set_scale_overrides(linear_scale, attn_scale);
+        }
         if (byt5) {
             byt5->set_scale_overrides(linear_scale, attn_scale);
         }
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        if (ph3_connector) {
+            ph3_connector->set_weight_adapter(adapter);
+        }
         if (llm) {
             llm->set_weight_adapter(adapter);
         }
@@ -2137,6 +2161,9 @@ struct LLMEmbedder : public Conditioner {
     }
 
     void runner_end() override {
+        if (ph3_connector) {
+            ph3_connector->runner_end();
+        }
         if (llm) {
             llm->runner_end();
         }
@@ -2147,10 +2174,11 @@ struct LLMEmbedder : public Conditioner {
 
     std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> tokenize(std::string text,
                                                                                   const std::pair<int, int>& attn_range,
-                                                                                  size_t min_length         = 0,
-                                                                                  size_t max_length         = 100000000,
-                                                                                  bool spell_quotes         = false,
-                                                                                  const std::string& suffix = "") {
+                                                                                  size_t min_length                                                  = 0,
+                                                                                  size_t max_length                                                  = 100000000,
+                                                                                  bool spell_quotes                                                  = false,
+                                                                                  const std::string& suffix                                          = "",
+                                                                                  const std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds = {}) {
         std::vector<std::pair<std::string, float>> parsed_attention;
         if (attn_range.first >= 0 && attn_range.second > 0) {
             if (attn_range.first > 0) {
@@ -2195,6 +2223,19 @@ struct LLMEmbedder : public Conditioner {
             weights.insert(weights.end(), curr_tokens.size(), curr_weight);
         }
 
+        for (const auto& image_embed : image_embeds) {
+            const int index     = image_embed.first;
+            const int64_t count = image_embed.second.shape()[1];
+            if (index < 0 || static_cast<size_t>(index) >= tokens.size() || count < 1) {
+                LOG_ERROR("Invalid reference image token range");
+                return {};
+            }
+            const int token    = tokens[index];
+            const float weight = weights[index];
+            tokens.insert(tokens.begin() + index, count - 1, token);
+            weights.insert(weights.begin() + index, count - 1, weight);
+        }
+
         if (!suffix.empty()) {
             std::vector<int> suffix_tokens;
             if (!tokenizer->encode(suffix, suffix_tokens) || suffix_tokens.size() >= max_length) {
@@ -2214,6 +2255,17 @@ struct LLMEmbedder : public Conditioner {
         }
         std::vector<float> mask;
         tokenizer->pad_tokens(tokens, &weights, &mask, min_length, max_length);
+
+        // Keep masks and weights in expanded coordinates, but only look up one token per image.
+        for (auto it = image_embeds.rbegin(); it != image_embeds.rend(); ++it) {
+            const int64_t begin = it->first;
+            const int64_t end   = begin + it->second.shape()[1];
+            if (begin < 0 || end > static_cast<int64_t>(tokens.size())) {
+                LOG_ERROR("Reference image exceeds the tokenized context");
+                return {};
+            }
+            tokens.erase(tokens.begin() + begin + 1, tokens.begin() + end);
+        }
 
         // for (int i = 0; i < tokens.size(); i++) {
         //     std::cout << tokens[i] << ":" << weights[i] << ", " << i << std::endl;
@@ -2237,7 +2289,7 @@ struct LLMEmbedder : public Conditioner {
                                     const std::vector<LLM::ImageGrid>& image_grids          = {},
                                     const std::string& prompt_suffix                        = "",
                                     sd::Tensor<float>* output_mask                          = nullptr) {
-        auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, spell_quotes, prompt_suffix);
+        auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, spell_quotes, prompt_suffix, image_embeds);
         auto& tokens             = std::get<0>(tokens_weights_mask);
         auto& weights            = std::get<1>(tokens_weights_mask);
         auto& mask               = std::get<2>(tokens_weights_mask);
@@ -2267,10 +2319,10 @@ struct LLMEmbedder : public Conditioner {
 
         sd::Tensor<int32_t> position_ids;
         if (sd_version_is_flux3(version)) {
-            position_ids = sd::Tensor<int32_t>::zeros({static_cast<int64_t>(tokens.size() * 4)});
+            position_ids = sd::Tensor<int32_t>::zeros({static_cast<int64_t>(weights.size() * 4)});
             for (size_t axis = 0; axis < 4; ++axis) {
-                for (size_t i = 0; i < tokens.size(); ++i) {
-                    position_ids[axis * tokens.size() + i] = mask[i] == 0.f ? 1 : static_cast<int32_t>(i);
+                for (size_t i = 0; i < weights.size(); ++i) {
+                    position_ids[axis * weights.size() + i] = mask[i] == 0.f ? 1 : static_cast<int32_t>(i);
                 }
             }
         }
@@ -2287,6 +2339,12 @@ struct LLMEmbedder : public Conditioner {
         if (hidden_states.empty()) {
             LOG_ERROR("LLM prompt encoding failed");
             return {};
+        }
+        if (ph3_connector) {
+            hidden_states = ph3_connector->compute(n_threads, hidden_states);
+            if (hidden_states.empty()) {
+                return {};
+            }
         }
         hidden_states = apply_token_weights(std::move(hidden_states), weights);
         GGML_ASSERT(hidden_states.shape()[1] > prompt_template_encode_start_idx);
@@ -2367,6 +2425,50 @@ struct LLMEmbedder : public Conditioner {
         }
     }
 
+    bool expand_vision_marker(const std::string& prompt,
+                              size_t& marker_start,
+                              std::vector<sd::Tensor<float>> outputs,
+                              int grid_h,
+                              int grid_w,
+                              std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds,
+                              LLM::DeepStackImageEmbeds& deepstack_image_embeds,
+                              std::vector<LLM::ImageGrid>& image_grids,
+                              int max_length = std::numeric_limits<int>::max()) {
+        if (outputs.empty()) {
+            return false;
+        }
+        const std::string placeholder = "<|image_pad|>";
+        size_t position               = prompt.find(placeholder, marker_start);
+        if (position == std::string::npos) {
+            LOG_ERROR("Reference image marker is missing");
+            return false;
+        }
+        std::vector<int> prefix_tokens;
+        if (!tokenizer->encode(prompt.substr(0, position), prefix_tokens, nullptr)) {
+            return false;
+        }
+        int index = static_cast<int>(prefix_tokens.size());
+        for (const auto& image_embed : image_embeds) {
+            index += static_cast<int>(image_embed.second.shape()[1]) - 1;
+        }
+        int count = static_cast<int>(outputs[0].shape()[1]);
+        if (index > max_length || count > max_length - index) {
+            LOG_ERROR("Reference images exceed the %d-token context", max_length);
+            return false;
+        }
+        if (deepstack_image_embeds.empty()) {
+            deepstack_image_embeds.resize(outputs.size() - 1);
+        }
+        GGML_ASSERT(deepstack_image_embeds.size() == outputs.size() - 1);
+        image_embeds.emplace_back(index, std::move(outputs[0]));
+        for (size_t layer = 1; layer < outputs.size(); ++layer) {
+            deepstack_image_embeds[layer - 1].emplace_back(index, std::move(outputs[layer]));
+        }
+        image_grids.push_back({index, count, grid_h, grid_w});
+        marker_start = position + placeholder.size();
+        return true;
+    }
+
     SDCondition get_learned_condition(int n_threads,
                                       const ConditionerParams& conditioner_params) override {
         std::string prompt;
@@ -2390,13 +2492,13 @@ struct LLMEmbedder : public Conditioner {
 
         if (sd_version_is_minimax_h3(version)) {
             prompt_template_encode_start_idx = 0;
-            out_layers                       = {50};
-            prompt_attn_range                = {0, 0};
+            // The final tap is normalized; LLMRunner exposes it at num_layers + 1.
+            out_layers        = version == VERSION_P_H3_IMAGE ? std::set<int>{13, 19, 25, 31, 37} : std::set<int>{50};
+            prompt_attn_range = {0, 0};
 
             if (llm->enable_vision) {
-                const std::string placeholder = "<|image_pad|>";
-                const int patch_size          = llm->config.vision.patch_size;
-                const int factor              = patch_size * llm->config.vision.spatial_merge_size;
+                const int patch_size = llm->config.vision.patch_size;
+                const int factor     = patch_size * llm->config.vision.spatial_merge_size;
 
                 auto resize_for_vision = [&](const sd::Tensor<float>& image) {
                     int height = static_cast<int>(image.shape()[1]);
@@ -2424,29 +2526,11 @@ struct LLMEmbedder : public Conditioner {
                                               int grid_h,
                                               int grid_w) {
                     GGML_ASSERT(image_outputs.size() == 4);
-                    auto image_embed = std::move(image_outputs[0]);
                     prompt += "<|vision_start|>";
-                    std::vector<int> prefix_tokens;
-                    if (!tokenizer->encode(prompt, prefix_tokens, nullptr)) {
-                        return false;
-                    }
-                    int image_embed_idx = static_cast<int>(prefix_tokens.size());
-                    image_embeds.emplace_back(image_embed_idx, image_embed);
-                    if (deepstack_image_embeds.empty()) {
-                        deepstack_image_embeds.resize(image_outputs.size() - 1);
-                    }
-                    for (size_t layer = 0; layer < deepstack_image_embeds.size(); ++layer) {
-                        deepstack_image_embeds[layer].emplace_back(image_embed_idx, std::move(image_outputs[layer + 1]));
-                    }
-                    image_grids.push_back({image_embed_idx,
-                                           static_cast<int>(image_embed.shape()[1]),
-                                           grid_h,
-                                           grid_w});
-                    for (int64_t i = 0; i < image_embed.shape()[1]; ++i) {
-                        prompt += placeholder;
-                    }
-                    prompt += "<|vision_end|>";
-                    return true;
+                    size_t marker_start = prompt.size();
+                    prompt += "<|image_pad|><|vision_end|>";
+                    return expand_vision_marker(prompt, marker_start, std::move(image_outputs), grid_h, grid_w,
+                                                image_embeds, deepstack_image_embeds, image_grids);
                 };
 
                 const auto* references = conditioner_params.minimax_h3_references;
@@ -2516,7 +2600,17 @@ struct LLMEmbedder : public Conditioner {
                     }
                 }
             }
-            prompt += conditioner_params.text;
+            auto text = conditioner_params.text;
+            if (version == VERSION_P_H3_IMAGE && !image_embeds.empty()) {
+                // Preserve explicit picture targets and structured briefs from the upstream upsampler.
+                static const std::regex verbatim(R"(^\s*(Edit <Picture \d+>|subject_definitions:))");
+                if (!std::regex_search(text, verbatim)) {
+                    text = "Edit <Picture 1>. " + text;
+                } else {
+                    text = trim(text);
+                }
+            }
+            prompt += text;
         } else if (sd_version_is_hunyuan_video(version)) {
             prompt_template_encode_start_idx = 98;
             out_layers                       = {26};
@@ -2609,14 +2703,13 @@ struct LLMEmbedder : public Conditioner {
                         return {};
                     }
                     int image_embed_idx = static_cast<int>(prefix_tokens.size());
+                    for (const auto& previous_image : image_embeds) {
+                        image_embed_idx += static_cast<int>(previous_image.second.shape()[1]) - 1;
+                    }
                     image_embeds.emplace_back(image_embed_idx, image_embed);
 
                     img_prompt += "<|vision_start|>";
-                    int64_t num_image_tokens = image_embed.shape()[1];
-                    img_prompt.reserve(img_prompt.size() + static_cast<size_t>(num_image_tokens) * placeholder.size() + 32);
-                    for (int j = 0; j < num_image_tokens; j++) {
-                        img_prompt += placeholder;
-                    }
+                    img_prompt += placeholder;
                     img_prompt += "<|vision_end|>";
                 }
                 prompt += img_prompt;
@@ -2660,26 +2753,14 @@ struct LLMEmbedder : public Conditioner {
                         return {};
                     }
                     prompt += (i == 0 ? "" : " ") + std::string("<image") + std::to_string(i + 1) + "><|vision_start|>";
-                    std::vector<int> prefix_tokens;
-                    if (!tokenizer->encode(prompt, prefix_tokens, nullptr)) {
+                    size_t marker_start = prompt.size();
+                    prompt += "<|image_pad|><|vision_end|>";
+                    if (!expand_vision_marker(prompt, marker_start, std::move(outputs),
+                                              static_cast<int>(height) / llm->config.vision.patch_size,
+                                              static_cast<int>(width) / llm->config.vision.patch_size,
+                                              image_embeds, deepstack_image_embeds, image_grids)) {
                         return {};
                     }
-                    int index = static_cast<int>(prefix_tokens.size());
-                    int count = static_cast<int>(outputs[0].shape()[1]);
-                    image_embeds.emplace_back(index, std::move(outputs[0]));
-                    if (deepstack_image_embeds.empty()) {
-                        deepstack_image_embeds.resize(outputs.size() - 1);
-                    }
-                    for (size_t layer = 1; layer < outputs.size(); ++layer) {
-                        deepstack_image_embeds[layer - 1].emplace_back(index, std::move(outputs[layer]));
-                    }
-                    image_grids.push_back({index, count,
-                                           static_cast<int>(height) / llm->config.vision.patch_size,
-                                           static_cast<int>(width) / llm->config.vision.patch_size});
-                    for (int j = 0; j < count; ++j) {
-                        prompt += "<|image_pad|>";
-                    }
-                    prompt += "<|vision_end|>";
                 }
             }
             prompt_attn_range.first = static_cast<int>(prompt.size());
@@ -2690,7 +2771,6 @@ struct LLMEmbedder : public Conditioner {
             if (llm->enable_vision && conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
                 LOG_INFO("%s", sd_version_is_mage_flow(version) ? "MageFlowEditPipeline" : "QwenImageEditPlusPipeline");
                 prompt_template_encode_start_idx = 64;
-                int image_embed_idx              = 64 + 6;
 
                 int min_pixels = conditioner_params.ref_image_params.vlm_min_size;
                 if (min_pixels <= 0) {
@@ -2707,6 +2787,7 @@ struct LLMEmbedder : public Conditioner {
                     }
                 }
 
+                prompt                  = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n";
                 std::string placeholder = "<|image_pad|>";
                 std::string img_prompt;
 
@@ -2726,19 +2807,22 @@ struct LLMEmbedder : public Conditioner {
 
                     auto image_embed = llm->encode_image(n_threads, resized_image, false);
                     GGML_ASSERT(!image_embed.empty());
+                    std::string image_prefix = prompt + img_prompt + (sd_version_is_mage_flow(version) ? "Image " : "Picture ") + std::to_string(i + 1) + ": <|vision_start|>";
+                    std::vector<int> prefix_tokens;
+                    if (!tokenizer->encode(image_prefix, prefix_tokens, nullptr)) {
+                        return {};
+                    }
+                    int image_embed_idx = static_cast<int>(prefix_tokens.size());
+                    for (const auto& previous_image : image_embeds) {
+                        image_embed_idx += static_cast<int>(previous_image.second.shape()[1]) - 1;
+                    }
                     image_embeds.emplace_back(image_embed_idx, image_embed);
-                    image_embed_idx += 1 + static_cast<int>(image_embed.shape()[1]) + 6;
 
                     img_prompt += (sd_version_is_mage_flow(version) ? "Image " : "Picture ") + std::to_string(i + 1) + ": <|vision_start|>";
-                    int64_t num_image_tokens = image_embed.shape()[1];
-                    img_prompt.reserve(num_image_tokens * placeholder.size());
-                    for (int j = 0; j < num_image_tokens; j++) {
-                        img_prompt += placeholder;
-                    }
+                    img_prompt += placeholder;
                     img_prompt += "<|vision_end|>";
                 }
 
-                prompt = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n";
                 prompt += img_prompt;
 
                 prompt_attn_range.first = static_cast<int>(prompt.size());
@@ -2816,14 +2900,13 @@ struct LLMEmbedder : public Conditioner {
                         return {};
                     }
                     int image_embed_idx = static_cast<int>(prefix_tokens.size());
+                    for (const auto& previous_image : image_embeds) {
+                        image_embed_idx += static_cast<int>(previous_image.second.shape()[1]) - 1;
+                    }
                     image_embeds.emplace_back(image_embed_idx, image_embed);
 
                     img_prompt += "<|vision_start|>";
-                    int64_t num_image_tokens = image_embed.shape()[1];
-                    img_prompt.reserve(img_prompt.size() + static_cast<size_t>(num_image_tokens) * placeholder.size() + 32);
-                    for (int j = 0; j < num_image_tokens; j++) {
-                        img_prompt += placeholder;
-                    }
+                    img_prompt += placeholder;
                     img_prompt += "<|vision_end|>";
                 }
 
@@ -2888,14 +2971,13 @@ struct LLMEmbedder : public Conditioner {
                         return {};
                     }
                     int image_embed_idx = static_cast<int>(prefix_tokens.size());
+                    for (const auto& previous_image : image_embeds) {
+                        image_embed_idx += static_cast<int>(previous_image.second.shape()[1]) - 1;
+                    }
                     image_embeds.emplace_back(image_embed_idx, image_embed);
 
                     img_prompt += "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
-                    int64_t num_image_tokens = image_embed.shape()[1];
-                    img_prompt.reserve(img_prompt.size() + static_cast<size_t>(num_image_tokens) * placeholder.size() + 32);
-                    for (int j = 0; j < num_image_tokens; j++) {
-                        img_prompt += placeholder;
-                    }
+                    img_prompt += placeholder;
                     img_prompt += "<|vision_end|>";
                 }
                 prompt += img_prompt;
@@ -2913,7 +2995,6 @@ struct LLMEmbedder : public Conditioner {
                 LOG_INFO("LongCatEditPipeline");
                 prompt_template_encode_start_idx = 67;
                 min_length                       = 512 + prompt_template_encode_start_idx;
-                int image_embed_idx              = 36 + 6;
 
                 int min_pixels = conditioner_params.ref_image_params.vlm_min_size;
                 if (min_pixels <= 0) {
@@ -2930,6 +3011,7 @@ struct LLMEmbedder : public Conditioner {
                     }
                 }
 
+                prompt                  = "<|im_start|>system\nAs an image editing expert, first analyze the content and attributes of the input image(s). Then, based on the user's editing instructions, clearly and precisely determine how to modify the given image(s), ensuring that only the specified parts are altered and all other aspects remain consistent with the original(s).<|im_end|>\n<|im_start|>user\n";
                 std::string placeholder = "<|image_pad|>";
                 std::string img_prompt;
 
@@ -2948,19 +3030,22 @@ struct LLMEmbedder : public Conditioner {
                     auto resized_image = clip_preprocess(image, w_bar, h_bar);
                     auto image_embed   = llm->encode_image(n_threads, resized_image, false);
                     GGML_ASSERT(!image_embed.empty());
+                    std::string image_prefix = prompt + img_prompt + "<|vision_start|>";
+                    std::vector<int> prefix_tokens;
+                    if (!tokenizer->encode(image_prefix, prefix_tokens, nullptr)) {
+                        return {};
+                    }
+                    int image_embed_idx = static_cast<int>(prefix_tokens.size());
+                    for (const auto& previous_image : image_embeds) {
+                        image_embed_idx += static_cast<int>(previous_image.second.shape()[1]) - 1;
+                    }
                     image_embeds.emplace_back(image_embed_idx, image_embed);
-                    image_embed_idx += 1 + static_cast<int>(image_embed.shape()[1]) + 6;
 
                     img_prompt += "<|vision_start|>";
-                    int64_t num_image_tokens = image_embed.shape()[1];
-                    img_prompt.reserve(num_image_tokens * placeholder.size());
-                    for (int j = 0; j < num_image_tokens; j++) {
-                        img_prompt += placeholder;
-                    }
+                    img_prompt += placeholder;
                     img_prompt += "<|vision_end|>";
                 }
 
-                prompt = "<|im_start|>system\nAs an image editing expert, first analyze the content and attributes of the input image(s). Then, based on the user's editing instructions, clearly and precisely determine how to modify the given image(s), ensuring that only the specified parts are altered and all other aspects remain consistent with the original(s).<|im_end|>\n<|im_start|>user\n";
                 prompt += img_prompt;
             } else {
                 prompt_template_encode_start_idx = 36;
@@ -3028,7 +3113,10 @@ struct LLMEmbedder : public Conditioner {
         } else if (sd_version_is_z_image(version) || sd_version_is_z_image_l2p(version)) {
             prompt_template_encode_start_idx = 0;
             out_layers                       = {35};  // -2
-
+            if (conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
+                LOG_ERROR("Z-Image currently does not support reference-image conditioning");
+                return {};
+            }
             if (conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
                 LOG_INFO("ZImageOmniPipeline");
                 prompt = "<|im_start|>user\n<|vision_start|>";
@@ -3267,7 +3355,7 @@ struct LLMEmbedder : public Conditioner {
             for (const auto& [index, image_embed] : image_embeds) {
                 int64_t begin = std::max<int64_t>(0, index - 1);
                 int64_t end   = std::min<int64_t>(static_cast<int64_t>(tags.size()),
-                                                index + image_embed.shape()[1] + 1);
+                                                  index + image_embed.shape()[1] + 1);
                 std::fill(tags.begin() + begin, tags.begin() + end, 0);
             }
             int64_t tag_count    = static_cast<int64_t>(tags.size());
@@ -3447,9 +3535,9 @@ struct LLaDAImageEmbedder : public Conditioner {
         // <|endoftext|> doubles as the pad token in LLaDA2's tokenizer.json.
         tokenizer       = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 156892);
         query_former    = std::make_shared<LLaDAImageTE::QueryFormerRunner>(backend,
-                                                                         tensor_storage_map,
-                                                                         query_former_prefix,
-                                                                         weight_manager);
+                                                                            tensor_storage_map,
+                                                                            query_former_prefix,
+                                                                            weight_manager);
         text_projection = std::make_shared<LLaDAImageTE::TextProjectionRunner>(backend,
                                                                                tensor_storage_map,
                                                                                text_projection_prefix,
@@ -3563,12 +3651,10 @@ struct LLaDAImageEmbedder : public Conditioner {
         auto inputs_embeds = llm->compute_input_embeds(n_threads, text_ids);
         auto query_embeds  = query_former->compute(n_threads, inputs_embeds);
 
-        // splice_image_embeds() replaces tokens in place, so the query slots have to exist in
-        // input_ids; their ids are irrelevant because the embeddings are overwritten.
-        std::vector<int32_t> padded(tokens.begin(), tokens.end());
-        padded.resize(static_cast<size_t>(n_text + num_queries), tokenizer->PAD_TOKEN_ID);
-        int64_t n_total = static_cast<int64_t>(padded.size());
-        sd::Tensor<int32_t> input_ids({n_total}, padded);
+        std::vector<int32_t> input_tokens(tokens.begin(), tokens.end());
+        input_tokens.push_back(tokenizer->PAD_TOKEN_ID);
+        sd::Tensor<int32_t> input_ids({n_text + 1}, std::move(input_tokens));
+        int64_t n_total = n_text + num_queries;
 
         // Bidirectional everywhere except that the text tokens must not see the appended
         // queries, matching backbone_attention_mask[:, :, :text_length, text_length:] = min.
@@ -3653,20 +3739,20 @@ struct LTXAVEmbedder : public Conditioner {
         LLM::LLMArch arch = detect_gemma_arch(tensor_storage_map, llm_prefix);
         LOG_INFO("ltxav text encoder: %s", arch == LLM::LLMArch::GEMMA4_12B ? "gemma 4" : "gemma 3");
         llm       = std::make_shared<LLM::LLMRunner>(arch,
-                                               backend,
-                                               tensor_storage_map,
-                                               llm_prefix,
-                                               false,
-                                               weight_manager);
+                                                     backend,
+                                                     tensor_storage_map,
+                                                     llm_prefix,
+                                                     false,
+                                                     weight_manager);
         tokenizer = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 0, true);
         if (!tokenizer) {
             tokenizer = std::make_shared<GemmaTokenizer>();
         }
         dual_projection = tensor_storage_map.find(projector_prefix + ".video_aggregate_embed.weight") != tensor_storage_map.end();
         projector       = std::make_shared<LTXAVTextProjectionRunner>(backend,
-                                                                tensor_storage_map,
-                                                                projector_prefix,
-                                                                weight_manager);
+                                                                      tensor_storage_map,
+                                                                      projector_prefix,
+                                                                      weight_manager);
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
