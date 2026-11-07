@@ -23,14 +23,14 @@ the 256-thread launch.
  src/ggml-cuda/norm.cu      |  63 ++++++++++++
  2 files changed, 262 insertions(+), 1 deletion(-)
 
-[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
+[Ported onto leejet/ggml 135ce1e0 (stable-diffusion.cpp master-1050): the diff below is
  the whole patch as one diff, regenerated from the port.]
 ---
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 8a295c19..74f3373a 100644
+index c926338b..eca69cae 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2061,8 +2061,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+@@ -1737,8 +1737,73 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
      static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
  };
  
@@ -105,7 +105,7 @@ index 8a295c19..74f3373a 100644
      using traits = batched_mul_mat_traits<compute_type>;
      using cuda_t = typename traits::cuda_type;
  
-@@ -2270,8 +2335,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -1946,8 +2011,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
  
      // Convert output back to F32 if needed
      if (cu_data_type != CUDA_R_32F) {
@@ -123,8 +123,8 @@ index 8a295c19..74f3373a 100644
      }
  }
  
-@@ -4336,6 +4410,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
- }
+@@ -4028,6 +4102,123 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ 
  
  // try and fuse nodes and return the number of nodes to skip
 +static bool ggml_cuda_cublas_epilogue_enabled() {
@@ -247,7 +247,7 @@ index 8a295c19..74f3373a 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      if (ggml_cuda_fusion_disabled()) {
-@@ -5083,6 +5274,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4776,6 +4967,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
