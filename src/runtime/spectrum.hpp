@@ -74,6 +74,13 @@ struct SpectrumState {
         cnt++;
     }
 
+    // Forget the fitted outputs but keep the step count, so predictions restart from fresh model evaluations.
+    void reset_history() {
+        H_buf.clear();
+        T_buf.clear();
+        num_cached = 0;
+    }
+
     void predict(sd::Tensor<float>* denoised) {
         GGML_ASSERT(denoised != nullptr);
         int64_t F    = (int64_t)H_buf[0].size();
