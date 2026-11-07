@@ -623,7 +623,7 @@ ArgOptions SDContextParams::get_options() {
          true, &offload_params_to_cpu},
         {"",
          "--mmap",
-         "whether to memory-map model",
+         "whether to memory-map model (CPU: weights the CPU repacks are still loaded and repacked)",
          true, &enable_mmap},
         {"",
          "--control-net-cpu",
