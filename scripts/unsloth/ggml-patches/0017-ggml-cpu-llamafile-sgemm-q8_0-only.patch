@@ -1,0 +1,73 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 30b8cbb5..160dcf72 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -49,6 +49,39 @@
+ 
+ #ifdef GGML_USE_LLAMAFILE
+ #include "llamafile/sgemm.h"
++
++// Weight types whose mul_mat may go through llamafile's tinyBLAS GEMM. Q8_0 by default: its tinyBLAS kernel adds
++// the per-block products in the same 8 lanes and the same final reduction as ggml_vec_dot_q8_0_q8_0, so it returns
++// the same bits, only faster. Other types change the accumulation order and are opt-in:
++// GGML_CPU_SGEMM_TYPES=q8_0,bf16,f16,f32 (ggml type names), "all" or "none".
++static uint64_t ggml_cpu_sgemm_types = 1ull << GGML_TYPE_Q8_0;
++
++static void ggml_cpu_sgemm_types_init(void) {
++    const char * env = getenv("GGML_CPU_SGEMM_TYPES");
++    if (env == NULL) {
++        return;
++    }
++    if (strcmp(env, "all") == 0) {
++        ggml_cpu_sgemm_types = ~0ull;
++        return;
++    }
++    uint64_t mask = 0;
++    char buf[256];
++    snprintf(buf, sizeof(buf), "%s", env);
++    for (char * tok = strtok(buf, ", "); tok != NULL; tok = strtok(NULL, ", ")) {
++        for (int t = 0; t < GGML_TYPE_COUNT && t < 64; ++t) {
++            const char * name = ggml_type_name((enum ggml_type) t);
++            if (name != NULL && strcmp(name, tok) == 0) {
++                mask |= 1ull << t;
++            }
++        }
++    }
++    ggml_cpu_sgemm_types = mask;
++}
++
++static inline bool ggml_cpu_sgemm_type_enabled(enum ggml_type t) {
++    return t < 64 && ((ggml_cpu_sgemm_types >> t) & 1);
++}
+ #endif
+ 
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+@@ -1460,7 +1493,7 @@ void ggml_compute_forward_mul_mat(
+ 
+     const bool src1_cont = ggml_is_contiguous(src1);
+ 
+-    if (!params->use_ref && src1_cont) {
++    if (!params->use_ref && src1_cont && ggml_cpu_sgemm_type_enabled(src0->type)) {
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+             for (int64_t i12 = 0; i12 < ne12; i12++)
+                 if (!llamafile_sgemm(params,
+@@ -1539,7 +1572,7 @@ UseGgmlGemm1:;
+     ggml_barrier(params->threadpool);
+ 
+ #if GGML_USE_LLAMAFILE
+-    if (!params->use_ref && src1->type != vec_dot_type) {
++    if (!params->use_ref && src1->type != vec_dot_type && ggml_cpu_sgemm_type_enabled(src0->type)) {
+         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+@@ -4088,6 +4121,10 @@ void ggml_cpu_init(void) {
+ 
+             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
+ 
++#ifdef GGML_USE_LLAMAFILE
++            ggml_cpu_sgemm_types_init();
++#endif
++
+             GGML_PRINT_DEBUG("%s: GELU, Quick GELU, SILU and EXP tables initialized in %f ms\n", __func__, (t_end - t_start)/1000.0);
+ 
+ #ifdef GGML_USE_OPENMP
