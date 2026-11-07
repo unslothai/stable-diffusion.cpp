@@ -49,11 +49,14 @@ lengths, GQA with batch, F32 K/V, permuted Q) and unmasked perf cases.
  create mode 100644 src/ggml-cuda/cudnn-attn.cu
  create mode 100644 src/ggml-cuda/cudnn-attn.cuh
 
-[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
- the whole patch as one diff, regenerated from the port.]
+[Ported onto leejet/ggml 135ce1e0 (stable-diffusion.cpp master-1050): the diff below is
+ the whole patch as one diff, regenerated from the port.
+ Upstream ggml 62da2f1b moved SageAttention out of ggml (GGML_OP_SAGE_ATTN is gone), so
+ the SAGE_ATTN half of this patch (sage-attn.cu hook, GGML_CUDA_CUDNN_SAGE) is dropped;
+ cuDNN now only serves FLASH_ATTN_EXT.]
 ---
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 35252a83..da110ce1 100644
+index 2ed8f62d..1fe28c4d 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -209,6 +209,9 @@ set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
@@ -434,10 +437,10 @@ index 00000000..9749f2ab
 +                                  void * q, void * k, void * v, void * o, void * workspace);
 diff --git a/src/ggml-cuda/cudnn-attn.cu b/src/ggml-cuda/cudnn-attn.cu
 new file mode 100644
-index 00000000..a5b9de14
+index 00000000..a7e8911d
 --- /dev/null
 +++ b/src/ggml-cuda/cudnn-attn.cu
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,376 @@
 +#include "cudnn-attn.cuh"
 +
 +#if defined(GGML_CUDA_USE_CUDNN) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -488,28 +491,20 @@ index 00000000..a5b9de14
 +
 +static bool cudnn_attn_make_plan(int device, const ggml_tensor * dst, cudnn_attn_plan & plan) {
 +    static const int  attn_mode = cudnn_attn_env_mode("GGML_CUDA_CUDNN_ATTN");
-+    static const int  sage_mode = cudnn_attn_env_mode("GGML_CUDA_CUDNN_SAGE");
 +    static const bool want_bf16 = cudnn_attn_env_set("GGML_CUDA_CUDNN_ATTN_BF16", false);
-+    if (attn_mode == 0 || (dst->op == GGML_OP_SAGE_ATTN && sage_mode == 0)) {
-+        return false;
-+    }
-+    if (dst->op != GGML_OP_FLASH_ATTN_EXT && dst->op != GGML_OP_SAGE_ATTN) {
-+        return false;
-+    }
-+    // An explicitly requested SageAttention variant keeps its kernel; AUTO takes the cuDNN path.
-+    if (dst->op == GGML_OP_SAGE_ATTN && ggml_get_op_params_i32(dst, 1) != GGML_SAGE_ATTN_AUTO) {
++    if (attn_mode == 0 || dst->op != GGML_OP_FLASH_ATTN_EXT) {
 +        return false;
 +    }
 +    const int cc = ggml_cuda_info().devices[device].cc;
 +    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
 +        return false;
 +    }
-+    // Unset switches keep the existing kernels except where cuDNN measured faster at H3 shapes: against the flash
-+    // attention kernel on sm89 and sm100 (slower on sm86), against the Sage kernel on sm100 (slower on sm86 and
-+    // sm89). Other architectures were not measured. =1 opts in on any sm80+ GPU.
++    // Unset switches keep the existing kernels except where cuDNN measured faster at H3 shapes than the flash
++    // attention kernel: sm89 and sm100 (slower on sm86). Other architectures were not measured. =1 opts in on
++    // any sm80+ GPU.
 +    const bool sm100 = cc >= 1000 && cc < GGML_CUDA_CC_BLACKWELL;
 +    const bool sm89  = cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_HOPPER;
-+    if (dst->op == GGML_OP_SAGE_ATTN ? sage_mode < 0 && !sm100 : attn_mode < 0 && !sm89 && !sm100) {
++    if (attn_mode < 0 && !sm89 && !sm100) {
 +        return false;
 +    }
 +
@@ -824,25 +819,23 @@ index 00000000..a5b9de14
 +#endif
 diff --git a/src/ggml-cuda/cudnn-attn.cuh b/src/ggml-cuda/cudnn-attn.cuh
 new file mode 100644
-index 00000000..067bea63
+index 00000000..c4e98b04
 --- /dev/null
 +++ b/src/ggml-cuda/cudnn-attn.cuh
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,24 @@
 +#pragma once
 +
 +#include "common.cuh"
 +
-+// cuDNN scaled dot product attention for GGML_OP_FLASH_ATTN_EXT and GGML_OP_SAGE_ATTN on NVIDIA
++// cuDNN scaled dot product attention for GGML_OP_FLASH_ATTN_EXT on NVIDIA
 +// sm80+ when the backend is built with GGML_CUDA_CUDNN and libcudnn 9 loads at run time.
 +// Only unmasked, sink-free, ALiBi-free, softcap-free attention with equal Q/K/V head sizes and at
 +// least 2^20 attention scores is taken; everything else, and every shape cuDNN rejects, keeps the
 +// existing kernels.
 +//
-+// By default FLASH_ATTN_EXT takes it on sm89 and sm100 and SAGE_ATTN on sm100, where it measured faster.
++// By default it is taken on sm89 and sm100, where it measured faster than the flash attention kernels.
 +// Environment:
 +//   GGML_CUDA_CUDNN_ATTN=0|1     never use cuDNN for attention / use it on every sm80+ GPU
-+//   GGML_CUDA_CUDNN_SAGE=0|1     keep the SageAttention kernels for GGML_OP_SAGE_ATTN / use cuDNN on every
-+//                                sm80+ GPU (AUTO mode; an explicitly requested Sage variant keeps its kernel)
 +//   GGML_CUDA_CUDNN_ATTN_BF16=1  run cuDNN in BF16 instead of F16 (F16 K/V are narrowed)
 +//   GGML_CUDA_CUDNN_LIB=path     library to open instead of libcudnn.so.9
 +//   GGML_CUDA_CUDNN_ATTN_LOG=1   log every call that takes (or falls back from) the cuDNN path
@@ -855,7 +848,7 @@ index 00000000..067bea63
 +// so the caller runs its own kernel.
 +bool ggml_cuda_cudnn_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index 9fb380e8..84c4e653 100644
+index b22d7bcd..d58d98a4 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
 @@ -4,6 +4,7 @@
@@ -866,7 +859,7 @@ index 9fb380e8..84c4e653 100644
  
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
  // one list per group of ncols1 queries: a column is selected if any query of the group can see it
-@@ -760,11 +761,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -771,11 +772,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
          ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
  
@@ -883,77 +876,11 @@ index 9fb380e8..84c4e653 100644
      switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
          case BEST_FATTN_KERNEL_NONE:
              GGML_ABORT("fatal error");
-diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 5c799ccd..f19aba44 100644
---- a/src/ggml-cuda/ggml-cuda.cu
-+++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -961,7 +961,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
-         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
-         : ggml_nbytes(tensor);
-     if (tensor->op == GGML_OP_SAGE_ATTN) {
--        size = ggml_cuda_sage_attn_get_alloc_size(tensor);
-+        size = ggml_cuda_sage_attn_get_alloc_size(buft_ctx->device, tensor);
-     }
-     if (tensor->op == GGML_OP_SOL_ATTN) {
-         size = ggml_cuda_sol_attn_get_alloc_size(tensor);
-diff --git a/src/ggml-cuda/sage-attn.cu b/src/ggml-cuda/sage-attn.cu
-index 2c103eb0..ceb29ed2 100644
---- a/src/ggml-cuda/sage-attn.cu
-+++ b/src/ggml-cuda/sage-attn.cu
-@@ -1,4 +1,5 @@
- #include "sage-attn.cuh"
-+#include "cudnn-attn.cuh"
- 
- #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDACC_VER_MAJOR__ >= 12
- 
-@@ -332,13 +333,18 @@ bool ggml_cuda_sage_attn_supported(int device, const ggml_tensor* op) {
-            op->ne[2] == q->ne[1] && op->ne[3] == q->ne[3];
- }
- 
--size_t ggml_cuda_sage_attn_get_alloc_size(const ggml_tensor* op) {
-+size_t ggml_cuda_sage_attn_get_alloc_size(int device, const ggml_tensor* op) {
-     // Scratch belongs to the graph allocation, so graph capture and VRAM planning see its full lifetime.
--    return SageWorkspace(op).size;
-+    // The cuDNN path, when it can run, reuses the same region for its own scratch.
-+    return std::max<size_t>(SageWorkspace(op).size, ggml_cuda_cudnn_attn_alloc_size(device, op));
- }
- 
- void ggml_cuda_sage_attn(ggml_backend_cuda_context& ctx, ggml_tensor* dst) {
-     GGML_ASSERT(ggml_cuda_sage_attn_supported(ctx.device, dst));
-+    ggml_cuda_set_device(ctx.device);
-+    if (ggml_cuda_cudnn_attn(ctx, dst)) {
-+        return;
-+    }
-     if (dst->src[0]->ne[0] == 64) {
-         sage_attn<64>(ctx, dst);
-     } else {
-@@ -352,7 +358,7 @@ bool ggml_cuda_sage_attn_supported(int, const ggml_tensor*) {
-     return false;
- }
- 
--size_t ggml_cuda_sage_attn_get_alloc_size(const ggml_tensor* op) {
-+size_t ggml_cuda_sage_attn_get_alloc_size(int, const ggml_tensor* op) {
-     return ggml_nbytes(op);
- }
- 
-diff --git a/src/ggml-cuda/sage-attn.cuh b/src/ggml-cuda/sage-attn.cuh
-index 126c7a74..e2648857 100644
---- a/src/ggml-cuda/sage-attn.cuh
-+++ b/src/ggml-cuda/sage-attn.cuh
-@@ -4,7 +4,7 @@
- #include "common.cuh"
- 
- bool ggml_cuda_sage_attn_supported(int device, const ggml_tensor* op);
--size_t ggml_cuda_sage_attn_get_alloc_size(const ggml_tensor* op);
-+size_t ggml_cuda_sage_attn_get_alloc_size(int device, const ggml_tensor* op);
- void ggml_cuda_sage_attn(ggml_backend_cuda_context& ctx, ggml_tensor* dst);
- 
- #endif
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 108da4a2..62be5695 100644
+index 70b348f4..a54d8745 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12008,6 +12008,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12019,6 +12019,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
  
@@ -975,7 +902,7 @@ index 108da4a2..62be5695 100644
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
      test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
-@@ -12469,6 +12484,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12480,6 +12495,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
      }
  

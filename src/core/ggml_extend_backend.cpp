@@ -1,4 +1,5 @@
 #include "core/ggml_extend_backend.h"
+#include "core/ggml_extensions.h"
 
 #include <algorithm>
 #include <cctype>
@@ -19,9 +20,8 @@
 #include <hip/hip_runtime_api.h>
 #endif
 
+#include "core/ggml_compat.h"
 #include "core/util.h"
-#include "ggml-backend-impl.h"
-#include "ggml-impl.h"
 #include "stable-diffusion.h"
 
 static std::string trim_copy(const std::string& value) {
@@ -297,6 +297,10 @@ bool add_rpc_devices(const std::string& servers) {
     }
     ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
     if (!rpc_reg) {
+        ggml_backend_load_all();
+        rpc_reg = ggml_backend_reg_by_name("RPC");
+    }
+    if (!rpc_reg) {
         LOG_ERROR("RPC backend not found, cannot add RPC servers");
         return false;
     }
@@ -309,10 +313,17 @@ bool add_rpc_devices(const std::string& servers) {
     for (const auto& server : rpc_servers) {
         LOG_INFO("Adding RPC server: %s", server.c_str());
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
-        // no return value to check for success but should print errors from the RPC backend if it fails to add the server
+        if (!reg) {
+            LOG_ERROR("failed to add RPC server: %s", server.c_str());
+            return false;
+        }
         ggml_backend_register(reg);
     }
     return true;
+}
+
+bool sd_add_rpc_servers(const char* servers) {
+    return add_rpc_devices(servers ? servers : "");
 }
 
 static void ggml_backend_load_all_once() {
@@ -538,24 +549,6 @@ ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_
     return chosen;
 }
 
-ggml_backend_buffer_t sd_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device,
-                                                          void* ptr,
-                                                          size_t size,
-                                                          size_t max_tensor_size) {
-    ggml_backend_buffer_t buffer = ggml_backend_dev_buffer_from_host_ptr(device, ptr, size, max_tensor_size);
-    if (buffer != nullptr && buffer->context == nullptr) {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-        if (reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "Metal") == 0) {
-            // Metal can wrap a failed mapping in a non-null buffer. Its free callback also
-            // dereferences the missing context, so only release the outer buffer.
-            buffer->iface.free_buffer = nullptr;
-            ggml_backend_buffer_free(buffer);
-            return nullptr;
-        }
-    }
-    return buffer;
-}
-
 static int cuda_compiled_arch(ggml_backend_t backend) {
 #ifdef SD_USE_CUDA
     if (!sd_backend_is(backend, "CUDA")) {
@@ -684,7 +677,9 @@ bool sd_backend_supports_conv_implicit_gemm(ggml_backend_t backend, bool conv3d)
 
 ggml_backend_t sd_backend_cpu_init() {
     ggml_backend_load_all_once();
-    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    auto backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    sd_ggml_register_extensions(backend);
+    return backend;
 }
 
 ggml_backend_t sd_backend_blas_init() {
@@ -730,21 +725,30 @@ bool sd_backend_cpu_set_n_threads(ggml_backend_t backend, int n_threads) {
     return false;
 }
 
-static ggml_cgraph sd_ggml_graph_view(ggml_cgraph* cgraph0, int i0, int i1) {
-    ggml_cgraph cgraph = {
-        /*.size             =*/0,
-        /*.n_nodes          =*/i1 - i0,
-        /*.n_leafs          =*/0,
-        /*.nodes            =*/cgraph0->nodes + i0,
-        /*.grads            =*/nullptr,
-        /*.grad_accs        =*/nullptr,
-        /*.leafs            =*/nullptr,
-        /*.use_counts       =*/cgraph0->use_counts,
-        /*.visited_hash_set =*/cgraph0->visited_hash_set,
-        /*.order            =*/cgraph0->order,
-        /*.uid              =*/0,
-    };
-    return cgraph;
+void sd_backend_set_buffer_cache_enabled(ggml_backend_t backend, bool enabled) {
+    auto dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+    if (dev == nullptr) {
+        return;
+    }
+    auto reg                    = ggml_backend_dev_backend_reg(dev);
+    using SetBufferCacheEnabled = void (*)(ggml_backend_t, bool);
+    auto fn                     = reinterpret_cast<SetBufferCacheEnabled>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_buffer_cache_enabled"));
+    if (fn != nullptr) {
+        fn(backend, enabled);
+    }
+}
+
+void sd_backend_clear_buffer_cache(ggml_backend_t backend) {
+    auto dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+    if (dev == nullptr) {
+        return;
+    }
+    auto reg               = ggml_backend_dev_backend_reg(dev);
+    using ClearBufferCache = void (*)(ggml_backend_t);
+    auto fn                = reinterpret_cast<ClearBufferCache>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_clear_buffer_cache"));
+    if (fn != nullptr) {
+        fn(backend);
+    }
 }
 
 ggml_status sd_backend_graph_compute_with_eval_callback(ggml_backend_t backend,
@@ -769,8 +773,7 @@ ggml_status sd_backend_graph_compute_with_eval_callback(ggml_backend_t backend,
             need = callback_eval(t, true, callback_eval_user_data);
         }
 
-        ggml_cgraph gv = sd_ggml_graph_view(gf, j0, j1 + 1);
-        status         = ggml_backend_graph_compute_async(backend, &gv);
+        status = ggml_backend_graph_compute_async_range(backend, gf, j0, j1 + 1);
         if (status != GGML_STATUS_SUCCESS) {
             break;
         }
@@ -1296,6 +1299,7 @@ ggml_backend_t SDBackendManager::init_cached_backend(const std::string& name) {
     }
 
     SDBackendHandle handle(backend);
+    sd_ggml_register_extensions(backend);
     backends_.emplace(actual_key, std::move(handle));
     return backend;
 }

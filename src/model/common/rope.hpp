@@ -661,7 +661,7 @@ namespace Rope {
         const int axes_dim_num = static_cast<int>(axes_dim.size());
         auto make_image_ids    = [=, &result](int image_h, int image_w, int image_index) {
             std::vector<std::vector<float>> image_ids(static_cast<size_t>(bs) * image_h * image_w,
-                                                         std::vector<float>(axes_dim_num, 0.f));
+                                                      std::vector<float>(axes_dim_num, 0.f));
             result.positions.append_image(image_h, image_w);
             int h_start = -(image_h - image_h / 2);
             int w_start = -(image_w - image_w / 2);
@@ -1078,8 +1078,8 @@ namespace Rope {
         if (backend != nullptr && x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
             x->ne[0] % 2 == 0 && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == x->ne[0] / 2 && pe->ne[3] == x->ne[2]) {
-            auto out = ggml_rope_apply(ctx, x, pe, rope_interleaved);
-            if (ggml_backend_supports_op(backend, out)) {
+            auto out = sd_ggml_rope_apply(ctx, backend, x, pe, rope_interleaved);
+            if (out && ggml_backend_supports_op(backend, out)) {
                 return out;
             }
         }
