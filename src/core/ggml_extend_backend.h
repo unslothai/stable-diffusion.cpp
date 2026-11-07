@@ -107,6 +107,9 @@ ggml_backend_t sd_backend_cpu_init();
 ggml_backend_t sd_backend_blas_init();
 bool sd_backend_set_n_threads_any(ggml_backend_t backend, int n_threads);
 bool sd_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads);
+void sd_backend_set_buffer_cache_enabled(ggml_backend_t backend, bool enabled);
+void sd_backend_clear_buffer_cache(ggml_backend_t backend);
+
 ggml_status sd_backend_graph_compute_with_eval_callback(ggml_backend_t backend,
                                                         ggml_cgraph* gf,
                                                         sd_graph_eval_callback_t callback_eval,
