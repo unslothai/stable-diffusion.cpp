@@ -1902,7 +1902,10 @@ namespace sd::pipeline {
         sd->reset_generation_extensions();
 
         if (sd_version_is_cosmos3(sd->version)) {
-            return generate_cosmos3_transfer_video(sd, sd_vid_gen_params, request, frames_out, num_frames_out);
+            const bool ok = generate_cosmos3_transfer_video(sd, sd_vid_gen_params, request, frames_out, num_frames_out);
+            if (ok && info_out)
+                *info_out = info;
+            return ok;
         }
 
         SamplePlan plan(sd, sd_vid_gen_params, request);

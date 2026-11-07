@@ -396,6 +396,10 @@ namespace sd::pipeline {
         LOG_INFO("cosmos3: %" PRId64 " latent frames in %.2fs (%.1f ms per latent frame, %.2f output fps excluding VAE)",
                  n_latent, denoise_ms / 1000.f, static_cast<float>(denoise_ms) / n_latent, pixel_frames * 1000.f / denoise_ms);
 
+        if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+            LOG_ERROR("cosmos3: cancelled before video decode");
+            return false;
+        }
         const int64_t decode_start = ggml_time_ms();
         sd::Tensor<float> video    = sd->decode_first_stage(output, true);
         if (video.empty()) {
