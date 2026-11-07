@@ -464,7 +464,7 @@ ArgOptions SDContextParams::get_options() {
          &uncond_diffusion_model_path},
         {"",
          "--embeddings-connectors",
-         "path to LTXAV embeddings connectors",
+         "path to embeddings connectors (LTXAV or P-H3-Image)",
          0,
          &embeddings_connectors_path},
         {"",
@@ -597,6 +597,11 @@ ArgOptions SDContextParams::get_options() {
 
     options.bool_options = {
         {"",
+         "--list-devices",
+         "list available ggml backend devices, including --rpc-servers (one 'name<TAB>description' per line), and exit; "
+         "the names are the device names accepted by --backend and --params-backend",
+         true, &list_devices},
+        {"",
          "--disable-prefetch",
          "disable asynchronous next-segment weight prefetch (defaults to false)",
          true, &disable_prefetch},
@@ -636,6 +641,10 @@ ArgOptions SDContextParams::get_options() {
          "--sage-attn",
          "use native CUDA SageAttention in the diffusion model, with flash/default attention fallback",
          true, &sage_attn},
+        {"",
+         "--taesd-preview-only",
+         "prevents usage of taesd for decoding the final image; the VAE keeps encoding / decoding and taesd is only used for step previews",
+         true, &taesd_preview_only},
     };
 
     auto on_type_arg = [&](int argc, const char** argv, int index) {
@@ -809,7 +818,7 @@ ArgOptions SDContextParams::get_options() {
          on_sampler_rng_arg},
         {"",
          "--prediction",
-         "prediction type override, one of [eps, v, edm_v, sd3_flow, flux_flow, sefi_flow]",
+         "prediction type override, one of [eps, v, edm_v, sd3_flow, flux_flow, sefi_flow, minit2i_flow, sensenova_u1_flow, flux3_flow, h3_av_flow, ming_image_flow]",
          on_prediction_arg},
         {"",
          "--lora-apply-mode",
@@ -819,21 +828,20 @@ ArgOptions SDContextParams::get_options() {
          "but it usually offers faster inference speed and, in some cases, lower memory usage. "
          "The at_runtime mode, on the other hand, is exactly the opposite.",
          on_lora_apply_mode_arg},
-        {"",
-         "--list-devices",
-         "list available ggml backend devices (one 'name<TAB>description' per line) and exit; "
-         "the names are the device names accepted by --backend and --params-backend",
-         [](int /*argc*/, const char** /*argv*/, int /*index*/) {
-             size_t device_list_size = sd_list_devices(nullptr, 0);
-             std::vector<char> devices(device_list_size + 1);
-             sd_list_devices(devices.data(), devices.size());
-             fputs(devices.data(), stdout);
-             std::exit(0);
-             return 0;
-         }},
     };
 
     return options;
+}
+
+bool SDContextParams::print_devices() const {
+    if (!sd_add_rpc_servers(rpc_servers.c_str())) {
+        return false;
+    }
+    size_t device_list_size = sd_list_devices(nullptr, 0);
+    std::vector<char> devices(device_list_size + 1);
+    sd_list_devices(devices.data(), devices.size());
+    fputs(devices.data(), stdout);
+    return true;
 }
 
 void SDContextParams::build_embedding_map() {
@@ -1010,6 +1018,7 @@ std::string SDContextParams::to_string() const {
         << "  attn_scale: " << attn_scale << ",\n"
         << "  diffusion_conv_direct: " << (diffusion_conv_direct ? "true" : "false") << ",\n"
         << "  vae_conv_direct: " << (vae_conv_direct ? "true" : "false") << ",\n"
+        << "  taesd_preview_only: " << (taesd_preview_only ? "true" : "false") << ",\n"
         << "  prediction: " << sd_prediction_name(prediction) << ",\n"
         << "  lora_apply_mode: " << sd_lora_apply_mode_name(lora_apply_mode) << ",\n"
         << "  force_sdxl_vae_conv_scale: " << (force_sdxl_vae_conv_scale ? "true" : "false") << "\n"
@@ -1017,7 +1026,7 @@ std::string SDContextParams::to_string() const {
     return oss.str();
 }
 
-sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
+sd_ctx_params_t SDContextParams::to_sd_ctx_params_t() {
     prepare_backend_assignments();
     embedding_vec.clear();
     embedding_vec.reserve(embedding_map.size());
@@ -1067,7 +1076,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.sage_attn                       = sage_attn;
     sd_ctx_params.linear_scale                    = linear_scale;
     sd_ctx_params.attn_scale                      = attn_scale;
-    sd_ctx_params.tae_preview_only                = taesd_preview;
+    sd_ctx_params.tae_preview_only                = taesd_preview_only;
     sd_ctx_params.diffusion_conv_direct           = diffusion_conv_direct;
     sd_ctx_params.vae_conv_direct                 = vae_conv_direct;
     sd_ctx_params.force_sdxl_vae_conv_scale       = force_sdxl_vae_conv_scale;
@@ -1185,7 +1194,7 @@ ArgOptions SDGenerationParams::get_options() {
          &extra_sample_args},
         {"",
          "--extra-tiling-args",
-         "extra VAE tiling args, key=value list. Supported video VAEs accept temporal_tile_frames/temporal_tile_size (default: 4), temporal_tile_overlap (default: 1)",
+         "extra VAE tiling args, key=value list. Supported video VAEs accept temporal_tile_frames/temporal_tile_size (default: 4), temporal_tile_overlap (default: 1); Wan2.2 TI2V 5B accepts temporal_decode_frames (default: 1)",
          (int)',',
          &extra_tiling_args},
         {"",
@@ -1521,6 +1530,8 @@ ArgOptions SDGenerationParams::get_options() {
         std::string sigmas_str = value;
         if (sigmas_str == "qwen-image-2.1-turbo") {
             sigmas_str = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0";
+        } else if (sigmas_str == "p-h3-image") {
+            sigmas_str = "1.0,0.984753,0.967905,0.951688,0.925372,0.881923,0.810083,0.528718,0.0";
         }
         if (!sigmas_str.empty() && sigmas_str.front() == '[') {
             sigmas_str.erase(0, 1);
@@ -1768,11 +1779,11 @@ ArgOptions SDGenerationParams::get_options() {
          on_scheduler_arg},
         {"",
          "--sigmas",
-         "custom sigma values for the sampler, comma-separated (e.g., \"14.61,7.8,3.5,0.0\") or preset: qwen-image-2.1-turbo.",
+         "custom sigma values for the sampler, comma-separated (e.g., \"14.61,7.8,3.5,0.0\") or preset: qwen-image-2.1-turbo, p-h3-image.",
          on_sigmas_arg},
         {"",
          "--hires-sigmas",
-         "custom sigma values for the highres fix second pass, comma-separated (e.g., \"0.85,0.725,0.421875,0.0\") or preset: qwen-image-2.1-turbo.",
+         "custom sigma values for the highres fix second pass, comma-separated (e.g., \"0.85,0.725,0.421875,0.0\") or preset: qwen-image-2.1-turbo, p-h3-image.",
          on_hires_sigmas_arg},
         {"",
          "--skip-layers",
@@ -1950,6 +1961,7 @@ static bool parse_image_json_field(const json& parent,
     return decode_base64_image(parent.at(key).get<std::string>(), channels, 0, 0, out_image);
 }
 
+/** Parses a JSON array of base64 image strings into owned images. */
 static bool parse_image_array_json_field(const json& parent,
                                          const char* key,
                                          int channels,
@@ -1975,6 +1987,84 @@ static bool parse_image_array_json_field(const json& parent,
             return false;
         }
         out_images.push_back(std::move(image));
+    }
+    return true;
+}
+
+/** Parses a JSON array of base64 WAV strings into owned audio clips. */
+static bool parse_audio_array_json_field(const json& parent,
+                                         const char* key,
+                                         std::vector<SDAudioOwner>& out_audios) {
+    if (!parent.contains(key)) {
+        return true;
+    }
+    if (parent.at(key).is_null()) {
+        out_audios.clear();
+        return true;
+    }
+    if (!parent.at(key).is_array()) {
+        return false;
+    }
+
+    out_audios.clear();
+    for (const auto& item : parent.at(key)) {
+        if (!item.is_string()) {
+            return false;
+        }
+        std::string encoded = item.get<std::string>();
+        auto comma_pos      = encoded.find(',');
+        if (comma_pos != std::string::npos) {
+            encoded = encoded.substr(comma_pos + 1);
+        }
+        std::vector<uint8_t> audio_bytes = decode_base64_bytes(encoded);
+        if (audio_bytes.empty()) {
+            return false;
+        }
+        std::vector<float> samples;
+        uint32_t sample_rate = 0;
+        uint32_t channels    = 0;
+        if (!load_wav_from_memory(audio_bytes.data(), audio_bytes.size(), samples, sample_rate, channels)) {
+            return false;
+        }
+        SDAudioOwner audio;
+        audio.reset(std::move(samples), sample_rate, channels);
+        out_audios.push_back(std::move(audio));
+    }
+    return true;
+}
+
+/** Parses a JSON array of per-video base64 frame arrays into owned videos. */
+static bool parse_video_array_json_field(const json& parent,
+                                         const char* key,
+                                         std::vector<std::vector<SDImageOwner>>& out_videos) {
+    if (!parent.contains(key)) {
+        return true;
+    }
+    if (parent.at(key).is_null()) {
+        out_videos.clear();
+        return true;
+    }
+    if (!parent.at(key).is_array()) {
+        return false;
+    }
+
+    out_videos.clear();
+    for (const auto& video : parent.at(key)) {
+        if (!video.is_array() || video.empty()) {
+            return false;
+        }
+        std::vector<SDImageOwner> frames;
+        for (const auto& frame : video) {
+            if (!frame.is_string()) {
+                return false;
+            }
+            SDImageOwner image;
+            if (!decode_base64_image(frame.get<std::string>(), 0, 0, 0, image)) {
+                return false;
+            }
+            frames.push_back(std::move(image));
+        }
+        out_videos.push_back(std::move(frames));
     }
     return true;
 }
@@ -2093,6 +2183,7 @@ bool SDGenerationParams::parse_image_preprocess_json(const std::string& json_str
     return true;
 }
 
+/** Populates generation params from a JSON payload (server APIs); returns false on any malformed field. */
 bool SDGenerationParams::from_json_str(
     const std::string& json_str,
     const std::function<std::string(const std::string&)>& lora_path_resolver) {
@@ -2219,7 +2310,7 @@ bool SDGenerationParams::from_json_str(
         if (target_custom_sigmas != nullptr &&
             sample_json.contains("custom_sigmas") &&
             sample_json["custom_sigmas"].is_array() &&
-            !sample_json["custom_sigmas"].empty()) { // empty [] = "not specified", keep server/CLI default
+            !sample_json["custom_sigmas"].empty()) {  // empty [] = "not specified", keep server/CLI default
             *target_custom_sigmas = sample_json["custom_sigmas"].get<std::vector<float>>();
         }
         if (sample_json.contains("sample_method") && sample_json["sample_method"].is_string()) {
@@ -2321,8 +2412,11 @@ bool SDGenerationParams::from_json_str(
         return false;
     }
     if (!parse_image_array_json_field(j, "ref_images", 0, ref_images) ||
-        !parse_image_array_json_field(j, "control_frames", 3, control_frames)) {
-        LOG_ERROR("invalid input image array");
+        !parse_image_array_json_field(j, "control_frames", 3, control_frames) ||
+        !parse_audio_array_json_field(j, "ref_audios", ref_audios) ||
+        !parse_audio_array_json_field(j, "ref_video_audios", ref_video_audios) ||
+        !parse_video_array_json_field(j, "ref_videos", ref_videos)) {
+        LOG_ERROR("invalid input image/audio/video array");
         return false;
     }
 
@@ -2539,11 +2633,6 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
         return false;
     }
 
-    if (seed < 0) {
-        srand((int)time(nullptr));
-        seed = rand();
-    }
-
     if (strict) {
         batch_count                = std::clamp(batch_count, 1, 8);
         sample_params.sample_steps = std::clamp(sample_params.sample_steps, 1, 100);
@@ -2579,6 +2668,7 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
     return true;
 }
 
+/** Validates params for a generation mode; enforces mode-specific input rules. */
 bool SDGenerationParams::validate(SDMode mode) {
     if (!image_preprocess.empty() && mode != IMG_GEN && mode != VID_GEN) {
         LOG_ERROR("--image-preprocess requires img_gen or vid_gen mode");
@@ -2632,12 +2722,13 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
-    if (ref_video_audio_paths.size() > ref_video_paths.size()) {
+    if (ref_video_audio_paths.size() + ref_video_audios.size() > ref_video_paths.size() + ref_videos.size()) {
         LOG_ERROR("error: each --ref-video-audio needs a corresponding --ref-video");
         return false;
     }
 
-    if (mode != VID_GEN && (!ref_video_paths.empty() || !ref_video_audio_paths.empty() || !ref_audio_paths.empty())) {
+    if (mode != VID_GEN && (!ref_video_paths.empty() || !ref_video_audio_paths.empty() || !ref_audio_paths.empty() ||
+                            !ref_videos.empty() || !ref_video_audios.empty() || !ref_audios.empty())) {
         LOG_ERROR("error: reference video and audio inputs require vid_gen mode");
         return false;
     }
@@ -2910,6 +3001,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
     params.image_preprocess          = {image_preprocess.c_str()};
+    params.ref_image_args            = ref_image_args.c_str();
     return params;
 }
 
@@ -3018,302 +3110,4 @@ std::string SDGenerationParams::to_string() const {
 
 std::string version_string() {
     return std::string("stable-diffusion.cpp version ") + sd_version() + ", commit " + sd_commit();
-}
-
-static std::string safe_json_string(const char* value) {
-    return value ? value : "";
-}
-
-static void set_json_basename_if_not_empty(json& target, const char* key, const std::string& path) {
-    if (!path.empty()) {
-        target[key] = sd_basename(path);
-    }
-}
-
-static json build_sampling_metadata_json(const sd_sample_params_t& sample_params,
-                                         const std::vector<int>& skip_layers,
-                                         const std::vector<float>* custom_sigmas = nullptr) {
-    json sampling = {
-        {"steps", sample_params.sample_steps},
-        {"eta", sample_params.eta},
-        {"shifted_timestep", sample_params.shifted_timestep},
-        {"flow_shift", sample_params.flow_shift},
-        {"extra_sample_args", safe_json_string(sample_params.extra_sample_args)},
-        {"guidance",
-         {
-             {"txt_cfg", sample_params.guidance.txt_cfg},
-             {"img_cfg", sample_params.guidance.img_cfg},
-             {"distilled_guidance", sample_params.guidance.distilled_guidance},
-             {"slg",
-              {
-                  {"scale", sample_params.guidance.slg.scale},
-                  {"layers", skip_layers},
-                  {"start", sample_params.guidance.slg.layer_start},
-                  {"end", sample_params.guidance.slg.layer_end},
-              }},
-         }},
-    };
-    if (sample_params.sample_method != SAMPLE_METHOD_COUNT) {
-        sampling["method"] = safe_json_string(sd_sample_method_name(sample_params.sample_method));
-    }
-    if (sample_params.scheduler != SCHEDULER_COUNT) {
-        sampling["scheduler"] = safe_json_string(sd_scheduler_name(sample_params.scheduler));
-    }
-    if (custom_sigmas != nullptr) {
-        sampling["custom_sigmas"] = *custom_sigmas;
-    }
-    return sampling;
-}
-
-std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
-                                            const SDGenerationParams& gen_params,
-                                            int64_t seed,
-                                            SDMode mode) {
-    json root;
-    root["schema"] = "sdcpp.image.params/v1";
-    root["mode"]   = "img_gen";
-    if (mode == VID_GEN) {
-        root["mode"] = "vid_gen";
-    } else if (mode == ADETAILER) {
-        root["mode"] = "adetailer";
-    }
-    root["generator"] = {
-        {"name", "stable-diffusion.cpp"},
-        {"version", safe_json_string(sd_version())},
-        {"commit", safe_json_string(sd_commit())},
-    };
-    root["seed"]   = seed;
-    root["width"]  = gen_params.get_resolved_width();
-    root["height"] = gen_params.get_resolved_height();
-
-    root["prompt"] = {
-        {"positive", gen_params.prompt},
-        {"negative", gen_params.negative_prompt},
-    };
-    if (!gen_params.ad_model_path.empty()) {
-        root["adetailer"] = {
-            {"model", sd_basename(gen_params.ad_model_path)},
-            {"prompt", gen_params.ad_prompt},
-            {"negative_prompt", gen_params.ad_negative_prompt},
-            {"extra_args", gen_params.extra_ad_args},
-        };
-    }
-    root["sampling"] = build_sampling_metadata_json(gen_params.sample_params,
-                                                    gen_params.skip_layers,
-                                                    &gen_params.custom_sigmas);
-
-    json models;
-    set_json_basename_if_not_empty(models, "model", ctx_params.model_path);
-    set_json_basename_if_not_empty(models, "clip_l", ctx_params.clip_l_path);
-    set_json_basename_if_not_empty(models, "clip_g", ctx_params.clip_g_path);
-    set_json_basename_if_not_empty(models, "clip_vision", ctx_params.clip_vision_path);
-    set_json_basename_if_not_empty(models, "t5xxl", ctx_params.t5xxl_path);
-    set_json_basename_if_not_empty(models, "llm", ctx_params.llm_path);
-    set_json_basename_if_not_empty(models, "llm_vision", ctx_params.llm_vision_path);
-    set_json_basename_if_not_empty(models, "diffusion_model", ctx_params.diffusion_model_path);
-    set_json_basename_if_not_empty(models, "high_noise_diffusion_model", ctx_params.high_noise_diffusion_model_path);
-    set_json_basename_if_not_empty(models, "uncond_diffusion_model", ctx_params.uncond_diffusion_model_path);
-    set_json_basename_if_not_empty(models, "vae", ctx_params.vae_path);
-    set_json_basename_if_not_empty(models, "taesd", ctx_params.taesd_path);
-    set_json_basename_if_not_empty(models, "control_net", ctx_params.control_net_path);
-    root["models"] = std::move(models);
-
-    root["clip_skip"]           = gen_params.clip_skip;
-    root["strength"]            = gen_params.strength;
-    root["control_strength"]    = gen_params.control_strength;
-    root["ip_adapter_strength"] = gen_params.ip_adapter_strength;
-    root["ref_image_args"]      = gen_params.ref_image_args;
-    root["image_preprocess"]    = gen_params.image_preprocess;
-    root["increase_ref_index"]  = gen_params.increase_ref_index;
-    if (mode == VID_GEN) {
-        root["video"] = {
-            {"frame_count", gen_params.video_frames},
-            {"fps", gen_params.fps},
-        };
-        root["moe_boundary"]        = gen_params.moe_boundary;
-        root["vace_strength"]       = gen_params.vace_strength;
-        root["high_noise_sampling"] = build_sampling_metadata_json(gen_params.high_noise_sample_params,
-                                                                   gen_params.high_noise_skip_layers);
-    }
-
-    root["rng"] = safe_json_string(sd_rng_type_name(ctx_params.rng_type));
-    if (ctx_params.sampler_rng_type != RNG_TYPE_COUNT) {
-        root["sampler_rng"] = safe_json_string(sd_rng_type_name(ctx_params.sampler_rng_type));
-    }
-
-    json loras = json::array();
-    for (const auto& entry : gen_params.lora_map) {
-        loras.push_back({
-            {"name", sd_basename(entry.first)},
-            {"multiplier", entry.second},
-            {"is_high_noise", false},
-        });
-    }
-    for (const auto& entry : gen_params.high_noise_lora_map) {
-        loras.push_back({
-            {"name", sd_basename(entry.first)},
-            {"multiplier", entry.second},
-            {"is_high_noise", true},
-        });
-    }
-    if (!loras.empty()) {
-        root["loras"] = std::move(loras);
-    }
-
-    if (gen_params.hires_enabled) {
-        root["hires"] = {
-            {"enabled", gen_params.hires_enabled},
-            {"upscaler", gen_params.hires_upscaler},
-            {"model", gen_params.hires_upscaler_model_path.empty() ? "" : sd_basename(gen_params.hires_upscaler_model_path)},
-            {"scale", gen_params.hires_scale},
-            {"target_width", gen_params.hires_width},
-            {"target_height", gen_params.hires_height},
-            {"steps", gen_params.hires_steps},
-            {"denoising_strength", gen_params.hires_denoising_strength},
-            {"custom_sigmas", gen_params.hires_custom_sigmas},
-            {"upscale_tile_size", gen_params.hires_upscale_tile_size},
-        };
-    }
-
-    if (gen_params.cache_params.mode != SD_CACHE_DISABLED) {
-        root["cache"] = {
-            {"requested_mode", gen_params.cache_mode},
-            {"requested_option", gen_params.cache_option},
-            {"mode", gen_params.cache_params.mode},
-            {"scm_mask", gen_params.scm_mask},
-            {"scm_policy_dynamic", gen_params.scm_policy_dynamic},
-            {"reuse_threshold", gen_params.cache_params.reuse_threshold},
-            {"start_percent", gen_params.cache_params.start_percent},
-            {"end_percent", gen_params.cache_params.end_percent},
-            {"error_decay_rate", gen_params.cache_params.error_decay_rate},
-            {"use_relative_threshold", gen_params.cache_params.use_relative_threshold},
-            {"reset_error_on_compute", gen_params.cache_params.reset_error_on_compute},
-            {"Fn_compute_blocks", gen_params.cache_params.Fn_compute_blocks},
-            {"Bn_compute_blocks", gen_params.cache_params.Bn_compute_blocks},
-            {"residual_diff_threshold", gen_params.cache_params.residual_diff_threshold},
-            {"max_warmup_steps", gen_params.cache_params.max_warmup_steps},
-            {"max_cached_steps", gen_params.cache_params.max_cached_steps},
-            {"max_continuous_cached_steps", gen_params.cache_params.max_continuous_cached_steps},
-            {"taylorseer_n_derivatives", gen_params.cache_params.taylorseer_n_derivatives},
-            {"taylorseer_skip_interval", gen_params.cache_params.taylorseer_skip_interval},
-            {"spectrum_w", gen_params.cache_params.spectrum_w},
-            {"spectrum_m", gen_params.cache_params.spectrum_m},
-            {"spectrum_lam", gen_params.cache_params.spectrum_lam},
-            {"spectrum_window_size", gen_params.cache_params.spectrum_window_size},
-            {"spectrum_flex_window", gen_params.cache_params.spectrum_flex_window},
-            {"spectrum_warmup_steps", gen_params.cache_params.spectrum_warmup_steps},
-            {"spectrum_stop_percent", gen_params.cache_params.spectrum_stop_percent},
-        };
-    }
-
-    if (gen_params.vae_tiling_params.enabled ||
-        gen_params.vae_tiling_params.temporal_tiling ||
-        !gen_params.extra_tiling_args.empty()) {
-        root["vae_tiling"] = {
-            {"enabled", gen_params.vae_tiling_params.enabled},
-            {"temporal_tiling", gen_params.vae_tiling_params.temporal_tiling},
-            {"tile_size_w", gen_params.vae_tiling_params.tile_size_w},
-            {"tile_size_h", gen_params.vae_tiling_params.tile_size_h},
-            {"target_overlap", gen_params.vae_tiling_params.target_overlap},
-            {"rel_size_w", gen_params.vae_tiling_params.rel_size_w},
-            {"rel_size_h", gen_params.vae_tiling_params.rel_size_h},
-            {"extra_tiling_args", gen_params.extra_tiling_args},
-        };
-    }
-
-    return root.dump();
-}
-
-std::string get_image_params(const SDContextParams& ctx_params,
-                             const SDGenerationParams& gen_params,
-                             int64_t seed,
-                             SDMode mode) {
-    std::string parameter_string;
-    if (gen_params.prompt_with_lora.size() != 0) {
-        parameter_string += gen_params.prompt_with_lora + "\n";
-    } else {
-        parameter_string += gen_params.prompt + "\n";
-    }
-    if (gen_params.negative_prompt.size() != 0) {
-        parameter_string += "Negative prompt: " + gen_params.negative_prompt + "\n";
-    }
-    parameter_string += "Steps: " + std::to_string(gen_params.sample_params.sample_steps) + ", ";
-    parameter_string += "CFG scale: " + std::to_string(gen_params.sample_params.guidance.txt_cfg) + ", ";
-    if (gen_params.sample_params.guidance.slg.scale != 0 && gen_params.skip_layers.size() != 0) {
-        parameter_string += "SLG scale: " + std::to_string(gen_params.sample_params.guidance.slg.scale) + ", ";
-        parameter_string += "Skip layers: [";
-        for (const auto& layer : gen_params.skip_layers) {
-            parameter_string += std::to_string(layer) + ", ";
-        }
-        parameter_string += "], ";
-        parameter_string += "Skip layer start: " + std::to_string(gen_params.sample_params.guidance.slg.layer_start) + ", ";
-        parameter_string += "Skip layer end: " + std::to_string(gen_params.sample_params.guidance.slg.layer_end) + ", ";
-    }
-    parameter_string += "Guidance: " + std::to_string(gen_params.sample_params.guidance.distilled_guidance) + ", ";
-    parameter_string += "Eta: " + std::to_string(gen_params.sample_params.eta) + ", ";
-    if (!gen_params.extra_sample_args.empty()) {
-        parameter_string += "Extra sample args: " + gen_params.extra_sample_args + ", ";
-    }
-    if (!gen_params.ad_model_path.empty()) {
-        parameter_string += "ADetailer model: " + sd_basename(gen_params.ad_model_path) + ", ";
-        if (!gen_params.ad_prompt.empty()) {
-            parameter_string += "ADetailer prompt: " + gen_params.ad_prompt + ", ";
-        }
-        if (!gen_params.ad_negative_prompt.empty()) {
-            parameter_string += "ADetailer negative prompt: " + gen_params.ad_negative_prompt + ", ";
-        }
-        if (!gen_params.extra_ad_args.empty()) {
-            parameter_string += "ADetailer args: " + gen_params.extra_ad_args + ", ";
-        }
-    }
-    parameter_string += "Seed: " + std::to_string(seed) + ", ";
-    parameter_string += "Size: " + std::to_string(gen_params.get_resolved_width()) + "x" + std::to_string(gen_params.get_resolved_height()) + ", ";
-    parameter_string += "Model: " + sd_basename(ctx_params.model_path) + ", ";
-    parameter_string += "RNG: " + std::string(sd_rng_type_name(ctx_params.rng_type)) + ", ";
-    if (ctx_params.sampler_rng_type != RNG_TYPE_COUNT) {
-        parameter_string += "Sampler RNG: " + std::string(sd_rng_type_name(ctx_params.sampler_rng_type)) + ", ";
-    }
-    parameter_string += "Sampler: " + std::string(sd_sample_method_name(gen_params.sample_params.sample_method));
-    if (!gen_params.custom_sigmas.empty()) {
-        parameter_string += ", Custom Sigmas: [";
-        for (size_t i = 0; i < gen_params.custom_sigmas.size(); ++i) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(4) << gen_params.custom_sigmas[i];
-            parameter_string += oss.str() + (i == gen_params.custom_sigmas.size() - 1 ? "" : ", ");
-        }
-        parameter_string += "]";
-    } else if (gen_params.sample_params.scheduler != SCHEDULER_COUNT) {  // Only show schedule if not using custom sigmas
-        parameter_string += " " + std::string(sd_scheduler_name(gen_params.sample_params.scheduler));
-    }
-    parameter_string += ", ";
-    for (const auto& te : {ctx_params.clip_l_path, ctx_params.clip_g_path, ctx_params.t5xxl_path, ctx_params.llm_path, ctx_params.llm_vision_path}) {
-        if (!te.empty()) {
-            parameter_string += "TE: " + sd_basename(te) + ", ";
-        }
-    }
-    if (!ctx_params.diffusion_model_path.empty()) {
-        parameter_string += "Unet: " + sd_basename(ctx_params.diffusion_model_path) + ", ";
-    }
-    if (!ctx_params.uncond_diffusion_model_path.empty()) {
-        parameter_string += "Uncond Unet: " + sd_basename(ctx_params.uncond_diffusion_model_path) + ", ";
-    }
-    if (!ctx_params.vae_path.empty()) {
-        parameter_string += "VAE: " + sd_basename(ctx_params.vae_path) + ", ";
-    }
-    if (gen_params.clip_skip != -1) {
-        parameter_string += "Clip skip: " + std::to_string(gen_params.clip_skip) + ", ";
-    }
-    if (gen_params.hires_enabled) {
-        parameter_string += "Hires upscale: " + gen_params.hires_upscaler + ", ";
-        parameter_string += "Hires scale: " + std::to_string(gen_params.hires_scale) + ", ";
-        parameter_string += "Hires resize: " + std::to_string(gen_params.hires_width) + "x" + std::to_string(gen_params.hires_height) + ", ";
-        parameter_string += "Hires steps: " + std::to_string(gen_params.hires_steps) + ", ";
-        parameter_string += "Denoising strength: " + std::to_string(gen_params.hires_denoising_strength) + ", ";
-        if (!gen_params.hires_custom_sigmas.empty()) {
-            parameter_string += "Hires custom sigmas: " + vec_to_string(gen_params.hires_custom_sigmas) + ", ";
-        }
-    }
-    parameter_string += "Version: stable-diffusion.cpp";
-    parameter_string += ", SDCPP: " + build_sdcpp_image_metadata_json(ctx_params, gen_params, seed, mode);
-    return parameter_string;
 }

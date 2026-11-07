@@ -221,6 +221,11 @@ jobs:
           # (we build with SD_SERVER_BUILD_FRONTEND / SD_WEBP / SD_WEBM off), so fetch only
           # ggml to keep the source tarball small and the build self-contained.
           git submodule update --init --recursive --depth 1 ggml
+          # The CUDA build includes cmake/cutlass.cmake, which fails without the CUTLASS headers
+          # (INT8 GEMM and CuTe attention kernels). Only include/ is compiled against, so keep that
+          # and the license and drop the rest of the checkout from the source tarball.
+          git submodule update --init --depth 1 thirdparty/cutlass
+          find thirdparty/cutlass -mindepth 1 -maxdepth 1 ! -name include ! -name LICENSE.txt ! -name .git -exec rm -rf {} +
           # ggml changes we carry on top of the pinned submodule commit (the submodule points at
           # leejet/ggml, which we do not push to). A patch that no longer applies fails the build.
           for p in scripts/unsloth/ggml-patches/*.patch; do
@@ -264,7 +269,7 @@ jobs:
       matrix:
         include:
           - label: Darwin-macOS-arm64
-            runner: macos-14
+            runner: macos-15
             arch: arm64
             # Static: apple_m1 variant drops FP16_VA (~40% slower). BLAS explicit: sd.cpp routes big matmuls to it.
             defines: "-DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"

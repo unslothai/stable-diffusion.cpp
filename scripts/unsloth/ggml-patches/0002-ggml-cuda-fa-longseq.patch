@@ -33,11 +33,15 @@ tiles, several Q tiles and GQA broadcast.
  4 files changed, 184 insertions(+), 15 deletions(-)
  create mode 100644 src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_128-ncols2_1.cu
 
-[Ported onto leejet/ggml dc998771 (stable-diffusion.cpp master-982): the diff below is
- the whole patch as one diff, regenerated from the port.]
+[Ported onto leejet/ggml 135ce1e0 (stable-diffusion.cpp master-1050): the diff below is
+ the whole patch as one diff, regenerated from the port.
+ Upstream ggml 0d84d52a (wide flash-attention tiles) added the DKQ=128 ncols1=128
+ config row, its instance (fattn-mma-wide.cu) and ggml_cuda_fattn_mma_shared_size; the
+ port reuses them (shared_size gains an nstages override for the long-sequence variant)
+ and the instance file here now only adds DKQ=64 ncols1=128.]
 ---
 diff --git a/src/ggml-cuda/fattn-common.cuh b/src/ggml-cuda/fattn-common.cuh
-index 41d94833..82f43137 100644
+index 8bfe7e30..1840b69c 100644
 --- a/src/ggml-cuda/fattn-common.cuh
 +++ b/src/ggml-cuda/fattn-common.cuh
 @@ -981,7 +981,10 @@ template <int DV, int ncols1, int ncols2>
@@ -63,21 +67,21 @@ index 41d94833..82f43137 100644
      int parallel_blocks = max_blocks_per_sm;
  
 diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
-index 296aa2b3..e011c8d5 100644
+index 391c75be..ca372be9 100644
 --- a/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -61,6 +61,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+@@ -62,6 +62,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 2, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
  
-+    // ncols == 128 is only used by the long-sequence variant (ncols2 == 1, no mask), see ggml_cuda_fattn_mma_use_longseq:
++    // ncols == 128 for DKQ == 64 is only used by the long-sequence variant (ncols2 == 1, no mask), see
++    // ggml_cuda_fattn_mma_use_longseq; the DKQ == 128 row is the wide tile at the top of this table.
 +    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 128, 256, 1,  64,  32,  32,  32, 2, true);
-+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 128, 256, 1,  64,  64,  64,  64, 2, true);
 +
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 4,  32,  96,  64,  64, 2, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  32,  96,  64,  64, 2, true);
-@@ -378,6 +382,24 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
+@@ -379,6 +383,24 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
  #endif // CP_ASYNC_AVAILABLE
  }
  
@@ -102,7 +106,7 @@ index 296aa2b3..e011c8d5 100644
  // ------------------------------------------------------------------------------------------------------------------
  
  template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
-@@ -573,7 +595,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
+@@ -574,7 +596,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
  
  template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
      bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
@@ -111,7 +115,7 @@ index 296aa2b3..e011c8d5 100644
  static __device__ __forceinline__ void flash_attn_ext_f16_iter(
          const float2 * const __restrict__ Q_f2,
          const half2  * const __restrict__ K_h2,
-@@ -611,7 +633,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -612,7 +634,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
      constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
      constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
      constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
@@ -120,7 +124,7 @@ index 296aa2b3..e011c8d5 100644
  
      constexpr bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols);
      constexpr int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
-@@ -1186,7 +1208,8 @@ template<int DKQ, int ncols> struct mma_tile_sizes {
+@@ -1187,7 +1209,8 @@ template<int DKQ, int ncols> struct mma_tile_sizes {
  };
  #endif // defined(TURING_MMA_AVAILABLE)
  
@@ -130,7 +134,7 @@ index 296aa2b3..e011c8d5 100644
  static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          const float2 * const __restrict__ Q_f2,
          const half2  * const __restrict__ K_h2,
-@@ -1232,7 +1255,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1233,7 +1256,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
      constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
      constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
      constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
@@ -141,7 +145,7 @@ index 296aa2b3..e011c8d5 100644
  
      if (cols_per_warp > ncols) {
          NO_DEVICE_CODE;
-@@ -1331,6 +1356,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1332,6 +1357,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
  
      int kb0 = kb0_start;
  
@@ -151,7 +155,7 @@ index 296aa2b3..e011c8d5 100644
      // Preload mask and K data for first iteration when using cp_async with multiple stages:
      if constexpr (nstages > 1) {
          static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
-@@ -1338,16 +1366,54 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1339,16 +1367,54 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          constexpr bool use_cp_async = true;
          constexpr bool oob_check    = false;
          constexpr int  k_VKQ_sup    = nbatch_fa;
@@ -212,7 +216,7 @@ index 296aa2b3..e011c8d5 100644
          constexpr bool oob_check = true;
          for (; kb0 < kb0_stop-1; ++kb0) {
              constexpr bool last_iter = false;
-@@ -1793,7 +1859,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
+@@ -1794,7 +1860,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
             (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
  }
  
@@ -221,7 +225,7 @@ index 296aa2b3..e011c8d5 100644
  __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
  static __global__ void flash_attn_ext_f16(
          const char * Q_ptr,
-@@ -1936,12 +2002,12 @@ static __global__ void flash_attn_ext_f16(
+@@ -1937,12 +2003,12 @@ static __global__ void flash_attn_ext_f16(
          constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
          if (kb0_start == 0) {
              constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
@@ -236,7 +240,7 @@ index 296aa2b3..e011c8d5 100644
                  (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                   ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
          }
-@@ -1985,7 +2051,7 @@ static __global__ void flash_attn_ext_f16(
+@@ -1986,7 +2052,7 @@ static __global__ void flash_attn_ext_f16(
  
      constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
      constexpr bool needs_fixup = false;
@@ -245,9 +249,22 @@ index 296aa2b3..e011c8d5 100644
          (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
           ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
  #else
-@@ -2004,6 +2070,47 @@ static __global__ void flash_attn_ext_f16(
- 
+@@ -2006,10 +2072,10 @@ static __global__ void flash_attn_ext_f16(
  bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
+ 
+ static size_t ggml_cuda_fattn_mma_shared_size(
+-        int DKQ, int DV, int ncols1, int ncols2, int cc, int warp_size) {
++        int DKQ, int DV, int ncols1, int ncols2, int cc, int warp_size, int nstages_override = -1) {
+     const int ncols = ncols1 * ncols2;
+     const auto config = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc);
+-    const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
++    const int nstages = nstages_override >= 0 ? nstages_override : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
+     const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
+     const int stride_K = config.nbatch_K2 + (swz ? 0 : 4);
+     const int stride_V = DKQ == 576 ? stride_K : config.nbatch_V2 + (swz ? 0 : 4);
+@@ -2021,6 +2087,47 @@ static size_t ggml_cuda_fattn_mma_shared_size(
+     return std::max(combine, config.Q_in_reg ? std::max(q, kv + mask) : q + kv + mask);
+ }
  
 +// Whether the long-sequence variant (see ggml_cuda_fattn_mma_get_nstages_longseq) can and should be used for dst.
 +// GGML_CUDA_FA_LONGSEQ=0 disables it, =1 enables it on every NVIDIA GPU with cp.async, unset = per-architecture default.
@@ -293,10 +310,11 @@ index 296aa2b3..e011c8d5 100644
  template <int DKQ, int DV, int ncols1, int ncols2>
  void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * KQV = dst;
-@@ -2012,13 +2119,22 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+@@ -2029,13 +2136,22 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
  
      constexpr int ncols = ncols1 * ncols2;
  
+-    const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
 +#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 +    constexpr bool longseq_instantiated = ncols2 == 1 && DKQ == DV && (DKQ == 64 || DKQ == 128);
 +    const bool longseq = longseq_instantiated && ggml_cuda_fattn_mma_use_longseq(cc, dst);
@@ -305,19 +323,20 @@ index 296aa2b3..e011c8d5 100644
 +    const bool longseq = false;
 +#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 +
-     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
--    const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
-+    const int  nstages        = longseq ? ggml_cuda_fattn_mma_get_nstages_longseq(DKQ, DV, ncols, cc) :
-+                                          ggml_cuda_fattn_mma_get_nstages        (DKQ, DV, ncols1, ncols2, cc);
- 
-     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
++    const int nthreads  = ggml_cuda_fattn_mma_get_nthreads (DKQ, DV, ncols, cc);
+     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
+-    const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
++    const int nstages   = longseq ? ggml_cuda_fattn_mma_get_nstages_longseq(DKQ, DV, ncols, cc) :
++                                         ggml_cuda_fattn_mma_get_nstages        (DKQ, DV, ncols1, ncols2, cc);
      const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
-@@ -2052,6 +2168,40 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+     const int nwarps = nthreads / warp_size_host;
+     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
+-    const size_t nbytes_shared_total = ggml_cuda_fattn_mma_shared_size(DKQ, DV, ncols1, ncols2, cc, warp_size_host);
++    const size_t nbytes_shared_total = ggml_cuda_fattn_mma_shared_size(DKQ, DV, ncols1, ncols2, cc, warp_size_host, nstages);
+ 
+     float logit_softcap;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+@@ -2047,6 +2163,37 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
  #endif // defined(GGML_USE_HIP)
      fattn_kernel_t fattn_kernel;
      bool use_sparse = false;
@@ -334,10 +353,7 @@ index 296aa2b3..e011c8d5 100644
 +            if (ncols1 <= 64) {
 +                // Same grid as the stock kernel of this tile size: identical stream-k seams, so results are bit-identical.
 +                const int    nstages_stock      = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
-+                const size_t nbytes_KV_stock    = nstages_stock <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
-+                const size_t nbytes_total_stock = std::max(nbytes_shared_combine, Q_in_reg ?
-+                    std::max(nbytes_shared_Q,  nbytes_KV_stock + nbytes_shared_mask) :
-+                             nbytes_shared_Q + nbytes_KV_stock + nbytes_shared_mask);
++                const size_t nbytes_total_stock = ggml_cuda_fattn_mma_shared_size(DKQ, DV, ncols1, ncols2, cc, warp_size_host, nstages_stock);
 +                fattn_kernel_t stock_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false>;
 +                static bool stock_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
 +                if (!stock_limit_raised[id]) {
@@ -358,24 +374,23 @@ index 296aa2b3..e011c8d5 100644
      if (logit_softcap == 0.0f) {
          constexpr bool use_logit_softcap = false;
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-@@ -2145,6 +2295,12 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112, 112,  64)
- DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
+@@ -2141,8 +2288,10 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
  DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256, 256,  64)
  
-+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-+// Long-sequence variant only:
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// Wide tile (fattn-mma-wide.cu) and long-sequence variant:
 +extern DECL_FATTN_MMA_F16_CASE( 64,  64, 128, 1);
-+extern DECL_FATTN_MMA_F16_CASE(128, 128, 128, 1);
+ extern DECL_FATTN_MMA_F16_CASE(128, 128, 128, 1);
+-#endif
 +#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-+
+ 
  extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  2);
  extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  2);
- extern DECL_FATTN_MMA_F16_CASE(512, 512, 16,  2);
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index 5fa3e530..9fb380e8 100644
+index 99e25cbd..b22d7bcd 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
-@@ -187,6 +187,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
+@@ -197,6 +197,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
          return;
      }
  
@@ -393,23 +408,23 @@ index 5fa3e530..9fb380e8 100644
  
 diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_128-ncols2_1.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_128-ncols2_1.cu
 new file mode 100644
-index 00000000..b9bf54a1
+index 00000000..a255a4b0
 --- /dev/null
 +++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_128-ncols2_1.cu
 @@ -0,0 +1,8 @@
 +// Long-sequence FlashAttention variant (CUDA only), see ggml_cuda_fattn_mma_use_longseq in fattn-mma-f16.cuh.
++// The DKQ == 128 ncols1 == 128 case is instantiated by fattn-mma-wide.cu.
 +
 +#include "../fattn-mma-f16.cuh"
 +
 +#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 +DECL_FATTN_MMA_F16_CASE(64, 64, 128, 1);
-+DECL_FATTN_MMA_F16_CASE(128, 128, 128, 1);
 +#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 5e2db805..83136355 100644
+index 0f990e05..3ab8ad0a 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11710,6 +11710,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11721,6 +11721,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
  
