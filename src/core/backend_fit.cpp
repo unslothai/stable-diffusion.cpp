@@ -131,11 +131,18 @@ namespace sd::backend_fit {
     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
                                                      bool include_other_devices) {
         std::vector<Device> out;
+        // An iGPU can appear once per backend (e.g. Vulkan and ROCm on the same APU); plan only for the iGPUs of
+        // the first backend that reports one, so one unified memory pool is not counted twice.
+        ggml_backend_reg_t igpu_reg = nullptr;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             const auto type        = ggml_backend_dev_type(dev);
             if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
                 (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                continue;
+            }
+            if (type == GGML_BACKEND_DEVICE_TYPE_IGPU && igpu_reg != nullptr &&
+                ggml_backend_dev_backend_reg(dev) != igpu_reg) {
                 continue;
             }
             Device device;
@@ -144,6 +151,19 @@ namespace sd::backend_fit {
             device.type        = type;
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                // An iGPU reports its share of the unified pool. Without a reading it cannot be planned for,
+                // so keep the default backend instead of falling back to CPU.
+                if (free_bytes == 0 && total_bytes == 0) {
+                    LOG_WARN("auto-fit: %s did not report memory; not planning for it", device.name.c_str());
+                    continue;
+                }
+                // Vulkan's heap budget subtraction can wrap on iGPUs; the model manager reads that as total.
+                if (total_bytes > 0 && free_bytes > total_bytes) {
+                    free_bytes = total_bytes;
+                }
+                igpu_reg = ggml_backend_dev_backend_reg(dev);
+            }
             device.free_bytes = (int64_t)free_bytes;
 
             float gib = budgets.default_gib;
