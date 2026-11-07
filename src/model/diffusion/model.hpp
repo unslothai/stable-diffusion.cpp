@@ -16,6 +16,11 @@ enum class RefImageResizeMode {
     AREA,
 };
 
+enum class RefImageSizeMode {
+    MATCH,
+    MAX,
+};
+
 struct RefImageParams {
     bool pass_to_vlm                   = false;
     bool pass_to_dit                   = true;
@@ -27,9 +32,26 @@ struct RefImageParams {
     int vlm_min_size                   = -1;
     int vlm_max_size                   = -1;
     bool resize_vae_to_target          = false;
+    bool resize_single_ref_to_target   = false;
+    bool vae_size_buckets              = false;
+    bool vae_center_crop               = false;
+    bool vlm_use_vae_input             = false;
+    RefImageSizeMode ref_image_size    = RefImageSizeMode::MATCH;
 };
 
 const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
+    {"fibo2", [] {
+         RefImageParams params;
+         params.pass_to_vlm                 = true;
+         params.ref_index_mode              = Rope::RefIndexMode::INCREASE;
+         params.vlm_resize_mode             = RefImageResizeMode::LONGEST_SIDE;
+         params.vlm_max_size                = 768;
+         params.resize_single_ref_to_target = true;
+         params.vae_size_buckets            = true;
+         params.vae_center_crop             = true;
+         params.vlm_use_vae_input           = true;
+         return params;
+     }()},
     {"flux_kontext", {false, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::NONE, -1, -1}},
     {"longcat", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
     {"flux2", {false, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::NONE, -1, -1}},
@@ -149,6 +171,11 @@ struct MingImageDiffusionExtra {
     const sd::Tensor<float>* direct_context = nullptr;
 };
 
+struct ZImageDiffusionExtra {
+    const sd::Tensor<float>* control_latent = nullptr;
+    float strength                          = 1.f;
+};
+
 using DiffusionExtraParams = std::variant<std::monostate,
                                           UNetDiffusionExtra,
                                           SkipLayerDiffusionExtra,
@@ -164,7 +191,8 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           SenseNovaU1DiffusionExtra,
                                           HunyuanVideoDiffusionExtra,
                                           LLaDAImageDiffusionExtra,
-                                          MingImageDiffusionExtra>;
+                                          MingImageDiffusionExtra,
+                                          ZImageDiffusionExtra>;
 
 struct DiffusionParams {
     const sd::Tensor<float>* x                        = nullptr;
