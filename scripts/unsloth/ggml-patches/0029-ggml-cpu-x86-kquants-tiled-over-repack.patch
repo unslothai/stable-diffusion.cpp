@@ -51,7 +51,7 @@ index 2632ae3..518b5cd 100644
                  return &q2_K_8x8_q8_K;
              }
 diff --git a/src/ggml-cpu/tiled/tiled.cpp b/src/ggml-cpu/tiled/tiled.cpp
-index 77e1a99..0d2b207 100644
+index 77e1a99..30f1113 100644
 --- a/src/ggml-cpu/tiled/tiled.cpp
 +++ b/src/ggml-cpu/tiled/tiled.cpp
 @@ -594,6 +594,36 @@ static bool ggml_tiled_matmul_forced(void) {
@@ -61,7 +61,7 @@ index 77e1a99..0d2b207 100644
 +bool ggml_cpu_tiled_prefers(int type) {
 +// cl.exe builds keep repack: Klein Q4_K_M on Windows x64 (MSVC 19.44) ran the same with tiled-over-repack as without
 +// (EPYC 7763 98.96 / 99.12 vs 97.62 / 97.86 s sampling, EPYC 9V45 34.42 / 34.73 vs 34.66 / 34.93 s), unlike the
-+// GCC / clang builds (1.17x Zen 3, 1.48x Zen 5), so there is nothing to gain there for a change of rounding
++// GCC / clang builds (1.17x Zen 3, 1.49x Zen 5), so there is nothing to gain there for a change of rounding
 +#if (!defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)) || (defined(_MSC_VER) && !defined(__clang__))
 +    (void) type;
 +    return false;
