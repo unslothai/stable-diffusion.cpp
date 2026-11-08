@@ -131,18 +131,12 @@ namespace sd::backend_fit {
     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
                                                      bool include_other_devices) {
         std::vector<Device> out;
-        // An iGPU can appear once per backend (e.g. Vulkan and ROCm on the same APU); plan only for the iGPUs of
-        // the first backend that reports one, so one unified memory pool is not counted twice.
-        ggml_backend_reg_t igpu_reg = nullptr;
+        std::vector<ggml_backend_reg_t> regs;  // backend of each entry of out
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             const auto type        = ggml_backend_dev_type(dev);
             if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
                 (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                continue;
-            }
-            if (type == GGML_BACKEND_DEVICE_TYPE_IGPU && igpu_reg != nullptr &&
-                ggml_backend_dev_backend_reg(dev) != igpu_reg) {
                 continue;
             }
             Device device;
@@ -162,7 +156,6 @@ namespace sd::backend_fit {
                 if (total_bytes > 0 && free_bytes > total_bytes) {
                     free_bytes = total_bytes;
                 }
-                igpu_reg = ggml_backend_dev_backend_reg(dev);
             }
             device.free_bytes = (int64_t)free_bytes;
 
@@ -179,6 +172,28 @@ namespace sd::backend_fit {
                 device.budget_bytes = std::max<int64_t>(device.free_bytes - 512 * MiB, 0);
             }
             out.push_back(std::move(device));
+            regs.push_back(ggml_backend_dev_backend_reg(dev));
+        }
+        // An iGPU can appear once per backend (e.g. Vulkan and ROCm on the same APU). When auto-fit picks the
+        // devices, plan only for the iGPUs of one backend, so one unified memory pool is not counted twice: the
+        // backend of the iGPU with the largest budget, which is the device select_main_device picks (first on a
+        // tie), so the main device stays what it was. A user-named assignment keeps every device it can name.
+        ggml_backend_reg_t igpu_reg = nullptr;
+        int64_t igpu_best           = 0;
+        for (size_t i = 0; i < out.size() && !include_other_devices; ++i) {
+            if (out[i].type == GGML_BACKEND_DEVICE_TYPE_IGPU && (igpu_reg == nullptr || out[i].budget_bytes > igpu_best)) {
+                igpu_reg  = regs[i];
+                igpu_best = out[i].budget_bytes;
+            }
+        }
+        if (igpu_reg != nullptr) {
+            std::vector<Device> kept;
+            for (size_t i = 0; i < out.size(); ++i) {
+                if (out[i].type != GGML_BACKEND_DEVICE_TYPE_IGPU || regs[i] == igpu_reg) {
+                    kept.push_back(std::move(out[i]));
+                }
+            }
+            out.swap(kept);
         }
         return out;
     }
