@@ -1,26 +1,5 @@
-diff --git a/src/ggml-cpu/amx/amx.cpp b/src/ggml-cpu/amx/amx.cpp
-index e90c279..cdd218f 100644
---- a/src/ggml-cpu/amx/amx.cpp
-+++ b/src/ggml-cpu/amx/amx.cpp
-@@ -1,4 +1,5 @@
- #include "amx.h"
-+#include "tiled/tiled.h"
- #include "common.h"
- #include "mmq.h"
- #include "ggml-backend-impl.h"
-@@ -172,6 +173,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
-             case GGML_TYPE_Q5_K:
-             case GGML_TYPE_Q6_K:
-             case GGML_TYPE_IQ4_XS:
-+                // the tiled K-quant matmul (plain buffer) measured as fast or faster than these AMX kernels
-+                if (ggml_cpu_tiled_prefers(src0->type)) {
-+                    return false;
-+                }
-                 alignment = 256; // QK_K
-                 break;
-             case GGML_TYPE_F16:
 diff --git a/src/ggml-cpu/repack.cpp b/src/ggml-cpu/repack.cpp
-index 2632ae3..518b5cd 100644
+index 2632ae3..c02953b 100644
 --- a/src/ggml-cpu/repack.cpp
 +++ b/src/ggml-cpu/repack.cpp
 @@ -17,6 +17,7 @@
@@ -36,7 +15,7 @@ index 2632ae3..518b5cd 100644
          }
      } else if (cur->type == GGML_TYPE_Q4_K) {
 -        if (ggml_cpu_has_avx2()) {
-+        // x86: the tiled K-quant matmul (plain buffer) measured faster than this repack at diffusion batch sizes
++        // x86: on AMD CPUs the tiled K-quant matmul (plain buffer) measured faster than this repack (see tiled.cpp)
 +        if (ggml_cpu_has_avx2() && !ggml_cpu_tiled_prefers(cur->type)) {
              if (cur->ne[1] % 8 == 0) {
                  return &q4_K_8x8_q8_K;
@@ -51,26 +30,52 @@ index 2632ae3..518b5cd 100644
                  return &q2_K_8x8_q8_K;
              }
 diff --git a/src/ggml-cpu/tiled/tiled.cpp b/src/ggml-cpu/tiled/tiled.cpp
-index 77e1a99..30f1113 100644
+index 77e1a99..ce1ae31 100644
 --- a/src/ggml-cpu/tiled/tiled.cpp
 +++ b/src/ggml-cpu/tiled/tiled.cpp
-@@ -594,6 +594,36 @@ static bool ggml_tiled_matmul_forced(void) {
+@@ -14,6 +14,9 @@
+ #include <cstring>
+ 
+ #include <mutex>
++#if defined(__x86_64__) || defined(__i386__)
++#include <cpuid.h>
++#endif
+ 
+ #define UNUSED GGML_UNUSED
+ 
+@@ -594,6 +597,52 @@ static bool ggml_tiled_matmul_forced(void) {
  // hard constraints shared by the MUL_MAT and MUL_MAT_ID entries; the src0 type gate is the
  // entries' type switch
  
++// Unsloth: AMD x86 CPUs only by default. Klein Q4_K_M DiT with the tiled kernel instead of the Q4_K / Q2_K repack:
++// 1.17x on Zen 3, 1.49x on Zen 5 (GCC). On Intel the tiled kernel lost to AMX at every batch size (Xeon 8559C,
++// Q4_K 3072 x 3072, 1 thread, 1-128 rows: 1.2-1.45x slower) and to the Q4_K repack on an Ice Lake 8370C (1.17x
++// slower at 1024 rows), so Intel keeps both. The weight buffer is picked once per weight from a probe, not per batch
++// size, which is why this is a per-CPU and not a per-shape rule. cl.exe builds keep repack too: Klein Q4_K_M on
++// Windows x64 (MSVC 19.44) ran the same either way (EPYC 7763 98.96 / 99.12 vs 97.62 / 97.86 s sampling, EPYC 9V45
++// 34.42 / 34.73 vs 34.66 / 34.93 s). GGML_CPU_TILED_OVER_REPACK=1 turns it on for every x86 CPU (CPU_REPACK only;
++// AMX keeps its types), =0 turns it off.
++#if defined(__x86_64__) || defined(__i386__)
++static bool ggml_cpu_tiled_vendor_amd(void) {
++    unsigned int a = 0, b = 0, c = 0, d = 0;
++    if (!__get_cpuid(0, &a, &b, &c, &d)) {
++        return false;
++    }
++    return b == 0x68747541 && d == 0x69746e65 && c == 0x444d4163;  // "AuthenticAMD"
++}
++#endif
++
 +bool ggml_cpu_tiled_prefers(int type) {
-+// cl.exe builds keep repack: Klein Q4_K_M on Windows x64 (MSVC 19.44) ran the same with tiled-over-repack as without
-+// (EPYC 7763 98.96 / 99.12 vs 97.62 / 97.86 s sampling, EPYC 9V45 34.42 / 34.73 vs 34.66 / 34.93 s), unlike the
-+// GCC / clang builds (1.17x Zen 3, 1.49x Zen 5), so there is nothing to gain there for a change of rounding
-+#if (!defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)) || (defined(_MSC_VER) && !defined(__clang__))
++#if (!defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)) || (defined(_MSC_VER) && !defined(__clang__)) || \
++    !(defined(__x86_64__) || defined(__i386__))
 +    (void) type;
 +    return false;
 +#else
-+    static bool over_repack = true;
++    static bool over_repack = false;
 +    static std::once_flag flag;
 +    std::call_once(flag, []() {
 +        const char * env = getenv("GGML_CPU_TILED_OVER_REPACK");
-+        over_repack = env == NULL || atoi(env) != 0;
++        over_repack = env == NULL ? ggml_cpu_tiled_vendor_amd() : atoi(env) != 0;
 +    });
 +    if (!over_repack || !ggml_tiled_matmul_enabled()) {
 +        return false;
@@ -92,16 +97,15 @@ index 77e1a99..30f1113 100644
  static bool ggml_tiled_supported(const struct ggml_tensor * src0,
                                   const struct ggml_tensor * src1) {
 diff --git a/src/ggml-cpu/tiled/tiled.h b/src/ggml-cpu/tiled/tiled.h
-index 6f3e8dc..0525603 100644
+index 6f3e8dc..65cd970 100644
 --- a/src/ggml-cpu/tiled/tiled.h
 +++ b/src/ggml-cpu/tiled/tiled.h
-@@ -7,6 +7,11 @@
+@@ -7,6 +7,10 @@
  extern "C" {
  #endif
  
-+// true when this build's tiled K-quant matmul is on (GGML_CPU_TILED_MM) and serves weights of this type, and
-+// GGML_CPU_TILED_OVER_REPACK is not 0: the AMX and CPU_REPACK buffers then leave such weights to it where it
-+// measured faster (see repack.cpp / amx.cpp)
++// true when CPU_REPACK should leave weights of this type to the tiled K-quant matmul (plain buffer): tiled on
++// (GGML_CPU_TILED_MM), an AMD x86 CPU unless GGML_CPU_TILED_OVER_REPACK says otherwise (see tiled.cpp)
 +bool ggml_cpu_tiled_prefers(int type);
 +
  // Amount of wdata to reserve for tiled workspaces
