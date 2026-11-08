@@ -1011,8 +1011,9 @@ public:
             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
         }
         x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
-        // The affine multiply may run on a different backend after normalization falls back.
-        x = ggml_mul(ctx->ggml_ctx, x, w);
+        // In place: if normalization falls back to another backend, the scheduler runs the in-place
+        // multiply on the backend that owns its output (ggml patch 0013).
+        x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
         return x;
     }
 };

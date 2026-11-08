@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <map>
 #include <utility>
@@ -211,11 +212,23 @@ ggml_backend_t GGMLRunner::backend_for_weight(const ggml_tensor* tensor) const {
     return nullptr;
 }
 
-static bool backend_can_allocate_op(ggml_backend_t backend, const ggml_tensor* node) {
-    auto buft        = ggml_backend_get_default_buffer_type(backend);
+// Largest single tensor the backend can bind. Vulkan reports its suballocation block size (1 GiB on
+// AMD and Intel) as the buffer type's max size, but ggml-vulkan allocates and binds larger tensors on
+// their own; what it cannot bind is a range past maxStorageBufferRange, which is a 32-bit field.
+// Using the block size sent every node over 1 GiB (Flux attention scores at 1024x1024) to the CPU,
+// which made Flux sampling on Vulkan about 6x slower (leejet/stable-diffusion.cpp#2291).
+static size_t backend_max_tensor_bytes(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t max_size  = ggml_backend_buft_get_max_size(buft);
-    max_size -= max_size % alignment;
+    if (sd_backend_is(backend, "Vulkan")) {
+        max_size = std::max<size_t>(max_size, UINT32_MAX);
+    }
+    return max_size - max_size % alignment;
+}
+
+static bool backend_can_allocate_op(ggml_backend_t backend, const ggml_tensor* node) {
+    auto buft             = ggml_backend_get_default_buffer_type(backend);
+    const size_t max_size = backend_max_tensor_bytes(backend, buft);
     if (ggml_backend_buft_get_alloc_size(buft, node) > max_size) {
         return false;
     }
