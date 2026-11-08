@@ -15,7 +15,8 @@ name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan)
 #                   after the upstream release the tree descends from (supply-chain
 #                   aged), decide if our release already exists.
 #   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64, Linux Vulkan.
-#   build-windows-- Windows x64 CPU + Vulkan (MSVC + Ninja).
+#   build-windows-- Windows x64 CPU + Vulkan (MSVC + Ninja), Windows arm64 CPU (clang + Ninja,
+#                   best effort like the CUDA legs).
 #   build-linux-cuda / build-windows-cuda -- x64, CUDA 12.8 and 13.3, best effort
 #                   (continue-on-error); the CUDA runtime is not bundled, see build-linux-cuda.
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
@@ -862,16 +863,33 @@ jobs:
     name: ${{ matrix.label }}
     needs: resolve
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
-    runs-on: windows-2022
+    runs-on: ${{ matrix.runner }}
+    # The arm64 leg is new and runs on a different runner image: until it has a release
+    # history it ships when it builds and is absent when it does not, like the CUDA legs,
+    # so it can never hold back the seven required CPU/Apple/Vulkan assets.
+    continue-on-error: ${{ matrix.best_effort == true }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: win-cpu-x64
+            runner: windows-2022
             vulkan: "OFF"
             cpu_floor: x64
           - label: win-vulkan-x64
+            runner: windows-2022
             vulkan: "ON"
+          # Native arm64. Windows on ARM hosts otherwise run win-cpu-x64 under x64
+          # emulation, about 5x slower. ggml has no CPU variant set for Windows on ARM
+          # (GGML_CPU_ALL_VARIANTS is Linux / Android / macOS only), so this is one build
+          # for armv8.2-a + dotprod + fp16, which every Windows 11 ARM64 CPU has
+          # (Snapdragon 850 / 7c / 8c / 8cx / X, Microsoft SQ, Ampere Altra, Azure Cobalt 100).
+          - label: win-cpu-arm64
+            runner: windows-11-arm
+            vulkan: "OFF"
+            msvc_arch: arm64
+            arm_arch: armv8.2-a+dotprod+fp16
+            best_effort: true
     env:
       VULKAN_VERSION: 1.4.328.1
       # SDK checksums: https://vulkan.lunarg.com/sdk/files.json
@@ -903,9 +921,15 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install Ninja
+        if: ${{ matrix.arm_arch == '' }}
         run: choco install ninja --no-progress
+      - name: Install Ninja (arm64)
+        if: ${{ matrix.arm_arch != '' }}
+        run: python -m pip install ninja
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch || 'x64' }}
 
       - name: Install Vulkan SDK
         if: ${{ matrix.vulkan == 'ON' }}
@@ -933,9 +957,19 @@ jobs:
           if ('${{ matrix.cpu_floor }}' -ne '') {
             $cpuVariants = @('-DSD_BUILD_SHARED_GGML_LIB=ON', '-DBUILD_SHARED_LIBS=ON', '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON')
           }
+          # MSVC proper has no -march for ARM (ggml then insists on GGML_NATIVE, which would
+          # bake in the build host's CPU), so the arm64 leg uses the clang that ships on the
+          # runner, targeting the MSVC ABI. clang emits big COFF objects without /bigobj.
+          # OpenMP is off there: clang has no OpenMP runtime on the image, ggml's own
+          # threadpool takes over.
+          $compiler = @("-DCMAKE_CXX_FLAGS=/bigobj")
+          if ('${{ matrix.arm_arch }}' -ne '') {
+            $compiler = @('-DCMAKE_C_COMPILER=clang', '-DCMAKE_CXX_COMPILER=clang++',
+                          '-DGGML_CPU_ARM_ARCH=${{ matrix.arm_arch }}', '-DGGML_OPENMP=OFF')
+          }
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_FLAGS='/bigobj' `
+            @compiler `
             -DSD_BUILD_EXAMPLES=ON `
             -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
@@ -1026,6 +1060,41 @@ jobs:
           # sd-cli itself exits 1 at the missing model; that is the expected stop, not the verdict.
           exit 0
 
+      # A bundle that only runs under x64 emulation would pass every other gate here,
+      # because the arm64 runner emulates x64 too. Prove each PE is ARM64 code and
+      # that sd-cli starts natively.
+      - name: Native arm64 gate
+        if: ${{ matrix.arm_arch != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = (Get-ChildItem dist -Filter *.zip | Select-Object -First 1).FullName
+          $work = Join-Path $env:RUNNER_TEMP 'arm64-gate'
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zip -DestinationPath $work
+          $bad = 0; $n = 0
+          foreach ($f in Get-ChildItem $work -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll' }) {
+            $b = [IO.File]::ReadAllBytes($f.FullName)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+            $n++
+            if ($machine -ne 0xAA64) {
+              Write-Host ('::error::{0} is machine 0x{1:X4}, not ARM64 (0xAA64)' -f $f.Name, $machine); $bad++
+            } else {
+              Write-Host ('  arm64  {0}' -f $f.Name)
+            }
+          }
+          if ($n -eq 0) { Write-Host '::error::no PE files in the bundle'; exit 1 }
+          if ($bad -ne 0) { exit 1 }
+          $cli = Get-ChildItem $work -Recurse -Filter sd-cli.exe | Select-Object -First 1
+          $ErrorActionPreference = 'Continue'
+          $p = Start-Process -FilePath $cli.FullName -ArgumentList '--help' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'arm64-help.txt')
+          Get-Content (Join-Path $env:RUNNER_TEMP 'arm64-help.txt') -TotalCount 5
+          if ($p.ExitCode -ne 0) { Write-Host "::error::sd-cli --help exited $($p.ExitCode)"; exit 1 }
+          $proc = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "host: $($proc.Name), $($proc.NumberOfCores) cores; $n PE files are ARM64"
+
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -1092,6 +1161,7 @@ jobs:
 
       # Vulkan is required: the pinned upstream fallback lacks our H3 fixes.
       # Blocking publication on a Vulkan failure prevents promoting an incomplete fix.
+      # win-cpu-arm64 is not in the list: like CUDA it is published when it built.
       - name: Coverage gate (all 7 CPU/Apple/Vulkan assets present)
         run: |
           set -eu
@@ -1141,7 +1211,7 @@ jobs:
           AHEAD='${{ needs.resolve.outputs.ahead }}'
           COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux/Windows CUDA 12 and 13 when those builds succeed. The CUDA bundles carry no CUDA runtime: Studio supplies the one its llama.cpp build already uses."
+          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux/Windows CUDA 12 and 13 and a native Windows arm64 CPU build when those builds succeed. The CUDA bundles carry no CUDA runtime: Studio supplies the one its llama.cpp build already uses."
           PINS='${{ needs.resolve.outputs.pins }}'
           if [ "${AHEAD:-0}" -gt 0 ]; then
             NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
