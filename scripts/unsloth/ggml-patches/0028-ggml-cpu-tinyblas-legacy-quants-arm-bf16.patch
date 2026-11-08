@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 51246c4..d1f362d 100644
+index 51246c4..ccde8f6 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -44,9 +44,9 @@
@@ -15,7 +15,7 @@ index 51246c4..d1f362d 100644
  
  #ifdef GGML_USE_LLAMAFILE
  #include "llamafile/sgemm.h"
-@@ -83,20 +83,41 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
+@@ -83,20 +83,42 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
  //   x86 AVX2 builds on Intel: Xeon 8573C 1.30x (GCC) / 1.24-1.25x (MSVC), Core i7-8700B 1.45-1.6x (clang);
  //   x86 AVX2 builds on AMD Zen 5 with GCC / clang (1.07-1.08x) and on Zen 4 with MSVC (1.03-1.11x);
  //   aarch64 NEON builds without FP16 vector arithmetic (F32 accumulation; armv8.0 1.35x on a Neoverse N2).
@@ -24,7 +24,8 @@ index 51246c4..d1f362d 100644
  // Left off: AMD Zen 3 AVX2 (GCC 11 0.78x, MSVC 0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
 -// (0.86x), other AMD families (not measured), and aarch64 FP16-vector builds, whose tinyBLAS kernel accumulates in
 -// FP16 rather than in another order.
-+// (0.86x), other AMD families (not measured), and MSVC aarch64 builds (no NEON tinyBLAS kernels there).
++// (0.86x), other AMD families (not measured), and cl.exe aarch64 builds (no NEON tinyBLAS kernels there; clang
++// targeting the MSVC ABI, as in the Windows arm64 bundle, gets them).
  static uint64_t ggml_cpu_sgemm_types = 0;
  
  static uint64_t ggml_cpu_sgemm_types_default(void) {
@@ -41,7 +42,7 @@ index 51246c4..d1f362d 100644
 +    if (legacy) {
 +        mask |= (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_1);
 +    }
-+#elif defined(__ARM_FEATURE_DOTPROD) && !defined(_MSC_VER)
++#elif defined(__ARM_FEATURE_DOTPROD) && !(defined(_MSC_VER) && !defined(__clang__))
 +    if (legacy) {
 +        mask |= (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q5_1);
 +#if !defined(__ARM_FEATURE_MATMUL_INT8)
@@ -59,13 +60,13 @@ index 51246c4..d1f362d 100644
      unsigned r[4] = { 0, 0, 0, 0 };
      ggml_cpu_sgemm_cpuid(0, r);
      const bool intel = r[1] == 0x756e6547 && r[3] == 0x49656e69 && r[2] == 0x6c65746e;  // GenuineIntel
-@@ -126,8 +147,14 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
+@@ -126,8 +148,14 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
          (void) zen4;
  #endif
      }
 -#elif defined(__ARM_NEON) && !defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
 -    mask |= f16;
-+#elif defined(__ARM_NEON) && !defined(_MSC_VER)
++#elif defined(__ARM_NEON) && !(defined(_MSC_VER) && !defined(__clang__))
 +    // BF16 on every NEON build, F16 on builds without FP16 vector arithmetic: F32-accumulating NEON tinyBLAS kernels
 +    // (F32 src1). FP16-vector builds keep F16 on vec_dot by default (faster there, but it accumulates in FP16;
 +    // GGML_CPU_SGEMM_TYPES=f16 picks the F32-accumulating kernel instead).
@@ -77,21 +78,63 @@ index 51246c4..d1f362d 100644
      return mask;
  }
 diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
-index d28840a..7b64bad 100644
+index d28840a..1f0cb90 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -313,6 +313,10 @@ template <> inline float16x8_t load(const ggml_fp16_t *p) {
+@@ -63,6 +63,12 @@
+ #define NOINLINE __attribute__((__noinline__))
+ #endif
+ 
++// Unsloth: the NEON fp16 / bf16 kernels below are compiled out only for cl.exe. clang targeting the MSVC ABI
++// (the Windows arm64 bundle) also defines _MSC_VER but has the float16_t types and intrinsics.
++#if defined(_MSC_VER) && !defined(__clang__)
++#define GGML_SGEMM_MSVC_CL 1
++#endif
++
+ #if defined(__ARM_NEON) || defined(__AVX512F__) || defined(__VXE__) || defined(__VXE2__)
+ #define VECTOR_REGISTERS 32
+ #else
+@@ -165,7 +171,7 @@ template <>
+ inline float32x4_t madd(float32x4_t a, float32x4_t b, float32x4_t c) {
+     return vfmaq_f32(c, b, a);
+ }
+-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(GGML_SGEMM_MSVC_CL)
+ template <>
+ inline float16x8_t madd(float16x8_t a, float16x8_t b, float16x8_t c) {
+     return vfmaq_f16(c, b, a);
+@@ -234,7 +240,7 @@ inline float hsum(float32x4_t x) {
+ }
+ #endif // __ARM_NEON
+ 
+-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(GGML_SGEMM_MSVC_CL)
+ inline float hsum(float16x8_t x) {
+     return vaddvq_f32(vaddq_f32(vcvt_f32_f16(vget_low_f16(x)),
+                                 vcvt_f32_f16(vget_high_f16(x))));
+@@ -305,7 +311,7 @@ template <typename T, typename U> T load(const U *);
+ template <> inline float32x4_t load(const float *p) {
+     return vld1q_f32(p);
+ }
+-#if !defined(_MSC_VER)
++#if !defined(GGML_SGEMM_MSVC_CL)
+ // FIXME: this should check for __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+ template <> inline float16x8_t load(const ggml_fp16_t *p) {
+     return vld1q_f16((const float16_t *)p);
+@@ -313,7 +319,11 @@ template <> inline float16x8_t load(const ggml_fp16_t *p) {
  template <> inline float32x4_t load(const ggml_fp16_t *p) {
      return vcvt_f32_f16(vld1_f16((const float16_t *)p));
  }
+-#endif // _MSC_VER
 +// BF16 -> F32 is exact: the 16 bits become the high half of the F32
 +template <> inline float32x4_t load(const ggml_bf16_t *p) {
 +    return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const uint16_t *)p), 16));
 +}
- #endif // _MSC_VER
++#endif // GGML_SGEMM_MSVC_CL
  #endif // __ARM_NEON
  
-@@ -1303,6 +1307,17 @@ class tinyBLAS_RVV {
+ #if defined(__VXE__) || defined(__VXE2__)
+@@ -1303,6 +1313,17 @@ class tinyBLAS_RVV {
  // QUANT ZERO MATRIX MULTIPLICATION
  
  #if defined(__ARM_FEATURE_DOTPROD)
@@ -109,7 +152,7 @@ index d28840a..7b64bad 100644
  template <typename TA>
  class tinyBLAS_Q0_ARM {
    public:
-@@ -1437,6 +1452,146 @@ class tinyBLAS_Q0_ARM {
+@@ -1437,6 +1458,146 @@ class tinyBLAS_Q0_ARM {
      const int ith;
      const int nth;
  };
@@ -256,7 +299,7 @@ index d28840a..7b64bad 100644
  #endif // __ARM_FEATURE_DOTPROD
  
  #if defined(__AVX2__) || defined(__AVX512F__) || defined(__AVX__)
-@@ -1885,6 +2040,218 @@ class tinyBLAS_Q0_AVX {
+@@ -1885,6 +2046,218 @@ class tinyBLAS_Q0_AVX {
  };
  #endif // __AVX__
  
@@ -475,11 +518,11 @@ index d28840a..7b64bad 100644
  //PPC Implementation
  #if defined(__MMA__)
  
-@@ -4006,6 +4373,15 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4006,6 +4379,15 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                  (float *)C, ldc};
              return tb.matmul(m, n);
          }
-+#elif defined(__ARM_NEON) && !defined(_MSC_VER)
++#elif defined(__ARM_NEON) && !defined(GGML_SGEMM_MSVC_CL)
 +        // BF16 weights widened exactly to F32, F32 src1, F32 accumulation
 +        if (Btype == GGML_TYPE_F32) {
 +            tinyBLAS<4, float32x4_t, float32x4_t, ggml_bf16_t, float, float> tb{ params,
@@ -491,12 +534,12 @@ index d28840a..7b64bad 100644
  #elif defined(__MMA__)
          if (k % 8) {
              return false;
-@@ -4062,7 +4438,17 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4062,7 +4444,17 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                  (float *)C, ldc};
              return tb.matmul(m, n);
          }
 -#elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
-+#elif defined(__ARM_NEON) && !defined(_MSC_VER)
++#elif defined(__ARM_NEON) && !defined(GGML_SGEMM_MSVC_CL)
 +        // F32 src1 and F32 accumulation on every NEON build (FP16-vector builds included: their F16 kernel below
 +        // accumulates in FP16 and is only reached with F16 activations)
 +        if (Btype == GGML_TYPE_F32) {
@@ -510,7 +553,7 @@ index d28840a..7b64bad 100644
          if (n < 8)
              return false;
          if (Btype == GGML_TYPE_F16) {
-@@ -4072,14 +4458,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4072,14 +4464,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                  (float *)C, ldc};
              return tb.matmul(m, n);
          }
@@ -526,7 +569,7 @@ index d28840a..7b64bad 100644
  #elif defined(__VXE__) || defined(__VXE2__)
          if (n < 4)
              return false;
-@@ -4214,6 +4593,62 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4214,6 +4599,62 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              params->ith, params->nth};
          tb.matmul(m, n);
          return true;
