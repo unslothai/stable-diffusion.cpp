@@ -1,8 +1,21 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 51246c4..5a26f4b 100644
+index 51246c4..d1f362d 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -83,16 +83,30 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
+@@ -44,9 +44,9 @@
+ #include <omp.h>
+ #endif
+ 
+-#if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
+-#undef GGML_USE_LLAMAFILE
+-#endif
++// Unsloth: upstream compiles the llamafile hook out of SVE / i8mm builds, where its Q4_0 / Q8_0 kernels lose to the
++// repack and i8mm vec_dot paths. The type mask below (ggml_cpu_sgemm_types_default) keeps those types off tinyBLAS
++// there, so the hook stays for the types those builds have no GEMM for (BF16, Q5_0, Q5_1).
+ 
+ #ifdef GGML_USE_LLAMAFILE
+ #include "llamafile/sgemm.h"
+@@ -83,20 +83,41 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
  //   x86 AVX2 builds on Intel: Xeon 8573C 1.30x (GCC) / 1.24-1.25x (MSVC), Core i7-8700B 1.45-1.6x (clang);
  //   x86 AVX2 builds on AMD Zen 5 with GCC / clang (1.07-1.08x) and on Zen 4 with MSVC (1.03-1.11x);
  //   aarch64 NEON builds without FP16 vector arithmetic (F32 accumulation; armv8.0 1.35x on a Neoverse N2).
@@ -30,12 +43,23 @@ index 51246c4..5a26f4b 100644
 +    }
 +#elif defined(__ARM_FEATURE_DOTPROD) && !defined(_MSC_VER)
 +    if (legacy) {
-+        mask |= (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_1);
++        mask |= (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q5_1);
++#if !defined(__ARM_FEATURE_MATMUL_INT8)
++        // i8mm builds: Q4_1 keeps its smmla vec_dot (two rows per call), as fast as this kernel on a Neoverse N2
++        mask |= 1ull << GGML_TYPE_Q4_1;
++#endif
 +    }
  #endif
  #if defined(__AVX512F__)
      mask |= f16;
-@@ -126,8 +140,14 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
+ #elif defined(__AVX2__)
++    // BF16 on every AVX2 build: BF16 vec_dot has no AVX2 kernel worth the name (3072 x 3072 x 1024 mul_mat,
++    // 4 threads: tinyBLAS 168 vs 392 ms on Zen 3, 211 vs 276 ms on Zen 4), unlike F16 below
++    mask |= 1ull << GGML_TYPE_BF16;
+     unsigned r[4] = { 0, 0, 0, 0 };
+     ggml_cpu_sgemm_cpuid(0, r);
+     const bool intel = r[1] == 0x756e6547 && r[3] == 0x49656e69 && r[2] == 0x6c65746e;  // GenuineIntel
+@@ -126,8 +147,14 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
          (void) zen4;
  #endif
      }
