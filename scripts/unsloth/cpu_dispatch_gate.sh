@@ -11,8 +11,9 @@
 #     variant library while it scores them, so a static initializer that the compiler vectorised with a
 #     variant's AVX512 / SVE flags crashes every host without that ISA, before any variant is picked;
 #   - no CPU variant is loaded, or the loaded variant needs a feature the emulated CPU lacks;
-#   - on a 128-bit SVE vector length (CPU names ending in -sve128) a variant other than armv8.2_2 is loaded:
-#     ggml-patches/0020 skips the SVE variants there unless GGML_CPU_ARM_SVE128=1 (names ending in +keep
+#   - on a 128-bit SVE vector length (CPU names ending in -sve128) a variant other than the best NEON one is loaded
+#     (armv8.6_0 with i8mm, else armv8.2_2): ggml-patches/0020 skips the SVE variants there unless
+#     GGML_CPU_ARM_SVE128=1 (names ending in +keep
 #     set it and must then load an SVE variant);
 #   - a variant that has the iqk GEMM kernels built does not enable them by default (ARM: every batch size;
 #     x86 AVX2 and up: 2-12 src1 rows, ggml-patches/0018). Variants without them (pre-AVX2 x86, Armv8.0)
@@ -50,6 +51,7 @@ variant_needs() {
     armv8.0_1) echo "" ;;
     armv8.2_1) echo "DOTPROD" ;;
     armv8.2_2) echo "DOTPROD FP16_VA" ;;
+    armv8.6_0) echo "DOTPROD FP16_VA I8MM" ;;
     armv8.2_3) echo "DOTPROD FP16_VA SVE" ;;
     armv8.6_1) echo "DOTPROD FP16_VA SVE I8MM" ;;
     armv8.6_2) echo "DOTPROD FP16_VA SVE I8MM SVE2" ;;
@@ -156,8 +158,12 @@ for entry in $cpus; do
       *-sve128)
         if [ -n "$keep" ]; then
           case "$needs" in *" SVE "*) ;; *) note="$note expected an SVE variant with GGML_CPU_ARM_SVE128=1";; esac
-        elif [ "$loaded" != "armv8.2_2" ]; then
-          note="$note expected armv8.2_2 on 128-bit SVE"
+        else
+          want=armv8.2_2
+          case "$has" in *" I8MM "*) want=armv8.6_0 ;; esac
+          if [ "$loaded" != "$want" ]; then
+            note="$note expected $want on 128-bit SVE"
+          fi
         fi
         ;;
     esac
