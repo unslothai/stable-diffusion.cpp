@@ -439,6 +439,12 @@ namespace MiniMaxH3 {
             if (forced > 0) {
                 chunk_size = std::min(chunk_size, forced);
             }
+            static bool logged = false;
+            if (chunk_size < sequence && !logged) {
+                logged = true;
+                LOG_INFO("MiniMax-H3: QKV projection of %" PRId64 " tokens runs in chunks of %" PRId64 " tokens",
+                         sequence, chunk_size);
+            }
             return chunk_size;
         }
 
