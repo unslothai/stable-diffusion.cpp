@@ -1,0 +1,14 @@
+stable-diffusion.cpp
+
+This file lists third-party code that is adapted into this repository under a
+license other than the project's MIT license.
+
+NVIDIA Cosmos (cosmos-framework)
+Source: https://github.com/nvidia-cosmos/cosmos-framework
+License: OpenMDW-1.1 (licenses/OpenMDW-1.1.txt)
+Notice:
+  Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Files:
+  src/model/diffusion/cosmos3.hpp
+  src/pipeline/cosmos3_transfer.cpp
+  src/pipeline/cosmos3_transfer_utils.h

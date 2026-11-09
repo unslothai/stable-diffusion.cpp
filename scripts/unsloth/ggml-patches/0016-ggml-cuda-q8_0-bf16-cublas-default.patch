@@ -1,0 +1,53 @@
+ggml-cuda: BF16 cuBLAS for large Q8_0 matmuls by default on A100, Hopper and datacenter Blackwell
+
+GGML_CUDA_QUANT_CUBLAS_MIN_BATCH (patch 0001) now defaults per architecture for Q8_0 weights: 1024 rows on
+sm80 / sm90 / sm100, 4096 on sm120; Ada, consumer Ampere and Orin keep MMQ. Every k-quant and sub-8-bit type keeps
+MMQ. A set env value still applies to every quantized type.
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 494f2b86..9eaa9fb7 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2646,8 +2646,9 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
+ // tokens per call) a tensor-core BF16 GEMM is faster on GPUs whose BF16 rate is not far below their
+ // int8 rate, and it is more accurate (activations stay BF16 instead of 8-bit).
+ // GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=<rows>: use the BF16 path when src1 has at least this many rows;
+-// 0 disables it (stock MMQ everywhere). Unset = the per-architecture default below.
+-static int64_t ggml_cuda_quant_cublas_min_batch(int cc) {
++// 0 disables it (stock MMQ everywhere); a set value applies to every quantized type. Unset = the default below:
++// Q8_0 weights only, per architecture; every k-quant and sub-8-bit type keeps MMQ.
++static int64_t ggml_cuda_quant_cublas_min_batch(int cc, ggml_type type) {
+     static const int64_t env = [] {
+         const char * e = getenv("GGML_CUDA_QUANT_CUBLAS_MIN_BATCH");
+         return e != nullptr ? (int64_t) atoll(e) : (int64_t) -1;
+@@ -2655,7 +2656,20 @@ static int64_t ggml_cuda_quant_cublas_min_batch(int cc) {
+     if (env >= 0) {
+         return env;
+     }
+-    GGML_UNUSED(cc);
++    // For Q8_0 the BF16 path is closer to an unquantized render (Z-Image Turbo Q8_0 vs its BF16 weights, B200:
++    // LPIPS 0.0148 with MMQ, 0.0052 here), since MMQ's q8_1 activations are then the larger error. For 4-bit and
++    // k-quant weights the weight error dominates and neither path is consistently closer, so they stay on MMQ.
++    // Ada, consumer Ampere and Orin keep MMQ (their int8 rate is twice their BF16-with-FP32-accumulate rate);
++    // sm120 gains only from 4096 rows.
++    if (type != GGML_TYPE_Q8_0) {
++        return 0;
++    }
++    if (cc == GGML_CUDA_CC_AMPERE || (cc >= GGML_CUDA_CC_HOPPER && cc < 1100)) {
++        return 1024;
++    }
++    if (cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN) {
++        return 4096;
++    }
+     return 0;
+ }
+ 
+@@ -2725,7 +2739,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     }
+     if (ggml_is_quantized(src0->type) && ne11 > MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+             bf16_mma_hardware_available(cc) && ggml_get_to_bf16_cuda(src0->type) != nullptr) {
+-        const int64_t min_batch = ggml_cuda_quant_cublas_min_batch(cc);
++        const int64_t min_batch = ggml_cuda_quant_cublas_min_batch(cc, src0->type);
+         if (min_batch > 0 && ne11*ne12*ne13 >= min_batch) {
+             // GGML_CUDA_QUANT_CUBLAS_TYPE=f32 dequantizes to FP32 instead: slow, for accuracy oracles only.
+             static const bool f32_oracle = [] {
