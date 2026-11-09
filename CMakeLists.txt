@@ -330,6 +330,18 @@ if (NOT SD_USE_SYSTEM_GGML)
     add_definitions(-DGGML_MAX_NAME=160)
 endif()
 
+# x86 CPU: build llamafile's tinyBLAS GEMM (as llama.cpp does). ggml-patches/0017 limits it to Q8_0 weights,
+# where it returns the same bits as the default vec_dot path; GGML_CPU_SGEMM_TYPES opts other types in.
+# Only with that patch applied (the prebuilt workflow applies it): unpatched ggml would route every type it
+# supports through tinyBLAS, so a plain source build keeps ggml's own default.
+set(sd_ggml_cpu_c "${SD_GGML_SOURCE_DIR}/src/ggml-cpu/ggml-cpu.c")
+if (EXISTS "${sd_ggml_cpu_c}")
+    file(STRINGS "${sd_ggml_cpu_c}" sd_ggml_sgemm_type_filter REGEX "GGML_CPU_SGEMM_TYPES" LIMIT_COUNT 1)
+endif()
+if (NOT DEFINED GGML_LLAMAFILE AND sd_ggml_sgemm_type_filter AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+    set(GGML_LLAMAFILE_DEFAULT ON)
+endif()
+
 # deps
 include(cmake/ggml.cmake)
 
