@@ -333,7 +333,14 @@ endif()
 # x86 and aarch64 CPU: build llamafile's tinyBLAS GEMM (as llama.cpp does). ggml-patches/0017 picks the weight types
 # it takes per CPU from measurements (Q8_0 on x86; F16 / BF16 where tinyBLAS was faster, see ggml-cpu.c);
 # GGML_CPU_SGEMM_TYPES overrides the set.
-if (NOT DEFINED GGML_LLAMAFILE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|aarch64|arm64|ARM64)$")
+# Only with that patch applied (the prebuilt workflow applies it): unpatched ggml would route every type it
+# supports through tinyBLAS, including the FP16-accumulating F16 kernel on aarch64 cores with FP16 vector
+# arithmetic, so a plain source build keeps ggml's own default.
+set(sd_ggml_cpu_c "${SD_GGML_SOURCE_DIR}/src/ggml-cpu/ggml-cpu.c")
+if (EXISTS "${sd_ggml_cpu_c}")
+    file(STRINGS "${sd_ggml_cpu_c}" sd_ggml_sgemm_type_filter REGEX "GGML_CPU_SGEMM_TYPES" LIMIT_COUNT 1)
+endif()
+if (NOT DEFINED GGML_LLAMAFILE AND sd_ggml_sgemm_type_filter AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|aarch64|arm64|ARM64)$")
     set(GGML_LLAMAFILE_DEFAULT ON)
 endif()
 
