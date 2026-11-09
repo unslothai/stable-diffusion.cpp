@@ -864,9 +864,7 @@ jobs:
     needs: resolve
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.runner }}
-    # The arm64 leg is new and runs on a different runner image: until it has a release
-    # history it ships when it builds and is absent when it does not, like the CUDA legs,
-    # so it can never hold back the seven required CPU/Apple/Vulkan assets.
+    # arm64 is best effort (shipped only when it builds, like CUDA), never blocking the required assets.
     continue-on-error: ${{ matrix.best_effort == true }}
     strategy:
       fail-fast: false
@@ -879,11 +877,8 @@ jobs:
           - label: win-vulkan-x64
             runner: windows-2022
             vulkan: "ON"
-          # Native arm64. Windows on ARM hosts otherwise run win-cpu-x64 under x64
-          # emulation, about 5x slower. ggml has no CPU variant set for Windows on ARM
-          # (GGML_CPU_ALL_VARIANTS is Linux / Android / macOS only), so this is one build
-          # for armv8.2-a + dotprod + fp16, which every Windows 11 ARM64 CPU has
-          # (Snapdragon 850 / 7c / 8c / 8cx / X, Microsoft SQ, Ampere Altra, Azure Cobalt 100).
+          # Native arm64 (x64 under emulation is ~5x slower). No ggml CPU variant set exists for Windows on ARM,
+          # so one armv8.2-a + dotprod + fp16 build, which every Windows 11 ARM64 CPU has.
           - label: win-cpu-arm64
             runner: windows-11-arm
             vulkan: "OFF"
@@ -957,11 +952,8 @@ jobs:
           if ('${{ matrix.cpu_floor }}' -ne '') {
             $cpuVariants = @('-DSD_BUILD_SHARED_GGML_LIB=ON', '-DBUILD_SHARED_LIBS=ON', '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON')
           }
-          # MSVC proper has no -march for ARM (ggml then insists on GGML_NATIVE, which would
-          # bake in the build host's CPU), so the arm64 leg uses the clang that ships on the
-          # runner, targeting the MSVC ABI. clang emits big COFF objects without /bigobj.
-          # OpenMP is off there: clang has no OpenMP runtime on the image, ggml's own
-          # threadpool takes over.
+          # MSVC has no ARM -march (ggml would force GGML_NATIVE), so arm64 uses the runner's clang on the MSVC ABI;
+          # no /bigobj needed, and OpenMP off (no runtime on the image; ggml's threadpool instead).
           $compiler = @("-DCMAKE_CXX_FLAGS=/bigobj")
           if ('${{ matrix.arm_arch }}' -ne '') {
             $compiler = @('-DCMAKE_C_COMPILER=clang', '-DCMAKE_CXX_COMPILER=clang++',
@@ -1060,9 +1052,7 @@ jobs:
           # sd-cli itself exits 1 at the missing model; that is the expected stop, not the verdict.
           exit 0
 
-      # A bundle that only runs under x64 emulation would pass every other gate here,
-      # because the arm64 runner emulates x64 too. Prove each PE is ARM64 code and
-      # that sd-cli starts natively.
+      # The arm64 runner also emulates x64, so prove each PE is ARM64 and sd-cli starts natively.
       - name: Native arm64 gate
         if: ${{ matrix.arm_arch != '' }}
         shell: pwsh
