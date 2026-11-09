@@ -1,0 +1,28 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 854efe8..fbe2763 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -529,6 +529,9 @@ if (GGML_CPU_ALL_VARIANTS)
+             ggml_add_cpu_backend_variant(armv8.2_1    DOTPROD)
+             ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
+             ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
++            # Unsloth: NEON + i8mm without SVE, for 128-bit SVE cores (Neoverse N2 / V2) where ggml-patches/0020
++            # skips the SVE variants: keeps the i8mm repack kernels there
++            ggml_add_cpu_backend_variant(armv8.6_0    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
+             ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
+             ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
+             ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
+diff --git a/src/ggml-cpu/arch/arm/cpu-feats.cpp b/src/ggml-cpu/arch/arm/cpu-feats.cpp
+index 79a3b2c..fb87688 100644
+--- a/src/ggml-cpu/arch/arm/cpu-feats.cpp
++++ b/src/ggml-cpu/arch/arm/cpu-feats.cpp
+@@ -27,7 +27,8 @@ static int ggml_backend_cpu_aarch64_score() {
+     // Unsloth: with 128-bit SVE (Neoverse N2 / V2, Cortex-A710 and later) the SVE variants ran stable-diffusion.cpp
+     // slower than the NEON dotprod + FP16 one (armv8.2_2) on a Neoverse N2: 1.29-1.38x slower for armv8.6_2 and about
+     // 5x slower for armv8.2_3 / armv8.6_1, F16, Q8_0, Q3_K and Q4_K alike. So they are not offered there and the best
+-    // NEON variant is picked. Wider SVE (Graviton 3, A64FX) keeps them. GGML_CPU_ARM_SVE128=1 offers them again.
++    // NEON variant is picked (armv8.6_0, NEON + i8mm, when the CPU has i8mm). Wider SVE (Graviton 3, A64FX) keeps
++    // them. GGML_CPU_ARM_SVE128=1 offers them again.
+     {
+         const int vl = prctl(PR_SVE_GET_VL);
+         const char * keep = getenv("GGML_CPU_ARM_SVE128");

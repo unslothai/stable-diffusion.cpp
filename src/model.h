@@ -71,6 +71,7 @@ enum SDVersion {
     VERSION_FIBO2,
     VERSION_CHROMA,
     VERSION_P_H3_IMAGE,
+    VERSION_COSMOS3,
     VERSION_COUNT,
 };
 
@@ -292,6 +293,10 @@ static inline bool sd_version_is_mage_flow(SDVersion version) {
 
 static inline bool sd_version_is_sensenova_u1(SDVersion version) {
     return version == VERSION_SENSENOVA_U1_5;
+}
+
+static inline bool sd_version_is_cosmos3(SDVersion version) {
+    return version == VERSION_COSMOS3;
 }
 
 static inline bool sd_version_is_pixart(SDVersion version) {

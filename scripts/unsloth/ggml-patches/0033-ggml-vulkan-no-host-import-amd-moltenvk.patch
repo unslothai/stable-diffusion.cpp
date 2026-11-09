@@ -1,0 +1,160 @@
+From 83b1d7665b3f1c6e23ceac8475c5a74207955ece Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Sat, 7 Nov 2026 18:47:13 -0800
+Subject: [PATCH] ggml-vulkan: no host-buffer import on AMD and MoltenVK
+
+Port of ggml-org/llama.cpp PR 30468 ("vulkan: fix gpu-visible host memory
+issues", merge commit a8d9a7e1e55f5b613f297504d9e159807ec3a99b, author
+0cc4m), a follow-up to llama.cpp PR 29741.
+
+With more than one Vulkan device, host allocations are imported into every
+device with VK_EXT_external_memory_host. On AMD (amdgpu) every page of every
+imported host allocation is re-checked on each submission, which costs a
+large share of the run time, so the import is disabled for AMD devices. The
+MoltenVK exclusion now happens when the device is created, a failed import
+falls back to staging once per device instead of warning on every call, and
+the code that became unreachable is removed. Single-device hosts never
+import and are unaffected.
+---
+ src/ggml-vulkan/ggml-vulkan-buffers.cpp | 16 ++++-------
+ src/ggml-vulkan/ggml-vulkan-types.h     |  2 ++
+ src/ggml-vulkan/ggml-vulkan.cpp         | 36 +++++++++++++++++--------
+ 3 files changed, 32 insertions(+), 22 deletions(-)
+
+diff --git a/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/src/ggml-vulkan/ggml-vulkan-buffers.cpp
+index 3fdc042..ef7662b 100644
+--- a/src/ggml-vulkan/ggml-vulkan-buffers.cpp
++++ b/src/ggml-vulkan/ggml-vulkan-buffers.cpp
+@@ -1,6 +1,5 @@
+ #include "ggml-vulkan-common.h"
+ 
+-#include <atomic>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <mutex>
+@@ -397,21 +396,16 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
+     vk_host_allocation & entry = vk_instance.host_allocations[index];
+ 
+     if (entry.views[device->idx] == nullptr) {
+-        if (!vk_instance.multi_device) {
+-            return;
+-        }
+-        if (!device->external_memory_host) {
+-            static std::atomic<uint32_t> warned_mask{0};
+-            const uint32_t bit = 1u << device->idx;
+-            if (!(warned_mask.fetch_or(bit) & bit)) {
+-                GGML_LOG_WARN("ggml_vulkan: %s does not support VK_EXT_external_memory_host; host memory "
+-                    "will be staged, not pinned, on this device\n", device->name.c_str());
+-            }
++        const uint32_t bit = 1u << device->idx;
++        if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
+             return;
+         }
++        GGML_ASSERT(device->external_memory_host);
+         // const only propagates from the const context; the pointee is mutable
+         entry.views[device->idx] = ggml_vk_buffer_from_host_ptr(const_cast<vk_device&>(device), entry.base, entry.size);
+         if (entry.views[device->idx] == nullptr) {
++            vk_instance.host_import_failed |= bit;
++            GGML_LOG_WARN("ggml_vulkan: %s: host memory import failed, using staging\n", device->name.c_str());
+             return;
+         }
+     }
+diff --git a/src/ggml-vulkan/ggml-vulkan-types.h b/src/ggml-vulkan/ggml-vulkan-types.h
+index 940cb29..3ed2d48 100644
+--- a/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1363,12 +1363,14 @@ struct vk_instance_t {
+ 
+     std::vector<size_t> device_indices;
+     std::vector<bool>   device_supports_membudget;
++    std::vector<bool>   device_host_buffer_import;
+     vk_device devices[GGML_VK_MAX_DEVICES];
+ 
+     std::vector<vk_host_allocation> host_allocations;
+     std::shared_mutex               host_allocations_mutex;
+ 
+     size_t host_import_alignment = 0;
++    uint32_t host_import_failed = 0;  // bitmask by device->idx, guarded by host_allocations_mutex
+ 
+     bool multi_device = false;
+ };
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 1905a4c..9239feb 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4034,6 +4034,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     }
+ }
+ 
++static bool ggml_vk_external_memory_host_usable(vk::DriverId driver_id) {
++    // Disable external_memory_host until https://github.com/KhronosGroup/MoltenVK/pull/2622
++    // is available in the Vulkan SDK.
++    return driver_id != vk::DriverId::eMoltenvk;
++}
++
++static bool ggml_vk_host_buffer_import_usable(uint32_t vendor_id) {
++    // amdgpu re-faults all pages of every imported host allocation on each submission
++    return vendor_id != VK_VENDOR_ID_AMD;
++}
++
+ vk_device ggml_vk_get_device(size_t idx) {
+     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
+ 
+@@ -4221,11 +4232,7 @@ vk_device ggml_vk_get_device(size_t idx) {
+         device->vendor_id = device->properties.vendorID;
+         device->driver_id = driver_props.driverID;
+ 
+-        if (device->driver_id == vk::DriverId::eMoltenvk) {
+-            // Disable external_memory_host until https://github.com/KhronosGroup/MoltenVK/pull/2622
+-            // is available in the Vulkan SDK.
+-            device->external_memory_host = false;
+-        }
++        device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(device->driver_id);
+ 
+         // Implementing the async backend interfaces seems broken on older Intel HW,
+         // see https://github.com/ggml-org/llama.cpp/issues/17302.
+@@ -5497,7 +5504,7 @@ void ggml_vk_instance_init() {
+     }
+     GGML_LOG_DEBUG("ggml_vulkan: Found %zu Vulkan devices:\n", vk_instance.device_indices.size());
+ 
+-    bool all_external_memory_host = vk_instance.device_indices.size() > 1;
++    size_t host_buffer_import_count = 0;
+     for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+         vk::PhysicalDevice vkdev = devices[vk_instance.device_indices[i]];
+         std::vector<vk::ExtensionProperties> extensionprops = vkdev.enumerateDeviceExtensionProperties();
+@@ -5514,20 +5521,27 @@ void ggml_vk_instance_init() {
+ 
+         vk_instance.device_supports_membudget.push_back(membudget_supported);
+ 
++        bool host_buffer_import = false;
+         if (external_memory_host_supported) {
+             vk::PhysicalDeviceProperties2 props2;
++            vk::PhysicalDeviceDriverProperties driver_props;
+             vk::PhysicalDeviceExternalMemoryHostPropertiesEXT ext_props;
+-            props2.pNext = &ext_props;
++            props2.pNext = &driver_props;
++            driver_props.pNext = &ext_props;
+             vkdev.getProperties2(&props2);
+-            vk_instance.host_import_alignment = std::max<size_t>(vk_instance.host_import_alignment, ext_props.minImportedHostPointerAlignment);
+-        } else {
+-            all_external_memory_host = false;
++            host_buffer_import = ggml_vk_external_memory_host_usable(driver_props.driverID) &&
++                                 ggml_vk_host_buffer_import_usable(props2.properties.vendorID);
++            if (host_buffer_import) {
++                vk_instance.host_import_alignment = std::max<size_t>(vk_instance.host_import_alignment, ext_props.minImportedHostPointerAlignment);
++                host_buffer_import_count++;
++            }
+         }
++        vk_instance.device_host_buffer_import.push_back(host_buffer_import);
+ 
+         ggml_vk_print_gpu_info(i);
+     }
+ 
+-    vk_instance.multi_device = all_external_memory_host;
++    vk_instance.multi_device = host_buffer_import_count > 1 && vk_instance.device_host_buffer_import[0];
+ }
+ 
+ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
+-- 
+2.43.0
+

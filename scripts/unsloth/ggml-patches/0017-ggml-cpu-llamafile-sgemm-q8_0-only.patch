@@ -1,0 +1,149 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 30b8cbb..6f9319d 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -49,6 +49,115 @@
+ 
+ #ifdef GGML_USE_LLAMAFILE
+ #include "llamafile/sgemm.h"
++#if defined(__AVX2__) && !defined(__AVX512F__)
++#if defined(_MSC_VER) && !defined(__clang__)
++#include <intrin.h>
++static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
++    int v[4];
++    __cpuid(v, (int) leaf);
++    for (int i = 0; i < 4; ++i) {
++        r[i] = (unsigned) v[i];
++    }
++}
++#else
++#include <cpuid.h>
++static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
++    if (!__get_cpuid(leaf, &r[0], &r[1], &r[2], &r[3])) {
++        r[0] = r[1] = r[2] = r[3] = 0;
++    }
++}
++#endif
++#endif
++
++// Weight types whose mul_mat may go through llamafile's tinyBLAS GEMM. Q8_0: its tinyBLAS kernel adds the per-block
++// products in the same 8 lanes and the same final reduction as ggml_vec_dot_q8_0_q8_0, so it returns the same bits,
++// only faster. F16 / BF16: both paths read the same F16 / BF16 activations and accumulate in F32, only in another
++// order (the text encoder, VAE and DiT F16 / BF16 matmuls). F32 doubles the rms error vs an F64 GEMM and stays
++// opt-in. GGML_CPU_SGEMM_TYPES=q8_0,bf16,f16,f32 (ggml type names), "all" or "none" overrides the default below;
++// GGML_CPU_SGEMM_TYPES=q8_0 restores the bit-identical-only set.
++//
++// Default, per measured SD1.5 F16 sampling (tinyBLAS vs vec_dot, same machine): Q8_0 on every x86 build (1.06-1.12x,
++// same bits). F16 / BF16 where tinyBLAS was faster or equal:
++//   x86 AVX512 builds: Zen 5 1.11-1.16x, Xeon 8573C 1.74x (GCC) / 1.85-1.88x (MSVC);
++//   x86 AVX2 builds on Intel: Xeon 8573C 1.30x (GCC) / 1.24-1.25x (MSVC), Core i7-8700B 1.45-1.6x (clang);
++//   x86 AVX2 builds on AMD Zen 5 with GCC / clang (1.07-1.08x) and on Zen 4 with MSVC (1.03-1.11x);
++//   aarch64 NEON builds without FP16 vector arithmetic (F32 accumulation; armv8.0 1.35x on a Neoverse N2).
++// Left off: AMD Zen 3 AVX2 (GCC 11 0.78x, MSVC 0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
++// (0.86x), other AMD families (not measured), and aarch64 FP16-vector builds, whose tinyBLAS kernel accumulates in
++// FP16 rather than in another order.
++static uint64_t ggml_cpu_sgemm_types = 0;
++
++static uint64_t ggml_cpu_sgemm_types_default(void) {
++    const uint64_t f16 = (1ull << GGML_TYPE_F16) | (1ull << GGML_TYPE_BF16);
++    uint64_t mask = 0;
++#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
++    mask |= 1ull << GGML_TYPE_Q8_0;
++#endif
++#if defined(__AVX512F__)
++    mask |= f16;
++#elif defined(__AVX2__)
++    unsigned r[4] = { 0, 0, 0, 0 };
++    ggml_cpu_sgemm_cpuid(0, r);
++    const bool intel = r[1] == 0x756e6547 && r[3] == 0x49656e69 && r[2] == 0x6c65746e;  // GenuineIntel
++    const bool amd   = r[1] == 0x68747541 && r[3] == 0x69746e65 && r[2] == 0x444d4163;  // AuthenticAMD
++    if (intel) {
++        mask |= f16;
++    } else if (amd) {
++        ggml_cpu_sgemm_cpuid(1, r);
++        unsigned family = (r[0] >> 8) & 0xf;
++        unsigned model  = (r[0] >> 4) & 0xf;
++        if (family == 0xf) {
++            family += (r[0] >> 20) & 0xff;
++            model  |= ((r[0] >> 16) & 0xf) << 4;
++        }
++        const bool zen4 = family == 0x19 && ((model >= 0x10 && model <= 0x1f) || (model >= 0x60 && model <= 0x7f) ||
++                                             (model >= 0xa0 && model <= 0xaf));
++        const bool zen5 = family == 0x1a;
++#if defined(_MSC_VER) && !defined(__clang__)
++        if (zen4) {
++            mask |= f16;
++        }
++        (void) zen5;
++#else
++        if (zen5) {
++            mask |= f16;
++        }
++        (void) zen4;
++#endif
++    }
++#elif defined(__ARM_NEON) && !defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++    mask |= f16;
++#endif
++    return mask;
++}
++
++static void ggml_cpu_sgemm_types_init(void) {
++    ggml_cpu_sgemm_types = ggml_cpu_sgemm_types_default();
++    const char * env = getenv("GGML_CPU_SGEMM_TYPES");
++    if (env == NULL) {
++        return;
++    }
++    if (strcmp(env, "all") == 0) {
++        ggml_cpu_sgemm_types = ~0ull;
++        return;
++    }
++    uint64_t mask = 0;
++    char buf[256];
++    snprintf(buf, sizeof(buf), "%s", env);
++    for (char * tok = strtok(buf, ", "); tok != NULL; tok = strtok(NULL, ", ")) {
++        for (int t = 0; t < GGML_TYPE_COUNT && t < 64; ++t) {
++            const char * name = ggml_type_name((enum ggml_type) t);
++            if (name != NULL && strcmp(name, tok) == 0) {
++                mask |= 1ull << t;
++            }
++        }
++    }
++    ggml_cpu_sgemm_types = mask;
++}
++
++static inline bool ggml_cpu_sgemm_type_enabled(enum ggml_type t) {
++    return t < 64 && ((ggml_cpu_sgemm_types >> t) & 1);
++}
+ #endif
+ 
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+@@ -1460,7 +1569,7 @@ void ggml_compute_forward_mul_mat(
+ 
+     const bool src1_cont = ggml_is_contiguous(src1);
+ 
+-    if (!params->use_ref && src1_cont) {
++    if (!params->use_ref && src1_cont && ggml_cpu_sgemm_type_enabled(src0->type)) {
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+             for (int64_t i12 = 0; i12 < ne12; i12++)
+                 if (!llamafile_sgemm(params,
+@@ -1539,7 +1648,7 @@ UseGgmlGemm1:;
+     ggml_barrier(params->threadpool);
+ 
+ #if GGML_USE_LLAMAFILE
+-    if (!params->use_ref && src1->type != vec_dot_type) {
++    if (!params->use_ref && src1->type != vec_dot_type && ggml_cpu_sgemm_type_enabled(src0->type)) {
+         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+@@ -4088,6 +4197,10 @@ void ggml_cpu_init(void) {
+ 
+             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
+ 
++#ifdef GGML_USE_LLAMAFILE
++            ggml_cpu_sgemm_types_init();
++#endif
++
+             GGML_PRINT_DEBUG("%s: GELU, Quick GELU, SILU and EXP tables initialized in %f ms\n", __func__, (t_end - t_start)/1000.0);
+ 
+ #ifdef GGML_USE_OPENMP

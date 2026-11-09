@@ -493,7 +493,8 @@ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
         p1 = 0;
     }
 
-    if (direct) {
+    // The direct kernels take F16 / F32 weights only (ggml-cpu asserts on anything else); other types keep im2col.
+    if (direct && (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32)) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
         // ggml_conv_2d, but skips the final [OC, N] -> [N, OC] relayout when N == 1 (no data moves).
@@ -536,7 +537,7 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
-    if (direct) {
+    if (direct && (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32)) {
         int64_t OC = w->ne[3] / IC;
         int64_t N  = x->ne[3] / IC;
         x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
@@ -762,17 +763,22 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        // A same-type cast is still a full copy; skip it for K/V that are already contiguous F16.
+        if (k_in->type != GGML_TYPE_F16 || !ggml_is_contiguous(k_in)) {
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        }
 
         if (kv_scale != 1.0f) {
             v_in = ggml_ext_scale(ctx, v_in, kv_scale);
         }
-        v_in       = ggml_permute(ctx, v_in, 0, 2, 1, 3);
-        auto v_f16 = ggml_cast(ctx, v_in, GGML_TYPE_F16);
-        if (!ggml_backend_supports_op(backend, v_f16)) {
-            v_f16 = ggml_cast(ctx, ggml_ext_cont(ctx, v_in), GGML_TYPE_F16);
+        v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);
+        if (v_in->type != GGML_TYPE_F16 || !ggml_is_contiguous(v_in)) {
+            auto v_f16 = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+            if (!ggml_backend_supports_op(backend, v_f16)) {
+                v_f16 = ggml_cast(ctx, ggml_ext_cont(ctx, v_in), GGML_TYPE_F16);
+            }
+            v_in = v_f16;
         }
-        v_in = v_f16;
         v_in = ggml_reshape_3d(ctx, v_in, v_in->ne[0], L_k, n_kv_head * N);
 
         if (mask_in != nullptr) {

@@ -29,6 +29,11 @@
 #include <unistd.h>
 #endif
 
+#ifdef __linux__
+#include <errno.h>
+#include <sched.h>
+#endif
+
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "stable-diffusion.h"
@@ -362,20 +367,47 @@ void MmapWrapper::release_range(size_t offset, size_t n) const {
 // LICENSE: https://github.com/ggerganov/llama.cpp/blob/master/LICENSE
 int32_t sd_get_num_physical_cores() {
 #ifdef __linux__
-    // enumerate the set of thread siblings, num entries is num cores
-    std::unordered_set<std::string> siblings;
-    for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
-        if (!thread_siblings.is_open()) {
-            break;  // no more cpus
+    // One thread per physical core this process may run on: the distinct thread-sibling sets among the CPUs in
+    // the affinity mask (a taskset / container cpuset leaves fewer CPUs than the machine has). Upstream's loop
+    // counts every CPU of the machine, so a 4-CPU cpuset on a 192-CPU host still gets 96 threads.
+    // The mask is sized dynamically: a kernel built for more than CPU_SETSIZE (1024) CPUs rejects a smaller one
+    // with EINVAL, so grow it until the call succeeds.
+    for (int ncpus = CPU_SETSIZE; ncpus <= (1 << 20); ncpus *= 2) {
+        cpu_set_t* mask   = CPU_ALLOC(ncpus);
+        const size_t size = CPU_ALLOC_SIZE(ncpus);
+        if (mask == nullptr) {
+            break;
         }
-        std::string line;
-        if (std::getline(thread_siblings, line)) {
-            siblings.insert(line);
+        CPU_ZERO_S(size, mask);
+        if (sched_getaffinity(0, size, mask) != 0) {
+            CPU_FREE(mask);
+            if (errno == EINVAL) {
+                continue;
+            }
+            break;
         }
-    }
-    if (siblings.size() > 0) {
-        return static_cast<int32_t>(siblings.size());
+        std::unordered_set<std::string> siblings;
+        int allowed = 0;
+        for (int cpu = 0; cpu < ncpus; ++cpu) {
+            if (!CPU_ISSET_S(cpu, size, mask)) {
+                continue;
+            }
+            allowed++;
+            std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
+            std::string line;
+            if (thread_siblings.is_open() && std::getline(thread_siblings, line) && !line.empty()) {
+                siblings.insert(line);
+            }
+        }
+        CPU_FREE(mask);
+        if (!siblings.empty()) {
+            return static_cast<int32_t>(siblings.size());
+        }
+        if (allowed > 0) {
+            // No topology in sysfs (some containers): assume 2-way SMT above 4 CPUs, as below.
+            return allowed <= 4 ? allowed : allowed / 2;
+        }
+        break;
     }
 #elif defined(__APPLE__) && defined(__MACH__)
     int32_t num_physical_cores;
@@ -829,13 +861,11 @@ sd::Tensor<float> sd_image_to_tensor(sd_image_t image,
                                                  static_cast<int64_t>(image.height),
                                                  static_cast<int64_t>(image.channel),
                                                  1});
-    for (uint32_t iw = 0; iw < image.width; ++iw) {
-        for (uint32_t ih = 0; ih < image.height; ++ih) {
-            for (uint32_t ic = 0; ic < image.channel; ++ic) {
-                tensor.index(iw, ih, ic, 0) = sd_image_get_f32(image, iw, ih, ic, scale);
-            }
-        }
-    }
+    const int64_t pixels     = int64_t(image.width) * image.height;
+    sd::tensor_for_each(tensor.numel(), [&](int64_t i) {
+        float value      = image.data[(i % pixels) * image.channel + i / pixels];
+        tensor.data()[i] = scale ? value / 255.f : value;
+    });
     if (target_width >= 0 && target_height >= 0 &&
         (tensor.shape()[0] != target_width || tensor.shape()[1] != target_height)) {
         tensor = sd::ops::interpolate(tensor,

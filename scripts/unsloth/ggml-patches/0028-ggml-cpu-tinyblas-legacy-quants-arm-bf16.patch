@@ -1,0 +1,652 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 51246c4..9186376 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -44,9 +44,9 @@
+ #include <omp.h>
+ #endif
+ 
+-#if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
+-#undef GGML_USE_LLAMAFILE
+-#endif
++// Unsloth: upstream compiles the llamafile hook out of SVE / i8mm builds, where its Q4_0 / Q8_0 kernels lose to the
++// repack and i8mm vec_dot paths. The type mask below (ggml_cpu_sgemm_types_default) keeps those types off tinyBLAS
++// there, so the hook stays for the types those builds have no GEMM for (BF16, Q5_0, Q5_1).
+ 
+ #ifdef GGML_USE_LLAMAFILE
+ #include "llamafile/sgemm.h"
+@@ -82,21 +82,44 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
+ //   x86 AVX512 builds: Zen 5 1.11-1.16x, Xeon 8573C 1.74x (GCC) / 1.85-1.88x (MSVC);
+ //   x86 AVX2 builds on Intel: Xeon 8573C 1.30x (GCC) / 1.24-1.25x (MSVC), Core i7-8700B 1.45-1.6x (clang);
+ //   x86 AVX2 builds on AMD Zen 5 with GCC / clang (1.07-1.08x) and on Zen 4 with MSVC (1.03-1.11x);
++//   x86 AVX2 builds on AMD Zen 3 / Zen 4 with GCC 13+ (1.81-1.84x);
+ //   aarch64 NEON builds without FP16 vector arithmetic (F32 accumulation; armv8.0 1.35x on a Neoverse N2).
+-// Left off: AMD Zen 3 AVX2 (GCC 11 0.78x, MSVC 0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
+-// (0.86x), other AMD families (not measured), and aarch64 FP16-vector builds, whose tinyBLAS kernel accumulates in
+-// FP16 rather than in another order.
++//   BF16 on every aarch64 NEON build (exact BF16 -> F32 widening, F32 accumulation): the shipped variants have no
++//   NEON BF16 vec_dot (scalar, about 19x slower on a Neoverse N2).
++// Left off: AMD Zen 3 AVX2 with GCC 11 (0.78x) or MSVC (0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
++// (0.86x), other AMD families (not measured), and cl.exe aarch64 builds (no NEON tinyBLAS kernels there; clang
++// targeting the MSVC ABI, as in the Windows arm64 bundle, gets them).
+ static uint64_t ggml_cpu_sgemm_types = 0;
+ 
+ static uint64_t ggml_cpu_sgemm_types_default(void) {
+     const uint64_t f16 = (1ull << GGML_TYPE_F16) | (1ull << GGML_TYPE_BF16);
+     uint64_t mask = 0;
++    // Legacy quants (GGML_CPU_SGEMM_LEGACY=0 drops them from the default). x86: Q4_0 / Q5_0 (tinyBLAS_Q0_AVX) and
++    // Q4_1 / Q5_1 (tinyBLAS_Q1_AVX, AVX2 builds) return the same bits as their vec_dot, like Q8_0; Q4_0 weights in a
++    // repack buffer keep the repack kernel. aarch64 dotprod: Q5_0 / Q4_1 / Q5_1 (tinyBLAS_QX_ARM) form vec_dot's
++    // integer block products and sum them in another float order; Q4_0 / Q8_0 stay on repack / vec_dot.
++    const char * legacy_env = getenv("GGML_CPU_SGEMM_LEGACY");
++    const bool legacy = legacy_env == NULL || atoi(legacy_env) != 0;
+ #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+     mask |= 1ull << GGML_TYPE_Q8_0;
++    if (legacy) {
++        mask |= (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_1);
++    }
++#elif defined(__ARM_FEATURE_DOTPROD) && !(defined(_MSC_VER) && !defined(__clang__))
++    if (legacy) {
++        mask |= (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q5_1);
++#if !defined(__ARM_FEATURE_MATMUL_INT8)
++        // i8mm builds: Q4_1 keeps its smmla vec_dot (two rows per call), as fast as this kernel on a Neoverse N2
++        mask |= 1ull << GGML_TYPE_Q4_1;
++#endif
++    }
+ #endif
+ #if defined(__AVX512F__)
+     mask |= f16;
+ #elif defined(__AVX2__)
++    // BF16 on every AVX2 build: BF16 vec_dot has no AVX2 kernel worth the name (3072 x 3072 x 1024 mul_mat,
++    // 4 threads: tinyBLAS 168 vs 392 ms on Zen 3, 211 vs 276 ms on Zen 4), unlike F16 below
++    mask |= 1ull << GGML_TYPE_BF16;
+     unsigned r[4] = { 0, 0, 0, 0 };
+     ggml_cpu_sgemm_cpuid(0, r);
+     const bool intel = r[1] == 0x756e6547 && r[3] == 0x49656e69 && r[2] == 0x6c65746e;  // GenuineIntel
+@@ -120,14 +143,28 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
+         }
+         (void) zen5;
+ #else
+-        if (zen5) {
++        // GCC 13 and later build a fast tinyBLAS F16 kernel for Zen 3 / Zen 4 too (SD1.5 F16 sampling, 4 threads:
++        // EPYC 7763 native build 1.81x, EPYC 9V74 AVX2 build 1.84x; VAE decode 1.65-1.68x); GCC 11 (the Linux release toolchain) does not
++        // (EPYC 7763 0.78x), so older compilers keep F16 on vec_dot there. GGML_CPU_SGEMM_TYPES overrides.
++#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 13
++        const bool zen3_gcc13 = family == 0x19;
++#else
++        const bool zen3_gcc13 = false;
++#endif
++        if (zen5 || zen3_gcc13) {
+             mask |= f16;
+         }
+         (void) zen4;
+ #endif
+     }
+-#elif defined(__ARM_NEON) && !defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
+-    mask |= f16;
++#elif defined(__ARM_NEON) && !(defined(_MSC_VER) && !defined(__clang__))
++    // BF16 on every NEON build, F16 on builds without FP16 vector arithmetic: F32-accumulating NEON tinyBLAS kernels
++    // (F32 src1). FP16-vector builds keep F16 on vec_dot by default (faster there, but it accumulates in FP16;
++    // GGML_CPU_SGEMM_TYPES=f16 picks the F32-accumulating kernel instead).
++    mask |= 1ull << GGML_TYPE_BF16;
++#if !defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
++    mask |= 1ull << GGML_TYPE_F16;
++#endif
+ #endif
+     return mask;
+ }
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index d28840a..1f0cb90 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -63,6 +63,12 @@
+ #define NOINLINE __attribute__((__noinline__))
+ #endif
+ 
++// Unsloth: the NEON fp16 / bf16 kernels below are compiled out only for cl.exe. clang targeting the MSVC ABI
++// (the Windows arm64 bundle) also defines _MSC_VER but has the float16_t types and intrinsics.
++#if defined(_MSC_VER) && !defined(__clang__)
++#define GGML_SGEMM_MSVC_CL 1
++#endif
++
+ #if defined(__ARM_NEON) || defined(__AVX512F__) || defined(__VXE__) || defined(__VXE2__)
+ #define VECTOR_REGISTERS 32
+ #else
+@@ -165,7 +171,7 @@ template <>
+ inline float32x4_t madd(float32x4_t a, float32x4_t b, float32x4_t c) {
+     return vfmaq_f32(c, b, a);
+ }
+-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(GGML_SGEMM_MSVC_CL)
+ template <>
+ inline float16x8_t madd(float16x8_t a, float16x8_t b, float16x8_t c) {
+     return vfmaq_f16(c, b, a);
+@@ -234,7 +240,7 @@ inline float hsum(float32x4_t x) {
+ }
+ #endif // __ARM_NEON
+ 
+-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(GGML_SGEMM_MSVC_CL)
+ inline float hsum(float16x8_t x) {
+     return vaddvq_f32(vaddq_f32(vcvt_f32_f16(vget_low_f16(x)),
+                                 vcvt_f32_f16(vget_high_f16(x))));
+@@ -305,7 +311,7 @@ template <typename T, typename U> T load(const U *);
+ template <> inline float32x4_t load(const float *p) {
+     return vld1q_f32(p);
+ }
+-#if !defined(_MSC_VER)
++#if !defined(GGML_SGEMM_MSVC_CL)
+ // FIXME: this should check for __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+ template <> inline float16x8_t load(const ggml_fp16_t *p) {
+     return vld1q_f16((const float16_t *)p);
+@@ -313,7 +319,11 @@ template <> inline float16x8_t load(const ggml_fp16_t *p) {
+ template <> inline float32x4_t load(const ggml_fp16_t *p) {
+     return vcvt_f32_f16(vld1_f16((const float16_t *)p));
+ }
+-#endif // _MSC_VER
++// BF16 -> F32 is exact: the 16 bits become the high half of the F32
++template <> inline float32x4_t load(const ggml_bf16_t *p) {
++    return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const uint16_t *)p), 16));
++}
++#endif // GGML_SGEMM_MSVC_CL
+ #endif // __ARM_NEON
+ 
+ #if defined(__VXE__) || defined(__VXE2__)
+@@ -1303,6 +1313,17 @@ class tinyBLAS_RVV {
+ // QUANT ZERO MATRIX MULTIPLICATION
+ 
+ #if defined(__ARM_FEATURE_DOTPROD)
++// bit 4 of the 16 Q5_0 / Q5_1 codes of one half block (half 0: codes 0..15, half 1: codes 16..31) as 0x10 bytes
++static inline uint8x16_t q5_high_bits(const uint8_t *qh, int half) {
++    uint32_t x32;
++    memcpy(&x32, qh, sizeof(uint32_t));
++    static const uint8_t sel[2][16] = { { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 },
++                                        { 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3 } };
++    static const uint8_t bit[16] = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
++    const uint8x16_t bytes = vqtbl1q_u8(vreinterpretq_u8_u32(vdupq_n_u32(x32)), vld1q_u8(sel[half]));
++    return vandq_u8(vtstq_u8(bytes, vld1q_u8(bit)), vdupq_n_u8(0x10));
++}
++
+ template <typename TA>
+ class tinyBLAS_Q0_ARM {
+   public:
+@@ -1437,6 +1458,146 @@ class tinyBLAS_Q0_ARM {
+     const int ith;
+     const int nth;
+ };
++
++// Q5_0 x Q8_0 and Q4_1 / Q5_1 x Q8_1: per block the int8 dot of the weight codes with the activations (vdotq, the
++// integer products of ggml_vec_dot_q5_0_q8_0 / _q4_1_q8_1 / _q5_1_q8_1), times d_w*d_a into 4 lanes, plus the
++// m_w*s_a term for the _1 types; the float sums run in another order than vec_dot. Each weight block is decoded
++// once per tile (not once per activation column) and the tile is up to 4 x 4.
++template <typename TA, typename TB>
++class tinyBLAS_QX_ARM {
++    static constexpr bool has_min = std::is_same<TB, block_q8_1>::value;
++
++  public:
++    tinyBLAS_QX_ARM(int64_t k,
++                    const TA *A, int64_t lda,
++                    const TB *B, int64_t ldb,
++                    float *C, int64_t ldc,
++                    int ith, int nth)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++    }
++
++    void matmul(int64_t m, int64_t n) {
++        mnpack(0, m, 0, n);
++    }
++
++  private:
++    NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t mc, nc, mp, np;
++        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4ll)) {
++        case 0x44: mc = 4; nc = 4; gemm<4, 4>(m0, m, n0, n); break;
++        case 0x43: mc = 4; nc = 3; gemm<4, 3>(m0, m, n0, n); break;
++        case 0x34: mc = 3; nc = 4; gemm<3, 4>(m0, m, n0, n); break;
++        case 0x42: mc = 4; nc = 2; gemm<4, 2>(m0, m, n0, n); break;
++        case 0x24: mc = 2; nc = 4; gemm<2, 4>(m0, m, n0, n); break;
++        case 0x33: mc = 3; nc = 3; gemm<3, 3>(m0, m, n0, n); break;
++        case 0x32: mc = 3; nc = 2; gemm<3, 2>(m0, m, n0, n); break;
++        case 0x23: mc = 2; nc = 3; gemm<2, 3>(m0, m, n0, n); break;
++        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
++        case 0x41: mc = 4; nc = 1; gemm<4, 1>(m0, m, n0, n); break;
++        case 0x14: mc = 1; nc = 4; gemm<1, 4>(m0, m, n0, n); break;
++        case 0x31: mc = 3; nc = 1; gemm<3, 1>(m0, m, n0, n); break;
++        case 0x13: mc = 1; nc = 3; gemm<1, 3>(m0, m, n0, n); break;
++        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
++        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
++        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
++        default: return;
++        }
++        mp = m0 + (m - m0) / mc * mc;
++        np = n0 + (n - n0) / nc * nc;
++        mnpack(mp, m, n0, np);
++        mnpack(m0, m, np, n);
++    }
++
++    template <int RM, int RN>
++    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t ytiles = (m - m0) / RM;
++        int64_t xtiles = (n - n0) / RN;
++        int64_t tiles = xtiles * ytiles;
++        int64_t duty = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            int64_t ii = m0 + job / xtiles * RM;
++            int64_t jj = n0 + job % xtiles * RN;
++            float32x4_t Cv[RN][RM] = {};
++            float32x4_t Sv[RN] = {};  // lane i: sum of m_w(row ii+i) * s_a(col jj+j), _1 types only
++            for (int64_t l = 0; l < k; ++l) {
++                int8x16_t alo[RM], ahi[RM];
++                float ad[RM];
++                float am[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++                for (int64_t i = 0; i < RM; ++i) {
++                    const TA * a = A + lda * (ii + i) + l;
++                    alo[i] = load_lo(a);
++                    ahi[i] = load_hi(a);
++                    ad[i] = unhalf(a->d);
++                    if constexpr (has_min) {
++                        am[i] = unhalf(a->m);
++                    }
++                }
++                const float32x4_t amv = vld1q_f32(am);
++                for (int64_t j = 0; j < RN; ++j) {
++                    const TB * b = B + ldb * (jj + j) + l;
++                    const int8x16_t blo = vld1q_s8(b->qs);
++                    const int8x16_t bhi = vld1q_s8(b->qs + 16);
++                    const float bd = unhalf(b->d);
++                    if constexpr (has_min) {
++                        Sv[j] = vmlaq_n_f32(Sv[j], amv, unhalf(b->s));
++                    }
++                    for (int64_t i = 0; i < RM; ++i) {
++                        Cv[j][i] = vmlaq_n_f32(Cv[j][i],
++                                               vcvtq_f32_s32(vdotq_s32(vdotq_s32(vdupq_n_s32(0), alo[i], blo), ahi[i], bhi)),
++                                               ad[i] * bd);
++                    }
++                }
++            }
++            for (int64_t j = 0; j < RN; ++j) {
++                float sm[4];
++                vst1q_f32(sm, Sv[j]);
++                for (int64_t i = 0; i < RM; ++i)
++                    C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]) + (has_min ? sm[i] : 0.0f);
++            }
++        }
++    }
++
++    inline int8x16_t load_lo(const block_q4_1 *b) {
++        return vreinterpretq_s8_u8(vandq_u8(vld1q_u8(b->qs), vdupq_n_u8(0x0f)));
++    }
++
++    inline int8x16_t load_hi(const block_q4_1 *b) {
++        return vreinterpretq_s8_u8(vshrq_n_u8(vld1q_u8(b->qs), 4));
++    }
++
++    inline int8x16_t load_lo(const block_q5_1 *b) {
++        return vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vld1q_u8(b->qs), vdupq_n_u8(0x0f)), q5_high_bits(b->qh, 0)));
++    }
++
++    inline int8x16_t load_hi(const block_q5_1 *b) {
++        return vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(vld1q_u8(b->qs), 4), q5_high_bits(b->qh, 1)));
++    }
++
++    // Q5_0: (low nibble | bit 4 from qh) - 16, the codes ggml_vec_dot_q5_0_q8_0 forms
++    inline int8x16_t load_lo(const block_q5_0 *b) {
++        return vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vld1q_u8(b->qs), vdupq_n_u8(0x0f)), q5_high_bits(b->qh, 0))),
++                        vdupq_n_s8(0x10));
++    }
++
++    inline int8x16_t load_hi(const block_q5_0 *b) {
++        return vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(vld1q_u8(b->qs), 4), q5_high_bits(b->qh, 1))),
++                        vdupq_n_s8(0x10));
++    }
++
++    const TA *const A;
++    const TB *const B;
++    float *const C;
++    const int64_t k;
++    const int64_t lda;
++    const int64_t ldb;
++    const int64_t ldc;
++    const int ith;
++    const int nth;
++};
+ #endif // __ARM_FEATURE_DOTPROD
+ 
+ #if defined(__AVX2__) || defined(__AVX512F__) || defined(__AVX__)
+@@ -1885,6 +2046,218 @@ class tinyBLAS_Q0_AVX {
+ };
+ #endif // __AVX__
+ 
++#if defined(__AVX2__)
++// Q4_1 / Q5_1 weights x Q8_1 activations. Per block the same integer dot (unsigned weight codes times signed
++// activations, the dpbusd / maddubs pairs of mul_sum_us8_pairs_float), the same d_w*d_a FMA into 8 lanes and the
++// same scalar m_w*s_a sum as ggml_vec_dot_q4_1_q8_1 / ggml_vec_dot_q5_1_q8_1, over the blocks in the same order,
++// so each output is the value vec_dot returns; only RM x RN outputs share the loads.
++template <typename TA>
++class tinyBLAS_Q1_AVX {
++  public:
++    tinyBLAS_Q1_AVX(int64_t k,
++                    const TA *A, int64_t lda,
++                    const block_q8_1 *B, int64_t ldb,
++                    float *C, int64_t ldc,
++                    int ith, int nth)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++    }
++
++    void matmul(int64_t m, int64_t n) {
++        mnpack(0, m, 0, n);
++    }
++
++  private:
++    void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t mc, nc, mp, np;
++        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4)) {
++#if VECTOR_REGISTERS == 32
++        case 0x44:
++        case 0x43:
++            mc = 4;
++            nc = 3;
++            gemm<4, 3>(m0, m, n0, n);
++            break;
++        case 0x34:
++        case 0x33:
++            mc = 3;
++            nc = 3;
++            gemm<3, 3>(m0, m, n0, n);
++            break;
++        case 0x42:
++            mc = 4;
++            nc = 2;
++            gemm<4, 2>(m0, m, n0, n);
++            break;
++        case 0x24:
++            mc = 2;
++            nc = 4;
++            gemm<2, 4>(m0, m, n0, n);
++            break;
++#else
++        case 0x44:
++        case 0x43:
++        case 0x42:
++            mc = 4;
++            nc = 2;
++            gemm<4, 2>(m0, m, n0, n);
++            break;
++        case 0x34:
++        case 0x24:
++            mc = 2;
++            nc = 4;
++            gemm<2, 4>(m0, m, n0, n);
++            break;
++        case 0x33:
++#endif
++        case 0x32:
++            mc = 3;
++            nc = 2;
++            gemm<3, 2>(m0, m, n0, n);
++            break;
++        case 0x23:
++            mc = 2;
++            nc = 3;
++            gemm<2, 3>(m0, m, n0, n);
++            break;
++        case 0x41:
++            mc = 4;
++            nc = 1;
++            gemm<4, 1>(m0, m, n0, n);
++            break;
++        case 0x22:
++            mc = 2;
++            nc = 2;
++            gemm<2, 2>(m0, m, n0, n);
++            break;
++        case 0x14:
++            mc = 1;
++            nc = 4;
++            gemm<1, 4>(m0, m, n0, n);
++            break;
++        case 0x31:
++            mc = 3;
++            nc = 1;
++            gemm<3, 1>(m0, m, n0, n);
++            break;
++        case 0x13:
++            mc = 1;
++            nc = 3;
++            gemm<1, 3>(m0, m, n0, n);
++            break;
++        case 0x21:
++            mc = 2;
++            nc = 1;
++            gemm<2, 1>(m0, m, n0, n);
++            break;
++        case 0x12:
++            mc = 1;
++            nc = 2;
++            gemm<1, 2>(m0, m, n0, n);
++            break;
++        case 0x11:
++            mc = 1;
++            nc = 1;
++            gemm<1, 1>(m0, m, n0, n);
++            break;
++        default:
++            return;
++        }
++        mp = m0 + (m - m0) / mc * mc;
++        np = n0 + (n - n0) / nc * nc;
++        mnpack(mp, m, n0, np);
++        mnpack(m0, m, np, n);
++    }
++
++    template <int RM, int RN>
++    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t ytiles = (m - m0) / RM;
++        int64_t xtiles = (n - n0) / RN;
++        int64_t tiles = xtiles * ytiles;
++        int64_t duty = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            int64_t ii = m0 + job / xtiles * RM;
++            int64_t jj = n0 + job % xtiles * RN;
++            __m256 Cv[RN][RM] = {};
++            float Sm[RN][RM] = {};
++            for (int64_t l = 0; l < k; ++l) {
++                __m256i av[RM];
++                float ad[RM], am[RM];
++                for (int64_t i = 0; i < RM; ++i) {
++                    const TA * a = A + lda * (ii + i) + l;
++                    av[i] = load(a);
++                    ad[i] = unhalf(a->d);
++                    am[i] = unhalf(a->m);
++                }
++                for (int64_t j = 0; j < RN; ++j) {
++                    const block_q8_1 * b = B + ldb * (jj + j) + l;
++                    const __m256i bv = _mm256_loadu_si256((const __m256i *) b->qs);
++                    const float bd = unhalf(b->d);
++                    const float bs = unhalf(b->s);
++                    for (int64_t i = 0; i < RM; ++i) {
++                        Sm[j][i] += am[i] * bs;
++                        Cv[j][i] = madd(_mm256_mul_ps(_mm256_set1_ps(ad[i]), _mm256_set1_ps(bd)), updot(av[i], bv), Cv[j][i]);
++                    }
++                }
++            }
++            for (int64_t j = 0; j < RN; ++j)
++                for (int64_t i = 0; i < RM; ++i)
++                    C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]) + Sm[j][i];
++        }
++    }
++
++    // 32 unsigned weight codes, low nibbles of qs then high nibbles (bytes_from_nibbles_32)
++    static inline __m256i denibble(const uint8_t *p) {
++        __m128i x = _mm_loadu_si128((const __m128i *)p);
++        return _mm256_and_si256(_mm256_set1_epi8(15),
++                                _mm256_insertf128_si256(_mm256_castsi128_si256(x),
++                                                        _mm_srli_epi16(x, 4), 1));
++    }
++
++    inline __m256i load(const block_q4_1 *b) {
++        return denibble(b->qs);
++    }
++
++    // bit 4 of each code from qh, as bytes_from_bits_32(qh) & 0x10 in ggml_vec_dot_q5_1_q8_1
++    inline __m256i load(const block_q5_1 *b) {
++        uint32_t x32;
++        memcpy(&x32, b->qh, sizeof(uint32_t));
++        const __m256i shuf = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202,
++                                               0x0101010101010101, 0x0000000000000000);
++        __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(x32), shuf);
++        bytes = _mm256_or_si256(bytes, _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe));
++        bytes = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
++        return _mm256_or_si256(denibble(b->qs), _mm256_and_si256(bytes, _mm256_set1_epi8(0x10)));
++    }
++
++    // unsigned x signed byte pairs summed to 8 int32 lanes, as mul_sum_us8_pairs_float
++    inline __m256 updot(__m256i u, __m256i s) {
++        __m256i res;
++#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
++        res = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, s);
++#elif defined(__AVXVNNI__)
++        res = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u, s);
++#else
++        res = _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(u, s));
++#endif
++        return _mm256_cvtepi32_ps(res);
++    }
++
++    const TA *const A;
++    const block_q8_1 *const B;
++    float *const C;
++    const int64_t k;
++    const int64_t lda;
++    const int64_t ldb;
++    const int64_t ldc;
++    const int ith;
++    const int nth;
++};
++#endif // __AVX2__
++
+ //PPC Implementation
+ #if defined(__MMA__)
+ 
+@@ -4006,6 +4379,15 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+                 (float *)C, ldc};
+             return tb.matmul(m, n);
+         }
++#elif defined(__ARM_NEON) && !defined(GGML_SGEMM_MSVC_CL)
++        // BF16 weights widened exactly to F32, F32 src1, F32 accumulation
++        if (Btype == GGML_TYPE_F32) {
++            tinyBLAS<4, float32x4_t, float32x4_t, ggml_bf16_t, float, float> tb{ params,
++                k, (const ggml_bf16_t *)A, lda,
++                (const float *)B, ldb,
++                (float *)C, ldc};
++            return tb.matmul(m, n);
++        }
+ #elif defined(__MMA__)
+         if (k % 8) {
+             return false;
+@@ -4062,7 +4444,17 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+                 (float *)C, ldc};
+             return tb.matmul(m, n);
+         }
+-#elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
++#elif defined(__ARM_NEON) && !defined(GGML_SGEMM_MSVC_CL)
++        // F32 src1 and F32 accumulation on every NEON build (FP16-vector builds included: their F16 kernel below
++        // accumulates in FP16 and is only reached with F16 activations)
++        if (Btype == GGML_TYPE_F32) {
++            tinyBLAS<4, float32x4_t, float32x4_t, ggml_fp16_t, float, float> tb{ params,
++                k, (const ggml_fp16_t *)A, lda,
++                (const float *)B, ldb,
++                (float *)C, ldc};
++            return tb.matmul(m, n);
++        }
++#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+         if (n < 8)
+             return false;
+         if (Btype == GGML_TYPE_F16) {
+@@ -4072,14 +4464,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+                 (float *)C, ldc};
+             return tb.matmul(m, n);
+         }
+-#elif defined(__ARM_NEON) && !defined(_MSC_VER)
+-        if (Btype == GGML_TYPE_F32) {
+-            tinyBLAS<4, float32x4_t, float32x4_t, ggml_fp16_t, float, float> tb{ params,
+-                k, (const ggml_fp16_t *)A, lda,
+-                (const float *)B, ldb,
+-                (float *)C, ldc};
+-            return tb.matmul(m, n);
+-        }
++#endif
+ #elif defined(__VXE__) || defined(__VXE2__)
+         if (n < 4)
+             return false;
+@@ -4214,6 +4599,62 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             params->ith, params->nth};
+         tb.matmul(m, n);
+         return true;
++#elif defined(__ARM_FEATURE_DOTPROD)
++        tinyBLAS_QX_ARM<block_q5_0, block_q8_0> tb{
++            k, (const block_q5_0 *)A, lda,
++            (const block_q8_0 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_Q4_1: {
++        if (Btype != GGML_TYPE_Q8_1)
++            return false;
++#if defined(__AVX2__)
++        tinyBLAS_Q1_AVX<block_q4_1> tb{
++            k, (const block_q4_1 *)A, lda,
++            (const block_q8_1 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
++#elif defined(__ARM_FEATURE_DOTPROD)
++        tinyBLAS_QX_ARM<block_q4_1, block_q8_1> tb{
++            k, (const block_q4_1 *)A, lda,
++            (const block_q8_1 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_Q5_1: {
++        if (Btype != GGML_TYPE_Q8_1)
++            return false;
++#if defined(__AVX2__)
++        tinyBLAS_Q1_AVX<block_q5_1> tb{
++            k, (const block_q5_1 *)A, lda,
++            (const block_q8_1 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
++#elif defined(__ARM_FEATURE_DOTPROD)
++        tinyBLAS_QX_ARM<block_q5_1, block_q8_1> tb{
++            k, (const block_q5_1 *)A, lda,
++            (const block_q8_1 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
+ #else
+         return false;
+ #endif
