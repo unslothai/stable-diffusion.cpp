@@ -1,0 +1,132 @@
+diff --git a/src/ggml-cpu/repack.cpp b/src/ggml-cpu/repack.cpp
+index 2632ae3..c02953b 100644
+--- a/src/ggml-cpu/repack.cpp
++++ b/src/ggml-cpu/repack.cpp
+@@ -17,6 +17,7 @@
+ #include <cstdio>  // for GGML_ASSERT
+ 
+ #include "repack.h"
++#include "tiled/tiled.h"
+ 
+ #if defined(__GNUC__)
+ #pragma GCC diagnostic ignored "-Woverlength-strings"
+@@ -5004,7 +5005,8 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+             #endif
+         }
+     } else if (cur->type == GGML_TYPE_Q4_K) {
+-        if (ggml_cpu_has_avx2()) {
++        // x86: on AMD CPUs the tiled K-quant matmul (plain buffer) measured faster than this repack (see tiled.cpp)
++        if (ggml_cpu_has_avx2() && !ggml_cpu_tiled_prefers(cur->type)) {
+             if (cur->ne[1] % 8 == 0) {
+                 return &q4_K_8x8_q8_K;
+             }
+@@ -5031,7 +5033,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+             #endif
+         }
+     } else if (cur->type == GGML_TYPE_Q2_K) {
+-        if (ggml_cpu_has_avx512()) {
++        if (ggml_cpu_has_avx512() && !ggml_cpu_tiled_prefers(cur->type)) {
+             if (cur->ne[1] % 8 == 0) {
+                 return &q2_K_8x8_q8_K;
+             }
+diff --git a/src/ggml-cpu/tiled/tiled.cpp b/src/ggml-cpu/tiled/tiled.cpp
+index 77e1a99..3fac356 100644
+--- a/src/ggml-cpu/tiled/tiled.cpp
++++ b/src/ggml-cpu/tiled/tiled.cpp
+@@ -14,6 +14,9 @@
+ #include <cstring>
+ 
+ #include <mutex>
++#if defined(__x86_64__) || defined(__i386__)
++#include <cpuid.h>
++#endif
+ 
+ #define UNUSED GGML_UNUSED
+ 
+@@ -594,6 +597,52 @@ static bool ggml_tiled_matmul_forced(void) {
+ // hard constraints shared by the MUL_MAT and MUL_MAT_ID entries; the src0 type gate is the
+ // entries' type switch
+ 
++// Unsloth: AMD x86 CPUs only by default. Klein Q4_K_M DiT with the tiled kernel instead of the Q4_K / Q2_K repack:
++// 1.17x on Zen 3, 1.49x on Zen 5 (GCC). On Intel the tiled kernel lost to AMX at every batch size (Xeon 8559C,
++// Q4_K 3072 x 3072, 1 thread, 1-128 rows: 1.2-1.45x slower) and to the Q4_K repack on an Ice Lake 8370C (1.17x
++// slower at 1024 rows), so Intel keeps both. The weight buffer is picked once per weight from a probe, not per batch
++// size, which is why this is a per-CPU and not a per-shape rule. cl.exe builds keep repack too: Klein Q4_K_M on
++// Windows x64 (MSVC 19.44) ran the same either way (EPYC 7763 98.96 / 99.12 vs 97.62 / 97.86 s sampling, EPYC 9V45
++// 34.42 / 34.73 vs 34.66 / 34.93 s). GGML_CPU_TILED_OVER_REPACK=1 turns it on for every x86 CPU (CPU_REPACK only;
++// AMX keeps its types), =0 turns it off.
++#if defined(__x86_64__) || defined(__i386__)
++static bool ggml_cpu_tiled_vendor_amd(void) {
++    unsigned int a = 0, b = 0, c = 0, d = 0;
++    if (!__get_cpuid(0, &a, &b, &c, &d)) {
++        return false;
++    }
++    return b == 0x68747541 && d == 0x69746e65 && c == 0x444d4163;  // "AuthenticAMD"
++}
++#endif
++
++bool ggml_cpu_tiled_prefers(int type) {
++#if (!defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)) || (defined(_MSC_VER) && !defined(__clang__)) || \
++    !(defined(__x86_64__) || defined(__i386__))
++    (void) type;
++    return false;
++#else
++    static bool over_repack = false;
++    static std::once_flag flag;
++    std::call_once(flag, []() {
++        const char * env = getenv("GGML_CPU_TILED_OVER_REPACK");
++        over_repack = env == NULL ? ggml_cpu_tiled_vendor_amd() : atoi(env) != 0;
++    });
++    if (!over_repack || !ggml_tiled_matmul_enabled()) {
++        return false;
++    }
++    switch (type) {
++        case GGML_TYPE_Q6_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q2_K:
++        case GGML_TYPE_IQ4_XS:
++            return true;
++        default:
++            return false;
++    }
++#endif
++}
++
+ #if !defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)
+ static bool ggml_tiled_supported(const struct ggml_tensor * src0,
+                                  const struct ggml_tensor * src1) {
+@@ -651,10 +700,18 @@ static size_t ggml_tiled_ws_size(void) {
+     return TILED_WS_SLOT; // clean 512KB slot, rounded up from sizeof(tiled_ws)
+ }
+ 
++static bool ggml_tiled_min_batch(int64_t rows);
++
+ size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst) {
+     if (! ggml_tiled_supported(dst->src[0], dst->src[1])) {
+         return 0; // unsupported, don't allocate
+     }
++    // Unsloth: no workspace when the batch floor declines every call. MUL_MAT checks src1 rows; an expert of
++    // MUL_MAT_ID gets at most one row per token (ids->ne[1]).
++    const int64_t max_rows = dst->op == GGML_OP_MUL_MAT_ID ? dst->src[2]->ne[1] : dst->src[1]->ne[1];
++    if (! ggml_tiled_min_batch(max_rows)) {
++        return 0;
++    }
+     return 64 + n_tasks * ggml_tiled_ws_size();  // 64 for alignment plus one 512KB slot per thread
+ }
+ 
+diff --git a/src/ggml-cpu/tiled/tiled.h b/src/ggml-cpu/tiled/tiled.h
+index 6f3e8dc..65cd970 100644
+--- a/src/ggml-cpu/tiled/tiled.h
++++ b/src/ggml-cpu/tiled/tiled.h
+@@ -7,6 +7,10 @@
+ extern "C" {
+ #endif
+ 
++// true when CPU_REPACK should leave weights of this type to the tiled K-quant matmul (plain buffer): tiled on
++// (GGML_CPU_TILED_MM), an AMD x86 CPU unless GGML_CPU_TILED_OVER_REPACK says otherwise (see tiled.cpp)
++bool ggml_cpu_tiled_prefers(int type);
++
+ // Amount of wdata to reserve for tiled workspaces
+ size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst);
+ 
