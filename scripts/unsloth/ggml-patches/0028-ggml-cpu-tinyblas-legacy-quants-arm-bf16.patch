@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 51246c4..ccde8f6 100644
+index 51246c4..9186376 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -44,9 +44,9 @@
@@ -15,15 +15,18 @@ index 51246c4..ccde8f6 100644
  
  #ifdef GGML_USE_LLAMAFILE
  #include "llamafile/sgemm.h"
-@@ -83,20 +83,42 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
+@@ -82,21 +82,44 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
+ //   x86 AVX512 builds: Zen 5 1.11-1.16x, Xeon 8573C 1.74x (GCC) / 1.85-1.88x (MSVC);
  //   x86 AVX2 builds on Intel: Xeon 8573C 1.30x (GCC) / 1.24-1.25x (MSVC), Core i7-8700B 1.45-1.6x (clang);
  //   x86 AVX2 builds on AMD Zen 5 with GCC / clang (1.07-1.08x) and on Zen 4 with MSVC (1.03-1.11x);
++//   x86 AVX2 builds on AMD Zen 3 / Zen 4 with GCC 13+ (1.81-1.84x);
  //   aarch64 NEON builds without FP16 vector arithmetic (F32 accumulation; armv8.0 1.35x on a Neoverse N2).
-+//   BF16 on every aarch64 NEON build (exact BF16 -> F32 widening, F32 accumulation): the shipped variants have no
-+//   NEON BF16 vec_dot (scalar, about 19x slower on a Neoverse N2).
- // Left off: AMD Zen 3 AVX2 (GCC 11 0.78x, MSVC 0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
+-// Left off: AMD Zen 3 AVX2 (GCC 11 0.78x, MSVC 0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
 -// (0.86x), other AMD families (not measured), and aarch64 FP16-vector builds, whose tinyBLAS kernel accumulates in
 -// FP16 rather than in another order.
++//   BF16 on every aarch64 NEON build (exact BF16 -> F32 widening, F32 accumulation): the shipped variants have no
++//   NEON BF16 vec_dot (scalar, about 19x slower on a Neoverse N2).
++// Left off: AMD Zen 3 AVX2 with GCC 11 (0.78x) or MSVC (0.71x), Zen 4 AVX2 with GCC 11 (0.87-0.88x), Zen 5 AVX2 with MSVC
 +// (0.86x), other AMD families (not measured), and cl.exe aarch64 builds (no NEON tinyBLAS kernels there; clang
 +// targeting the MSVC ABI, as in the Windows arm64 bundle, gets them).
  static uint64_t ggml_cpu_sgemm_types = 0;
@@ -60,7 +63,22 @@ index 51246c4..ccde8f6 100644
      unsigned r[4] = { 0, 0, 0, 0 };
      ggml_cpu_sgemm_cpuid(0, r);
      const bool intel = r[1] == 0x756e6547 && r[3] == 0x49656e69 && r[2] == 0x6c65746e;  // GenuineIntel
-@@ -126,8 +148,14 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
+@@ -120,14 +143,28 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
+         }
+         (void) zen5;
+ #else
+-        if (zen5) {
++        // GCC 13 and later build a fast tinyBLAS F16 kernel for Zen 3 / Zen 4 too (SD1.5 F16 sampling, 4 threads:
++        // EPYC 7763 native build 1.81x, EPYC 9V74 AVX2 build 1.84x; VAE decode 1.65-1.68x); GCC 11 (the Linux release toolchain) does not
++        // (EPYC 7763 0.78x), so older compilers keep F16 on vec_dot there. GGML_CPU_SGEMM_TYPES overrides.
++#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 13
++        const bool zen3_gcc13 = family == 0x19;
++#else
++        const bool zen3_gcc13 = false;
++#endif
++        if (zen5 || zen3_gcc13) {
+             mask |= f16;
+         }
          (void) zen4;
  #endif
      }
