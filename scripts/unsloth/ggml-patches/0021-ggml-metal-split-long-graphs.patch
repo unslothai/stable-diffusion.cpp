@@ -1,0 +1,52 @@
+diff --git a/src/ggml-metal/ggml-metal-context.m b/src/ggml-metal/ggml-metal-context.m
+index e9064666..b4bac890 100644
+--- a/src/ggml-metal/ggml-metal-context.m
++++ b/src/ggml-metal/ggml-metal-context.m
+@@ -53,6 +53,7 @@ struct ggml_metal {
+ 
+     // command buffer state
+     int n_cb;           // number of extra threads used to submit the command buffers
++    int n_cb_user;      // n_cb as requested by ggml_metal_set_n_cb; graph_compute may raise n_cb for big graphs
+     int n_nodes_0;      // number of nodes submitted by the main thread
+     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
+     int n_nodes_per_cb;
+@@ -156,6 +157,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+         if (ggml_metal_fusion_info_stats(res->finfo)) {
+             ggml_metal_fusion_info_labels_init(res->finfo);
+             res->n_cb = 0;
++            res->n_cb_user = 0;
+         }
+ 
+         GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, ggml_metal_fusion_info_enabled(res->finfo) ? "true" : "false");
+@@ -484,6 +486,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+     // number of nodes encoded by the main thread (empirically determined)
+     const int n_main = MAX(64, 0.1*gf->n_nodes);
+ 
++    // a command buffer that runs for too long is killed by the macOS GPU watchdog (status 5,
++    // kIOGPUCommandBufferCallbackErrorTimeout): one Z-Image 512 DiT step in one buffer does that on a slow GPU.
++    // Spread big graphs over more command buffers (GGML_METAL_NODES_PER_CB, default 256; 0 = off).
++    {
++        static int nodes_per_cb = -1;
++        if (nodes_per_cb < 0) {
++            const char * v = getenv("GGML_METAL_NODES_PER_CB");
++            nodes_per_cb = v ? MAX(0, atoi(v)) : 256;
++        }
++        int n_cb_eff = ctx->n_cb_user;
++        if (nodes_per_cb > 0 && n_cb_eff > 0) {
++            n_cb_eff = MAX(n_cb_eff, MIN(GGML_METAL_MAX_COMMAND_BUFFERS, (gf->n_nodes - n_main + nodes_per_cb - 1)/nodes_per_cb));
++        }
++        ctx->n_cb = n_cb_eff;
++    }
++
+     // number of threads in addition to the main thread
+     const int n_cb = ctx->n_cb;
+ 
+@@ -712,6 +730,8 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+         n_cb = 0;
+     }
+ 
++    ctx->n_cb_user = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
++
+     if (ctx->n_cb != n_cb) {
+         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
+ 
