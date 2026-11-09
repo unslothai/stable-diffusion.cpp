@@ -30,7 +30,7 @@ index 2632ae3..c02953b 100644
                  return &q2_K_8x8_q8_K;
              }
 diff --git a/src/ggml-cpu/tiled/tiled.cpp b/src/ggml-cpu/tiled/tiled.cpp
-index 77e1a99..ce1ae31 100644
+index 77e1a99..3fac356 100644
 --- a/src/ggml-cpu/tiled/tiled.cpp
 +++ b/src/ggml-cpu/tiled/tiled.cpp
 @@ -14,6 +14,9 @@
@@ -96,6 +96,25 @@ index 77e1a99..ce1ae31 100644
  #if !defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)
  static bool ggml_tiled_supported(const struct ggml_tensor * src0,
                                   const struct ggml_tensor * src1) {
+@@ -651,10 +700,18 @@ static size_t ggml_tiled_ws_size(void) {
+     return TILED_WS_SLOT; // clean 512KB slot, rounded up from sizeof(tiled_ws)
+ }
+ 
++static bool ggml_tiled_min_batch(int64_t rows);
++
+ size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst) {
+     if (! ggml_tiled_supported(dst->src[0], dst->src[1])) {
+         return 0; // unsupported, don't allocate
+     }
++    // Unsloth: no workspace when the batch floor declines every call. MUL_MAT checks src1 rows; an expert of
++    // MUL_MAT_ID gets at most one row per token (ids->ne[1]).
++    const int64_t max_rows = dst->op == GGML_OP_MUL_MAT_ID ? dst->src[2]->ne[1] : dst->src[1]->ne[1];
++    if (! ggml_tiled_min_batch(max_rows)) {
++        return 0;
++    }
+     return 64 + n_tasks * ggml_tiled_ws_size();  // 64 for alignment plus one 512KB slot per thread
+ }
+ 
 diff --git a/src/ggml-cpu/tiled/tiled.h b/src/ggml-cpu/tiled/tiled.h
 index 6f3e8dc..65cd970 100644
 --- a/src/ggml-cpu/tiled/tiled.h
