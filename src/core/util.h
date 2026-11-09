@@ -65,12 +65,16 @@ public:
     uint8_t* writable_data() { return static_cast<uint8_t*>(data_); }
     size_t size() const { return size_; }
     bool copy_data(void* buf, size_t n, size_t offset) const;
+    // Drops this process's resident pages wholly inside [offset, offset + n) of a read-only mapping, for bytes that
+    // were copied out (a loaded / repacked weight); a later read faults them back in from the file.
+    void release_range(size_t offset, size_t n) const;
 
 protected:
-    MmapWrapper(void* data, size_t size)
-        : data_(data), size_(size) {}
-    void* data_  = nullptr;
-    size_t size_ = 0;
+    MmapWrapper(void* data, size_t size, bool writable = false)
+        : data_(data), size_(size), writable_(writable) {}
+    void* data_    = nullptr;
+    size_t size_   = 0;
+    bool writable_ = false;
 };
 
 std::string path_join(const std::string& p1, const std::string& p2);

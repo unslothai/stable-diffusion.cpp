@@ -1294,6 +1294,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
                                 return false;
                             }
+                            mmapped->release_range(tensor_storage.offset, n);
                         } else {
                             file.seekg(tensor_storage.offset);
                             file.read(buf, n);

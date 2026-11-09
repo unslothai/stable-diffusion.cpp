@@ -250,8 +250,8 @@ static MmapFlags get_mmap_flags() {
 
 class MmapWrapperImpl : public MmapWrapper {
 public:
-    MmapWrapperImpl(void* data, size_t size, int fd)
-        : MmapWrapper(data, size), fd_(fd) {}
+    MmapWrapperImpl(void* data, size_t size, int fd, bool writable)
+        : MmapWrapper(data, size, writable), fd_(fd) {}
 
     ~MmapWrapperImpl() override {
 #ifdef __linux__
@@ -327,7 +327,7 @@ std::unique_ptr<MmapWrapper> MmapWrapper::create(const std::string& filename, bo
     }
 #endif
 
-    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, file_descriptor);
+    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, file_descriptor, writable);
 }
 
 #endif
@@ -338,6 +338,28 @@ bool MmapWrapper::copy_data(void* buf, size_t n, size_t offset) const {
     }
     std::memcpy(buf, data() + offset, n);
     return true;
+}
+
+void MmapWrapper::release_range(size_t offset, size_t n) const {
+#if !defined(_WIN32)
+    static const bool enabled = [] {
+        const char* v = std::getenv("SD_MMAP_RELEASE_COPIED");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    // A writable (copy-on-write) mapping may hold merged LoRA deltas: dropping its pages would lose them.
+    if (!enabled || writable_ || offset >= size_ || n > (size_ - offset)) {
+        return;
+    }
+    const uintptr_t page  = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t begin = (reinterpret_cast<uintptr_t>(data()) + offset + page - 1) / page * page;
+    const uintptr_t end   = (reinterpret_cast<uintptr_t>(data()) + offset + n) / page * page;
+    if (end > begin) {
+        madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
+    }
+#else
+    (void)offset;
+    (void)n;
+#endif
 }
 
 // get_num_physical_cores is copy from
