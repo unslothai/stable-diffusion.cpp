@@ -510,6 +510,10 @@ SDVersion ModelLoader::get_sd_version() const {
         if (tensor_storage.name.find("net.img_embedder.proj1.weight") != std::string::npos) {
             return VERSION_MINIT2I;
         }
+        if (tensor_storage.name.find("model.diffusion_model.layers.0.self_attn.add_q_proj.weight") != std::string::npos &&
+            tensor_storage_map.find("model.diffusion_model.layers.0.mlp_moe_gen.gate_proj.weight") != tensor_storage_map.end()) {
+            return VERSION_COSMOS3;
+        }
         if (tensor_storage.name.find("language_model.model.layers.0.self_attn.q_proj_mot_gen.weight") != std::string::npos) {
             return VERSION_SENSENOVA_U1_5;
         }
