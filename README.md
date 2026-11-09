@@ -88,6 +88,7 @@ API and command-line option may change frequently.***
     - [LTX-2.3/LTX-2.5](./docs/ltx2.md)
     - [HunyuanVideo 1.5](./docs/hunyuan_video.md)
     - [LingBot-Video](./docs/lingbot_video.md)
+    - [Cosmos3-Nano-Sim-Transfer](./docs/cosmos3.md) (video-to-video from edge control)
   - [PhotoMaker](./docs/photo_maker.md) support.
   - [IP-Adapter](./docs/ip_adapter.md) support (SD 1.5 and SDXL, including Plus)
   - Control Net support with SD 1.5
@@ -96,6 +97,7 @@ API and command-line option may change frequently.***
   - Latent Consistency Models support (LCM/LCM-LoRA)
   - Faster and memory efficient latent decoding with [TAESD](./docs/taesd.md)
   - Upscale images generated with [ESRGAN](./docs/esrgan.md)
+  - Upscale videos with [RelayVSR](./docs/relay_vsr.md) (experimental, 2x and 4x)
 - Supported backends
   - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
   - CUDA
