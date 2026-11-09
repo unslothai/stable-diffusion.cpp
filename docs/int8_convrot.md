@@ -100,7 +100,68 @@ The packed runtime activation tensor contains the I8 activation rows and their f
 
 LoRA adapters are applied at runtime without modifying the INT8 weights. The INT8 convrot path computes the base linear output, while LoRA, LoHa, LoKr, and raw weight-difference adapters compute their output corrections from the original, unrotated activation and add them to the base output. `--lora-apply-mode auto` selects this path for models containing INT8 tensorwise weights. If `immediately` is requested, sd.cpp falls back to runtime application because merging an adapter would require dequantizing and rotating its weight update, then recalculating the per-row scales and requantizing the result.
 
-The shared CUDA/HIP/MUSA convrot activation paths currently require a group size of `256`; other supported group sizes use CPU execution.
+The shared CUDA/HIP/MUSA convrot activation paths support H64 and H256. Vulkan also supports H64 activation quantization; its INT8 matrix multiplication path currently requires H256.
+
+## Packed INT4 convrot
+
+ComfyUI `convrot_w4a4` and `asym_w4a8_int8` safetensors load directly, including
+checkpoints that mix packed INT4, INT8 tensorwise, and floating-point layers.
+Packed weights retain their checkpoint byte layout; they are not expanded or
+converted to GGUF Q4 blocks at load time.
+
+- `convrot_w4a4`: signed 4-bit weights, low nibble first, with F32 per-output
+  `weight_scale`. Activations use the same INT8 convrot quantization as above;
+  the format name does not select a native INT4 activation kernel.
+- `asym_w4a8_int8`: 4-bit indices into `weight_codebook` (16 F32 values), F32
+  `weight_s_channel`, and F8_E4M3 `weight_s_rel` per 16 input features. The
+  metadata must specify `group_size: 16`. CPU evaluates the floating-point
+  codebook; GPU kernels requantize it to INT8 with `amax / 127`, introducing a
+  small additional rounding error.
+
+Both formats imply convrot rotation even without a `convrot` flag; missing
+`convrot_groupsize` defaults to 256.
+
+Both formats reuse the convrot activation cache when the input scale is `1` and
+produce F32 outputs with optional bias. CPU provides a portable implementation.
+CUDA/HIP/MUSA use shared packed-weight kernels without requiring INT8 BLAS.
+With CUTLASS enabled, NVIDIA
+SM80 and newer devices use mixed-input S8 x S4 GEMM for eligible W4A4 shapes,
+reusing the INT8 scale epilogue without expanding the full weight tensor. W4A8
+uses CUTLASS integer MMA per 16-value group with FP32 scale restoration.
+Other CUDA shapes and builds retain the packed byte-dot path. Set
+`GGML_CUDA_W4_FORCE_DP4A=1` to compare against that path. Supported AMD targets
+use packed byte-dot instructions, with portable byte arithmetic for other targets.
+Vulkan requires integer dot product support and at least 13312 bytes of shared
+memory for W4A4 or 16452 bytes for W4A8. GPU W4 kernels require the logical input
+width to be divisible by 64; H64 and H256 are supported. When supported by the
+compiler and device, Vulkan uses NV cooperative matrix integer GEMM. W4A4
+decodes packed weights directly into cooperative matrices for aligned input
+and output widths. Complete activation tiles and the final partial tile use
+separate shader specializations. Other W4A4 shapes use double-buffered weight
+and activation tiles (20480 bytes of shared memory, or 30720 for larger tiles).
+W4A8 stages both weights and activations in shared memory in K=64 tiles,
+reusing them for each 16-value group's integer
+MMA and FP32 scale restoration. FP8 scales use a shared lookup table, and
+expanding projections visit activation tiles in groups of weight panels for
+cache reuse. Adjacent groups share a K=32 activation fragment, with
+complementary zero padding in the weights to preserve each group's scale.
+This path uses 17476 bytes of shared memory, or 22596 for larger tiles.
+Both paths use 256-thread workgroups and keep the model's
+weights packed; neither expands a full layer in device memory. Other Vulkan
+devices retain the packed dot-product path; set `GGML_VK_W4_FORCE_DP4A=1` to compare
+against it. FP32 accumulation order can differ between these paths.
+Other shapes use CPU fallback. HIP W4A8 selects wave64 WMMA by the active
+compilation target's intrinsic support, preferring the GFX12 fragment layout
+over the GFX11 layout.
+There is no GPU architecture allowlist: newer targets supporting either
+intrinsic automatically use its matching layout. Selection happens per device
+image, including multi-architecture builds; targets supporting neither intrinsic
+retain the integer-dot fallback. W4A4 retains integer dot products on HIP.
+
+LoRA application remains at runtime, using the original unrotated activations
+and logical weight dimensions. Packed weights and their codebook/scale tensors
+are excluded from weight type conversion. `SD_USE_UPSTREAM_GGML` builds reject
+these formats because they require the application extension API.
 
 ## Example
 

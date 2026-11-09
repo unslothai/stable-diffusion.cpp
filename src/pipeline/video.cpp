@@ -10,6 +10,8 @@
 #include "conditioning/wan_audio.h"
 #include "core/rng.hpp"
 #include "core/rng_philox.hpp"
+#include "cosmos3_transfer.h"
+#include "cosmos3_transfer_utils.h"
 #include "diffusion_engine.h"
 #include "model/diffusion/minimax_h3.hpp"
 #include "model/upscaler/h3_latent_upscaler.hpp"
@@ -1899,6 +1901,20 @@ namespace sd::pipeline {
         if (!sd->apply_loras(sd_vid_gen_params->loras, sd_vid_gen_params->lora_count))
             return false;
         sd->reset_generation_extensions();
+
+        if (sd_version_is_cosmos3(sd->version)) {
+            const bool ok = generate_cosmos3_transfer_video(sd, sd_vid_gen_params, request, frames_out, num_frames_out);
+            if (ok && info_out) {
+                // The transfer pipeline fixes the sampler (distilled schedule, no CFG), so record what ran.
+                const auto sigmas              = sd::cosmos3::distilled_sigmas();
+                *info_out                      = info;
+                (*info_out)["negative_prompt"] = "";
+                (*info_out)["sample_params"]   = {{"sample_steps", static_cast<int>(sigmas.size()) - 1},
+                                                  {"guidance", {{"txt_cfg", 1.0f}, {"distilled_guidance", 0.0f}}},
+                                                  {"custom_sigmas", sigmas}};
+            }
+            return ok;
+        }
 
         SamplePlan plan(sd, sd_vid_gen_params, request);
         auto latent_inputs_opt = prepare_video_generation_latents(sd, sd_vid_gen_params, &request, ref_image_params);
