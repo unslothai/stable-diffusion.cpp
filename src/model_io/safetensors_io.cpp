@@ -138,14 +138,29 @@ static bool read_comfy_quant_config(std::ifstream& file,
 
     try {
         const nlohmann::json json = nlohmann::json::parse(data.data(), data.data() + size);
-        config.format             = json.value("format", "");
-        config.convrot            = json.value("convrot", false);
-        config.group_size         = json.value("convrot_groupsize", 0);
-        config.weight_group_size  = json.value("group_size", 0);
+        // Layer settings may sit at the top level or under "params"; the top level wins.
+        static const nlohmann::json empty_params = nlohmann::json::object();
+        auto params_it                           = json.find("params");
+        const nlohmann::json& params             = params_it != json.end() && params_it->is_object() ? *params_it : empty_params;
+        auto setting                             = [&](const char* key, auto fallback) {
+            using T = decltype(fallback);
+            if (json.contains(key)) {
+                return json.at(key).get<T>();
+            }
+            return params.value(key, fallback);
+        };
+        config.format            = json.value("format", "");
+        config.convrot           = setting("convrot", false);
+        config.group_size        = setting("convrot_groupsize", 0);
+        config.weight_group_size = setting("group_size", 0);
         if (config.format == "convrot_w4a4" || config.format == "asym_w4a8_int8") {
             // Packed W4 formats imply rotation, including exports without the INT8 convrot flag.
             config.convrot    = true;
-            config.group_size = json.value("convrot_groupsize", 256);
+            config.group_size = setting("convrot_groupsize", 256);
+        }
+        if (config.format == "asym_w4a8_int8") {
+            // W4A8 exports default to 16-value weight groups.
+            config.weight_group_size = setting("group_size", 16);
         }
     } catch (const std::exception&) {
         set_error(error, "parsing ComfyUI quantization metadata tensor failed: '" + tensor_name + "'");
