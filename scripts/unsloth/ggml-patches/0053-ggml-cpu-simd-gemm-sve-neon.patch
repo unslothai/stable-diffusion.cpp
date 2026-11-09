@@ -1,0 +1,54 @@
+simd_gemm (the F32 GEMM of the tiled CPU flash attention) on aarch64 builds with SVE enabled (GGML_NATIVE on an SVE
+core, the armv8.6 / armv9 CPU variants): svfloat32_t is a sizeless type, so the register-tile kernel was compiled out
+and these builds ran the scalar triple loop. Every SVE core also has 128-bit NEON, so SVE builds now run the same NEON
+register-tile kernel as a NEON-only build. Every C element is still one FMA chain over k in order, so the GEMM output
+is bit-identical to the scalar loop it replaces and to the NEON build. Builds without SVE compile the same code as
+before.
+
+diff --git a/src/ggml-cpu/simd-gemm.h b/src/ggml-cpu/simd-gemm.h
+index d223d7b2..ce8e7d94 100644
+--- a/src/ggml-cpu/simd-gemm.h
++++ b/src/ggml-cpu/simd-gemm.h
+@@ -7,3 +7,29 @@
+ // TODO: add support for sizeless vector types
+-#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
++// SVE (aarch64): svfloat32_t is sizeless and cannot be held in the accumulator arrays below, so SVE builds used the
++// scalar GEMM at the end of this file. Every SVE CPU also has 128-bit NEON: run the NEON kernel there instead (same
++// tile, same FMA per element in the same order as a build without SVE, so the result is the same as that build's).
++#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON) && defined(__aarch64__)
++#define GGML_SIMD_GEMM_SVE_AS_NEON
++#include <arm_neon.h>
++#pragma push_macro("GGML_F32_EPR")
++#pragma push_macro("GGML_F32_VEC")
++#pragma push_macro("GGML_F32_VEC_LOAD")
++#pragma push_macro("GGML_F32_VEC_STORE")
++#pragma push_macro("GGML_F32_VEC_SET1")
++#pragma push_macro("GGML_F32_VEC_FMA")
++#undef GGML_F32_EPR
++#undef GGML_F32_VEC
++#undef GGML_F32_VEC_LOAD
++#undef GGML_F32_VEC_STORE
++#undef GGML_F32_VEC_SET1
++#undef GGML_F32_VEC_FMA
++#define GGML_F32_EPR              4
++#define GGML_F32_VEC              float32x4_t
++#define GGML_F32_VEC_LOAD         vld1q_f32
++#define GGML_F32_VEC_STORE        vst1q_f32
++#define GGML_F32_VEC_SET1(x)      vdupq_n_f32(x)
++#define GGML_F32_VEC_FMA(a, b, c) vfmaq_f32(a, b, c)
++#endif
++
++#if defined(GGML_SIMD) && (!defined(__ARM_FEATURE_SVE) || defined(GGML_SIMD_GEMM_SVE_AS_NEON)) && !defined(__riscv_v_intrinsic)
+ 
+@@ -185,2 +211,11 @@ static void simd_gemm(
+ }
++
++#if defined(GGML_SIMD_GEMM_SVE_AS_NEON)
++#pragma pop_macro("GGML_F32_VEC_FMA")
++#pragma pop_macro("GGML_F32_VEC_SET1")
++#pragma pop_macro("GGML_F32_VEC_STORE")
++#pragma pop_macro("GGML_F32_VEC_LOAD")
++#pragma pop_macro("GGML_F32_VEC")
++#pragma pop_macro("GGML_F32_EPR")
++#endif
+ #elif defined(GGML_SIMD) && defined(__riscv_v_intrinsic)

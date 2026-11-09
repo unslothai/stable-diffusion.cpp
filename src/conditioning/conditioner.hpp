@@ -1753,6 +1753,23 @@ struct MiniT2IConditioner : public Conditioner {
     }
 };
 
+// Cosmos3 encodes the prompt inside its transformer; the transfer pipeline tokenizes it.
+struct Cosmos3Conditioner : public Conditioner {
+    SDCondition get_learned_condition(int n_threads, const ConditionerParams& conditioner_params) override {
+        SD_UNUSED(n_threads);
+        SD_UNUSED(conditioner_params);
+        return {};
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
+        SD_UNUSED(tensors);
+    }
+
+    void set_flash_attention_enabled(bool enabled) override {
+        SD_UNUSED(enabled);
+    }
+};
+
 struct SenseNovaU1Conditioner : public Conditioner {
     static constexpr size_t kMaxPromptTokens = 12288;
     SenseNovaU1Tokenizer tokenizer;

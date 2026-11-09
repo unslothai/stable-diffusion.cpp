@@ -1,26 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
-#
 #   cpu_dispatch_gate.sh <bundle.zip>
-#
-# Runs the bundle's sd-cli on emulated CPUs that are older or newer than the build runner: Intel SDE on
-# Linux x86_64 (Nehalem .. Sapphire Rapids), qemu-aarch64 on Linux aarch64 (Cortex-A53 .. max). For each CPU
-# it fails when
-#   - the process dies or SDE reports an instruction the emulated CPU does not have. ggml dlopens EVERY CPU
-#     variant library while it scores them, so a static initializer that the compiler vectorised with a
-#     variant's AVX512 / SVE flags crashes every host without that ISA, before any variant is picked;
-#   - no CPU variant is loaded, or the loaded variant needs a feature the emulated CPU lacks;
-#   - on a 128-bit SVE vector length (CPU names ending in -sve128) a variant other than armv8.2_2 is loaded:
-#     ggml-patches/0020 skips the SVE variants there unless GGML_CPU_ARM_SVE128=1 (names ending in +keep
-#     set it and must then load an SVE variant);
-#   - a variant that has the iqk GEMM kernels built does not enable them by default (ARM: every batch size;
-#     x86 AVX2 and up: 2-12 src1 rows, ggml-patches/0018). Variants without them (pre-AVX2 x86, Armv8.0)
-#     report built types 0x0.
-# The runner's own CPU cannot catch either: it has the newest ISA the bundle uses.
-#
-# Env: SDE_DIR (an unpacked Intel SDE; downloaded and checked against SDE_SHA256 when unset),
-#      QEMU_AARCH64 (default qemu-aarch64), CPU_DISPATCH_GATE_CPUS (space separated subset of the CPUs below).
+# Runs the bundle's sd-cli on emulated CPUs (Intel SDE Nehalem .. Sapphire Rapids, qemu Cortex-A53 .. max), which
+# the build runner (newest ISA) cannot stand in for. Fails when, per CPU:
+#   - the process dies or SDE flags an unsupported instruction (ggml dlopens EVERY variant to score it, so an
+#     AVX512 / SVE-vectorised static initializer crashes older hosts before any variant is picked);
+#   - no variant loads, or the loaded one needs a missing feature;
+#   - on 128-bit SVE (-sve128) a variant other than armv8.2_2 loads (ggml-patches/0020; +keep sets GGML_CPU_ARM_SVE128=1);
+#   - a variant built with the iqk GEMM does not enable it by default (ggml-patches/0018).
+# Env: SDE_DIR (else downloaded, checked against SDE_SHA256), QEMU_AARCH64, CPU_DISPATCH_GATE_CPUS (subset).
 
 set -euo pipefail
 

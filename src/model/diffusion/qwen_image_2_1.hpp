@@ -24,14 +24,14 @@ namespace Qwen {
                 return it == weights.end() ? nullptr : &it->second;
             };
             if (auto w = find("img_in.weight")) {
-                config.in_channels = w->ne[0];
+                config.in_channels = w->logical_ne0();
                 config.hidden_size = w->ne[1];
             }
             if (auto w = find("proj_out.weight")) {
                 config.out_channels = w->ne[1];
             }
             if (auto w = find("txt_in.in_layer.weight")) {
-                config.context_dim = w->ne[0];
+                config.context_dim = w->logical_ne0();
             }
             if (auto w = find("transformer_blocks.0.attn.norm_q.weight")) {
                 config.head_dim = w->ne[0];
@@ -178,6 +178,47 @@ namespace Qwen {
             }
         }
 
+        static bool prefix_f16_reuse_enabled() {
+            static const bool enabled = [] {
+                const char* v = std::getenv("SD_QWEN21_PREFIX_F16_REUSE");
+                return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+            }();
+            return enabled;
+        }
+
+        // F16 prefix cache under flash attention: the F32 widen + concat + narrow is an exact round trip, so
+        // narrow only the new K/V and concat in F16 (bit-identical). nullptr keeps the F32 path otherwise.
+        ggml_tensor* attend_f16_prefix(GGMLRunnerContext* ctx,
+                                       ggml_tensor* q,
+                                       ggml_tensor* k,
+                                       ggml_tensor* v,
+                                       ggml_tensor* prefix_k,
+                                       ggml_tensor* prefix_v,
+                                       int64_t heads,
+                                       const QwenImage21PrefixCache& cache) const {
+            if (prefix_k->type != GGML_TYPE_F16 || prefix_v->type != GGML_TYPE_F16 || k->type != GGML_TYPE_F32 ||
+                v->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || !ctx->flash_attn_enabled || ctx->sage_attn_enabled ||
+                (ctx->attn_scale > 0.f && ctx->attn_scale != 1.f) || !sd_backend_is_cpu(ctx->backend) ||
+                !prefix_f16_reuse_enabled()) {
+                return nullptr;
+            }
+            auto gctx = ctx->ggml_ctx;
+            prefix_k  = ggml_reshape_4d(gctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
+            prefix_v  = ggml_reshape_4d(gctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
+            auto k16  = ggml_cast(gctx, k, GGML_TYPE_F16);
+            auto v16  = ggml_cast(gctx, v, GGML_TYPE_F16);
+            auto kc   = ggml_concat(gctx, prefix_k, k16, 1);  // [d_head, L_k, heads, N]
+            auto vc   = ggml_concat(gctx, prefix_v, v16, 2);  // [d_head, heads, L_k, N]
+            // Same head-major V the attention helper builds from its F32 V, already in F16.
+            auto vh = ggml_cont(gctx, ggml_permute(gctx, vc, 0, 2, 1, 3));  // [d_head, L_k, heads, N]
+            for (auto node : {k16, v16, kc, vc, vh}) {
+                if (!ggml_backend_supports_op(ctx->backend, node)) {
+                    return nullptr;
+                }
+            }
+            return ggml_ext_attention_prepared(gctx, ctx->backend, q, kc, vh, heads, k->ne[3], 1.f, nullptr);
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             int64_t heads = x->ne[0] / dim_head;
             auto project  = [&](const char* name) {
@@ -222,17 +263,20 @@ namespace Qwen {
                 auto prefix_k = ctx->load_cache_tensor(cache.name + ".k");
                 auto prefix_v = ctx->load_cache_tensor(cache.name + ".v");
                 GGML_ASSERT(prefix_k != nullptr && prefix_v != nullptr);
-                if (prefix_k->type != k->type) {
-                    prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
+                result = attend_f16_prefix(ctx, q, k, v, prefix_k, prefix_v, heads, cache);
+                if (result == nullptr) {
+                    if (prefix_k->type != k->type) {
+                        prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
+                    }
+                    if (prefix_v->type != v->type) {
+                        prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
+                    }
+                    prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
+                    prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
+                    k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
+                    v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
+                    result   = attend(q, k, v, nullptr);
                 }
-                if (prefix_v->type != v->type) {
-                    prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
-                }
-                prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
-                prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
-                k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
-                v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
-                result   = attend(q, k, v, nullptr);
             } else {
                 for (size_t i = 0; i < segments.size(); ++i) {
                     const auto& segment = segments[i];
