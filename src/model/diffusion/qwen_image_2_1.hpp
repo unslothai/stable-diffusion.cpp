@@ -186,10 +186,8 @@ namespace Qwen {
             return enabled;
         }
 
-        // Reusing an F16 prefix cache under flash attention: widening the cached K/V to F32, concatenating
-        // and letting the attention helper narrow the result back to F16 is an exact round trip. Narrow
-        // only the new target K/V instead, concatenate in F16 and hand flash attention its F16 inputs.
-        // The result is bit-identical; nullptr keeps the F32 concatenation for any other case.
+        // F16 prefix cache under flash attention: the F32 widen + concat + narrow is an exact round trip, so
+        // narrow only the new K/V and concat in F16 (bit-identical). nullptr keeps the F32 path otherwise.
         ggml_tensor* attend_f16_prefix(GGMLRunnerContext* ctx,
                                        ggml_tensor* q,
                                        ggml_tensor* k,
