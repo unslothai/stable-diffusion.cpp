@@ -1,0 +1,138 @@
+CPU direct convolution (CONV_2D / CONV_3D, the CPU VAE path with --conv-direct auto): build each patch row from a source
+row segment converted once. For a run of consecutive patches of one output row, the (input plane, kernel row) source
+segment the run reads is converted to the kernel type once (ggml_cpu_fp32_to_fp16 for F16 kernels), then every patch
+copies its knl_w taps from it. Before, every source element went through a bounds check and an F32 -> F16 conversion
+once per kernel column tap (3 times for a 3x3 kernel) and each store wrote one element. The patch matrix holds the same
+values in the same slots, so the GEMM and the output are bit-identical.
+The per-tap loop is kept for 1-wide kernels (no element is converted twice there), for segments over 1024 elements
+(large strides / dilations) and as the reference path (use_ref), which test-backend-ops -b CPU compares against.
+
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index cdaea5bc..3e0e2386 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <type_traits>
+ #include <vector>
+ 
+ struct ggml_fp8_e4m3_cpu {
+@@ -7424,6 +7425,43 @@ void ggml_compute_forward_col2im_1d(
+ 
+ #define CONV_2D_RUN 64
+ 
++// Max source elements of one converted row segment (see conv_patch_row): (CONV_2D_RUN - 1) * stride + (knl - 1) * dilation + 1.
++#define CONV_SEG_MAX 1024
++
++// im2col of one (input plane, kernel row) for a run of `run` consecutive patches of one output row: the source row
++// segment the run reads ([x0, x0 + seg_n), zero outside the row or when src_row is null) is converted once, then each
++// patch copies its knl_w taps from it. The per-tap loop converted every source element knl_w times and handled one
++// patch element per store; the values written, and their slots, are the same. The per-tap loop stays for 1-wide
++// kernels (nothing is converted twice there), for segments longer than CONV_SEG_MAX and as the reference path
++// (use_ref, what test-backend-ops -b CPU compares against).
++template <typename T>
++static inline void conv_patch_row(char * dst_base, int64_t dst_stride, const char * src_row, int64_t src_nb0, int64_t src_w,
++                                  int64_t x0, int64_t run, int64_t stride, int64_t dilation, int64_t knl_w, T * seg) {
++    const int64_t seg_n = (run - 1) * stride + (knl_w - 1) * dilation + 1;
++    const int64_t lo    = std::min<int64_t>(seg_n, std::max<int64_t>(0, -x0));        // first in-row element of the segment
++    const int64_t hi    = std::max<int64_t>(lo, std::min<int64_t>(seg_n, src_w - x0));  // one past the last
++    if (src_row == nullptr) {
++        for (int64_t t = 0; t < seg_n; ++t) { seg[t] = T(); }
++    } else {
++        for (int64_t t = 0; t < lo; ++t) { seg[t] = T(); }
++        if constexpr (std::is_same_v<T, float>) {
++            for (int64_t t = lo; t < hi; ++t) { seg[t] = *(const float *) (src_row + (x0 + t) * src_nb0); }
++        } else if (src_nb0 == (int64_t) sizeof(float)) {
++            ggml_cpu_fp32_to_fp16((const float *) src_row + x0 + lo, seg + lo, hi - lo);
++        } else {
++            for (int64_t t = lo; t < hi; ++t) { seg[t] = GGML_CPU_FP32_TO_FP16(*(const float *) (src_row + (x0 + t) * src_nb0)); }
++        }
++        for (int64_t t = hi; t < seg_n; ++t) { seg[t] = T(); }
++    }
++    for (int64_t j = 0; j < run; ++j) {
++        T *       d = (T *) (dst_base + j * dst_stride);
++        const T * s = seg + j * stride;
++        for (int64_t kx = 0; kx < knl_w; ++kx) {
++            d[kx] = s[kx * dilation];
++        }
++    }
++}
++
+ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
+                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
+                                               const ggml_tensor *         src,     // [W, H, C, N]
+@@ -7486,6 +7524,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         // (one patch touches c_in planes; one plane per patch was a cache and TLB miss per element). Same values,
+         // same conversions as the per-patch loop, so the result is bit-identical.
+         const size_t ts = traits->type_size;
++        alignas(64) float seg_buf[CONV_SEG_MAX];
+         for (int64_t p = patch_start; p < patch_end;) {
+             const int64_t n_idx = p / (dst_w * dst_h);
+             const int64_t oy    = (p / dst_w) % dst_h;
+@@ -7495,6 +7534,25 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+             const char * src_base = (const char *) src_data + n_idx * src->nb[3];
+             char *       dst_base = (char *) tmp + (p % patches_per_batch) * knl_n * ts;
+ 
++            const int64_t seg_n = (run - 1) * stride_x + (knl_w - 1) * dilation_x + 1;
++            if (!params->use_ref && knl_w > 1 && seg_n <= CONV_SEG_MAX) {
++                const int64_t x0 = ox0 * stride_x - pad_x;
++                for (int64_t ic = 0; ic < c_in; ++ic) {
++                    for (int64_t ky = 0; ky < knl_h; ++ky) {
++                        const int64_t sy      = oy * stride_y + ky * dilation_y - pad_y;
++                        const char *  src_row = sy >= 0 && sy < src_h ? src_base + sy * src->nb[1] + ic * src->nb[2] : nullptr;
++                        char *        dst_row = dst_base + (ic * (knl_h * knl_w) + ky * knl_w) * ts;
++                        if (kernel_type == GGML_TYPE_F32) {
++                            conv_patch_row<float>(dst_row, knl_n * ts, src_row, src->nb[0], src_w, x0, run, stride_x, dilation_x, knl_w, (float *) seg_buf);
++                        } else {
++                            conv_patch_row<ggml_fp16_t>(dst_row, knl_n * ts, src_row, src->nb[0], src_w, x0, run, stride_x, dilation_x, knl_w, (ggml_fp16_t *) seg_buf);
++                        }
++                    }
++                }
++                p += run;
++                continue;
++            }
++
+             for (int64_t ic = 0; ic < c_in; ++ic) {
+                 for (int64_t ky = 0; ky < knl_h; ++ky) {
+                     const int64_t sy  = oy * stride_y + ky * dilation_y - pad_y;
+@@ -7635,6 +7693,7 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
+         // Runs of consecutive patches along one output row, as in conv_2d: each (ic, kz, ky) source row is read once
+         // per run. Same values and conversions as the per-patch loop (bit-identical).
+         const size_t ts = traits->type_size;
++        alignas(64) float seg_buf[CONV_SEG_MAX];
+         for (int64_t p = patch_start; p < patch_end;) {
+             const int64_t p_in_batch = p % (dst_w * dst_h * dst_d);
+             const int64_t p_in_depth = p_in_batch % (dst_w * dst_h);
+@@ -7646,6 +7705,30 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
+ 
+             char * dst_base = (char *) tmp + (p % patches_per_batch) * knl_n_total * ts;
+ 
++            const int64_t seg_n = (run - 1) * s0 + (knl_w - 1) * d0 + 1;
++            if (!params->use_ref && knl_w > 1 && seg_n <= CONV_SEG_MAX) {
++                const int64_t x0 = dst_x0 * s0 - p0;
++                for (int64_t ic = 0; ic < c; ++ic) {
++                    const int64_t cn_idx = batch_idx * c + ic;
++                    for (int64_t kz = 0; kz < knl_d; ++kz) {
++                        const int64_t sz = dst_z * s2 + kz * d2 - p2;
++                        for (int64_t ky = 0; ky < knl_h; ++ky) {
++                            const int64_t sy      = dst_y * s1 + ky * d1 - p1;
++                            const bool    row     = sz >= 0 && sz < src_d && sy >= 0 && sy < src_h;
++                            const char *  src_row = row ? (const char *) src_data + sy * src->nb[1] + sz * src->nb[2] + cn_idx * src->nb[3] : nullptr;
++                            char *        dst_row = dst_base + (ic * knl_n_per_channel + kz * (knl_h * knl_w) + ky * knl_w) * ts;
++                            if (kernel_type == GGML_TYPE_F32) {
++                                conv_patch_row<float>(dst_row, knl_n_total * ts, src_row, src->nb[0], src_w, x0, run, s0, d0, knl_w, (float *) seg_buf);
++                            } else {
++                                conv_patch_row<ggml_fp16_t>(dst_row, knl_n_total * ts, src_row, src->nb[0], src_w, x0, run, s0, d0, knl_w, (ggml_fp16_t *) seg_buf);
++                            }
++                        }
++                    }
++                }
++                p += run;
++                continue;
++            }
++
+             for (int64_t ic = 0; ic < c; ++ic) {
+                 const int64_t cn_idx = batch_idx * c + ic;
+                 for (int64_t kz = 0; kz < knl_d; ++kz) {
