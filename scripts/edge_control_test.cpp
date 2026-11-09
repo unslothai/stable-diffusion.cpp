@@ -143,7 +143,6 @@ int main() {
         CHECK(strong > 0);
     }
 
-    // Timing on a busy image (deterministic noise plus gradients).
     const int sizes[2][2] = {{832, 480}, {1280, 720}};
     for (const auto& size : sizes) {
         const int tw = size[0], th = size[1];

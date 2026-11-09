@@ -1,5 +1,3 @@
-// Host-side packing and sampling helpers for Cosmos3-Nano-Sim-Transfer.
-//
 // Ported from NVIDIA cosmos-framework (data/generator/sequence_packing/mrope.py,
 // autoregressive.py, model/generator/omni_mot_causal_model.py).
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -114,10 +112,8 @@ namespace sd::cosmos3 {
         return ids;
     }
 
-    // Attention history of the causal transfer stream. Every latent frame adds a
-    // clean control entry and, once denoised, a clean RGB entry. With a finite
-    // window the first `sink` frame pairs stay pinned and only the newest entries
-    // the next forward may read are kept, as in the reference KV ring.
+    // Each latent frame adds a clean control and a clean RGB entry; a finite window pins the first
+    // `sink` pairs and keeps only what the next forward reads (the reference KV ring).
     struct HistoryPolicy {
         int64_t window_frames = 0;  // 0 keeps the full history
         int64_t sink_frames   = 0;
