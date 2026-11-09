@@ -15,8 +15,8 @@ index 4b9396d..d223d7b 100644
 -// TODO: untested on avx512
  // These are in units of GGML_F32_EPR
 -#if defined(__AVX512F__) || defined (__ARM_NEON__)
-+// GCC and clang define __ARM_NEON on AArch64 but __ARM_NEON__ only on 32-bit ARM, so check both:
-+// with only __ARM_NEON__, every arm64 build fell through to the 2x2 tile below.
++// On AArch64, GCC and non-Apple clang define only __ARM_NEON (Apple clang defines both), so check both:
++// with only __ARM_NEON__, Linux and Windows arm64 builds fell through to the 2x2 tile below.
 +#if defined(__AVX512F__) || defined(__ARM_NEON__) || defined(__ARM_NEON)
      static constexpr int GEMM_RM = 4;
      static constexpr int GEMM_RN = 4; // 16+4+1 = 25/32
