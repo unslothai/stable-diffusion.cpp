@@ -1251,6 +1251,18 @@ bool StableDiffusionGGML::conv_direct_for(SDBackendModule module, bool conv3d) {
     if (any_enabled && !enabled) {
         LOG_INFO("conv%dd direct auto: %s -> off (compute devices disagree)", conv3d ? 3 : 2, sd_backend_module_name(module));
     }
+    // Vulkan: auto turns direct 2D convolution on for the VAE only. There it decodes faster in a fraction of the
+    // memory (1.2x on AMD's Windows driver, 1.5x on RADV, 6.7x at 1024 px), but in UNet sampling (SD1.5, 512 px) it
+    // ran 11% slower than im2col on AMD's Windows driver and tied on RADV, so the diffusion model and ControlNet keep
+    // im2col unless asked (--conv-direct auto,diffusion=on).
+    if (enabled && !conv3d && module != SDBackendModule::VAE) {
+        for (auto backend : backends) {
+            if (sd_backend_is(backend, "Vulkan")) {
+                LOG_INFO("conv2d direct auto: %s -> off (Vulkan: VAE only)", sd_backend_module_name(module));
+                return false;
+            }
+        }
+    }
     return enabled;
 }
 
