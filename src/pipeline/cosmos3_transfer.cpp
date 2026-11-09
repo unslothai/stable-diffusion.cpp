@@ -28,160 +28,158 @@
 
 namespace sd::pipeline {
 
-    namespace {
-        // Test hooks for numerical comparison against the reference implementation.
-        const char* debug_dir() {
-            const char* dir = std::getenv("SD_COSMOS3_DEBUG_DIR");
-            return dir != nullptr && dir[0] != '\0' ? dir : nullptr;
-        }
+    // Test hooks for numerical comparison against the reference implementation.
+    static const char* debug_dir() {
+        const char* dir = std::getenv("SD_COSMOS3_DEBUG_DIR");
+        return dir != nullptr && dir[0] != '\0' ? dir : nullptr;
+    }
 
-        template <typename T>
-        bool read_raw(const std::string& path, std::vector<T>* out, size_t expected) {
-            FILE* f = std::fopen(path.c_str(), "rb");
-            if (f == nullptr) {
-                return false;
-            }
-            std::fseek(f, 0, SEEK_END);
-            const long bytes = std::ftell(f);
-            std::fseek(f, 0, SEEK_SET);
-            if (bytes < 0 || (expected > 0 && static_cast<size_t>(bytes) != expected * sizeof(T))) {
-                std::fclose(f);
-                LOG_WARN("cosmos3 debug: %s has %ld bytes, expected %zu values", path.c_str(), bytes, expected);
-                return false;
-            }
-            out->resize(static_cast<size_t>(bytes) / sizeof(T));
-            const size_t read = std::fread(out->data(), sizeof(T), out->size(), f);
+    template <typename T>
+    static bool read_raw(const std::string& path, std::vector<T>* out, size_t expected) {
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) {
+            return false;
+        }
+        std::fseek(f, 0, SEEK_END);
+        const long bytes = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (bytes < 0 || (expected > 0 && static_cast<size_t>(bytes) != expected * sizeof(T))) {
             std::fclose(f);
-            return read == out->size();
+            LOG_WARN("cosmos3 debug: %s has %ld bytes, expected %zu values", path.c_str(), bytes, expected);
+            return false;
         }
+        out->resize(static_cast<size_t>(bytes) / sizeof(T));
+        const size_t read = std::fread(out->data(), sizeof(T), out->size(), f);
+        std::fclose(f);
+        return read == out->size();
+    }
 
-        void write_raw(const std::string& path, const float* data, size_t count) {
-            FILE* f = std::fopen(path.c_str(), "wb");
-            if (f == nullptr) {
-                return;
+    static void write_raw(const std::string& path, const float* data, size_t count) {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (f == nullptr) {
+            return;
+        }
+        std::fwrite(data, sizeof(float), count, f);
+        std::fclose(f);
+    }
+
+    static std::string debug_path(const char* dir, const std::string& name) {
+        return std::string(dir) + "/" + name;
+    }
+
+    static float round_bf16(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        bits += 0x7FFFu + ((bits >> 16) & 1u);
+        bits &= 0xFFFF0000u;
+        std::memcpy(&value, &bits, sizeof(bits));
+        return value;
+    }
+
+    static std::vector<float> randn(const std::shared_ptr<RNG>& rng, uint64_t seed, size_t count, bool bf16) {
+        rng->manual_seed(seed);
+        std::vector<float> values = rng->randn(static_cast<uint32_t>(count));
+        if (bf16) {
+            for (float& v : values) {
+                v = round_bf16(v);
             }
-            std::fwrite(data, sizeof(float), count, f);
-            std::fclose(f);
         }
+        return values;
+    }
 
-        std::string debug_path(const char* dir, const std::string& name) {
-            return std::string(dir) + "/" + name;
+    static bool tokenize_prompt(const std::string& caption, std::vector<int32_t>* ids) {
+        static const char* kSystemPrompt =
+            "You are a helpful assistant that generates images or videos following the user's instructions "
+            "and control signals (edge maps, blur, depth, or segmentation).";
+        const std::string text = std::string("<|im_start|>system\n") + kSystemPrompt + "<|im_end|>\n" +
+                                 "<|im_start|>user\n" + caption + "<|im_end|>\n" +
+                                 "<|im_start|>assistant\n";
+        Qwen2Tokenizer tokenizer;
+        std::vector<int> tokens;
+        std::string error;
+        if (!tokenizer.encode(text, tokens, nullptr, &error)) {
+            LOG_ERROR("cosmos3: prompt tokenization failed: %s", error.c_str());
+            return false;
         }
+        ids->assign(tokens.begin(), tokens.end());
+        return true;
+    }
 
-        float round_bf16(float value) {
-            uint32_t bits;
-            std::memcpy(&bits, &value, sizeof(bits));
-            bits += 0x7FFFu + ((bits >> 16) & 1u);
-            bits &= 0xFFFF0000u;
-            std::memcpy(&value, &bits, sizeof(bits));
-            return value;
+    // [W, H, 3, 1] in [0, 1]: gray frames are replicated, alpha is dropped.
+    static sd::Tensor<float> rgb_frame(const sd_image_t& image, int width, int height) {
+        auto frame             = sd_image_to_tensor(image, width, height);
+        const int64_t channels = frame.shape()[2];
+        if (channels == 3) {
+            return frame;
         }
+        sd::Tensor<float> rgb = sd::zeros<float>({width, height, 3, 1});
+        const size_t plane    = static_cast<size_t>(width) * height;
+        for (int64_t c = 0; c < 3; ++c) {
+            const float* src = frame.data() + static_cast<size_t>(channels >= 3 ? c : 0) * plane;
+            std::copy(src, src + plane, rgb.data() + c * plane);
+        }
+        return rgb;
+    }
 
-        std::vector<float> randn(const std::shared_ptr<RNG>& rng, uint64_t seed, size_t count, bool bf16) {
-            rng->manual_seed(seed);
-            std::vector<float> values = rng->randn(static_cast<uint32_t>(count));
-            if (bf16) {
-                for (float& v : values) {
-                    v = round_bf16(v);
-                }
+    // Control video in [0, 1], [W, H, T, 3, 1]. Precomputed control frames win;
+    // otherwise an edge map is derived from the reference video's RGB frames.
+    static sd::Tensor<float> build_control_video(const sd_vid_gen_params_t* params, int width, int height, int frames, float edge_threshold) {
+        sd::Tensor<float> video = sd::zeros<float>({width, height, frames, 3, 1});
+        if (params->control_frames_size > 0) {
+            if (params->control_frames_size < frames) {
+                LOG_ERROR("cosmos3: %d control frames given, %d needed", params->control_frames_size, frames);
+                return {};
             }
-            return values;
-        }
-
-        bool tokenize_prompt(const std::string& caption, std::vector<int32_t>* ids) {
-            static const char* kSystemPrompt =
-                "You are a helpful assistant that generates images or videos following the user's instructions "
-                "and control signals (edge maps, blur, depth, or segmentation).";
-            const std::string text = std::string("<|im_start|>system\n") + kSystemPrompt + "<|im_end|>\n" +
-                                     "<|im_start|>user\n" + caption + "<|im_end|>\n" +
-                                     "<|im_start|>assistant\n";
-            Qwen2Tokenizer tokenizer;
-            std::vector<int> tokens;
-            std::string error;
-            if (!tokenizer.encode(text, tokens, nullptr, &error)) {
-                LOG_ERROR("cosmos3: prompt tokenization failed: %s", error.c_str());
-                return false;
-            }
-            ids->assign(tokens.begin(), tokens.end());
-            return true;
-        }
-
-        // [W, H, 3, 1] in [0, 1]: gray frames are replicated, alpha is dropped.
-        sd::Tensor<float> rgb_frame(const sd_image_t& image, int width, int height) {
-            auto frame             = sd_image_to_tensor(image, width, height);
-            const int64_t channels = frame.shape()[2];
-            if (channels == 3) {
-                return frame;
-            }
-            sd::Tensor<float> rgb = sd::zeros<float>({width, height, 3, 1});
-            const size_t plane    = static_cast<size_t>(width) * height;
-            for (int64_t c = 0; c < 3; ++c) {
-                const float* src = frame.data() + static_cast<size_t>(channels >= 3 ? c : 0) * plane;
-                std::copy(src, src + plane, rgb.data() + c * plane);
-            }
-            return rgb;
-        }
-
-        // Control video in [0, 1], [W, H, T, 3, 1]. Precomputed control frames win;
-        // otherwise an edge map is derived from the reference video's RGB frames.
-        sd::Tensor<float> build_control_video(const sd_vid_gen_params_t* params, int width, int height, int frames, float edge_threshold) {
-            sd::Tensor<float> video = sd::zeros<float>({width, height, frames, 3, 1});
-            if (params->control_frames_size > 0) {
-                if (params->control_frames_size < frames) {
-                    LOG_ERROR("cosmos3: %d control frames given, %d needed", params->control_frames_size, frames);
+            for (int i = 0; i < frames; ++i) {
+                if (params->control_frames[i].channel == 0) {
+                    LOG_ERROR("cosmos3: control frame %d has no channels", i);
                     return {};
                 }
-                for (int i = 0; i < frames; ++i) {
-                    if (params->control_frames[i].channel == 0) {
-                        LOG_ERROR("cosmos3: control frame %d has no channels", i);
-                        return {};
-                    }
-                    auto frame = rgb_frame(params->control_frames[i], width, height);
-                    sd::ops::slice_assign(&video, 2, i, i + 1, frame.unsqueeze(2));
-                }
-                return video;
+                auto frame = rgb_frame(params->control_frames[i], width, height);
+                sd::ops::slice_assign(&video, 2, i, i + 1, frame.unsqueeze(2));
             }
-            if (params->ref_videos_count > 0 && params->ref_videos[0].frame_count >= frames) {
-                const sd_ref_video_t& source = params->ref_videos[0];
-                std::vector<uint8_t> edges(static_cast<size_t>(width) * height);
-                sd::edge::GradientEdgeParams edge_params;
-                edge_params.thin             = edge_threshold > 0.f;
-                edge_params.binary_threshold = edge_threshold;
-                const int64_t edge_start     = ggml_time_ms();
-                const size_t plane           = static_cast<size_t>(width) * height;
-                std::vector<uint8_t> pixels;
-                for (int i = 0; i < frames; ++i) {
-                    const sd_image_t& frame = source.frames[i];
-                    const uint8_t* rgb      = frame.data;
-                    if (frame.channel == 0) {
-                        LOG_ERROR("cosmos3: reference video frame %d has no channels", i);
-                        return {};
-                    }
-                    if (static_cast<int>(frame.width) != width || static_cast<int>(frame.height) != height || frame.channel != 3) {
-                        auto resized = rgb_frame(frame, width, height);
-                        pixels.resize(plane * 3);
-                        for (size_t p = 0; p < plane; ++p) {
-                            for (int c = 0; c < 3; ++c) {
-                                pixels[p * 3 + c] = static_cast<uint8_t>(std::lround(std::min(std::max(resized.data()[c * plane + p], 0.f), 1.f) * 255.f));
-                            }
-                        }
-                        rgb = pixels.data();
-                    }
-                    sd::edge::gradient_magnitude(rgb, width, height, 3, edges.data(), edge_params);
-                    for (int c = 0; c < 3; ++c) {
-                        float* dst = video.data() + (static_cast<size_t>(c) * frames + i) * plane;
-                        for (size_t p = 0; p < plane; ++p) {
-                            dst[p] = edges[p] / 255.f;
-                        }
-                    }
-                }
-                LOG_INFO("cosmos3: edge control for %d frames in %" PRId64 " ms", frames, ggml_time_ms() - edge_start);
-                return video;
-            }
-            LOG_ERROR("cosmos3: Sim-Transfer needs a control video (control frames) or a reference video to derive edges from");
-            return {};
+            return video;
         }
-    }  // namespace
+        if (params->ref_videos_count > 0 && params->ref_videos[0].frame_count >= frames) {
+            const sd_ref_video_t& source = params->ref_videos[0];
+            std::vector<uint8_t> edges(static_cast<size_t>(width) * height);
+            sd::edge::GradientEdgeParams edge_params;
+            edge_params.thin             = edge_threshold > 0.f;
+            edge_params.binary_threshold = edge_threshold;
+            const int64_t edge_start     = ggml_time_ms();
+            const size_t plane           = static_cast<size_t>(width) * height;
+            std::vector<uint8_t> pixels;
+            for (int i = 0; i < frames; ++i) {
+                const sd_image_t& frame = source.frames[i];
+                const uint8_t* rgb      = frame.data;
+                if (frame.channel == 0) {
+                    LOG_ERROR("cosmos3: reference video frame %d has no channels", i);
+                    return {};
+                }
+                if (static_cast<int>(frame.width) != width || static_cast<int>(frame.height) != height || frame.channel != 3) {
+                    auto resized = rgb_frame(frame, width, height);
+                    pixels.resize(plane * 3);
+                    for (size_t p = 0; p < plane; ++p) {
+                        for (int c = 0; c < 3; ++c) {
+                            pixels[p * 3 + c] = static_cast<uint8_t>(std::lround(std::min(std::max(resized.data()[c * plane + p], 0.f), 1.f) * 255.f));
+                        }
+                    }
+                    rgb = pixels.data();
+                }
+                sd::edge::gradient_magnitude(rgb, width, height, 3, edges.data(), edge_params);
+                for (int c = 0; c < 3; ++c) {
+                    float* dst = video.data() + (static_cast<size_t>(c) * frames + i) * plane;
+                    for (size_t p = 0; p < plane; ++p) {
+                        dst[p] = edges[p] / 255.f;
+                    }
+                }
+            }
+            LOG_INFO("cosmos3: edge control for %d frames in %" PRId64 " ms", frames, ggml_time_ms() - edge_start);
+            return video;
+        }
+        LOG_ERROR("cosmos3: Sim-Transfer needs a control video (control frames) or a reference video to derive edges from");
+        return {};
+    }
 
     bool generate_cosmos3_transfer_video(StableDiffusionGGML* sd,
                                          const sd_vid_gen_params_t* params,
@@ -197,7 +195,7 @@ namespace sd::pipeline {
         history.window_frames = runner->window_frames;
         history.sink_frames   = runner->sink_frames;
         if (!history.valid()) {
-            LOG_ERROR("cosmos3: invalid KV window (window %" PRId64 ", sink %" PRId64 ")", history.window_frames, history.sink_frames);
+            LOG_ERROR("cosmos3: invalid KV window (window %" PRId64 ", sink %" PRId64 "): use 0, or 2 or more with sink < window", history.window_frames, history.sink_frames);
             return false;
         }
         const char* dbg = debug_dir();

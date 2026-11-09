@@ -34,7 +34,7 @@ The weights are under the NVIDIA OpenMDW License 1.1; the ported code carries th
 - Prompts can be plain text or the structured JSON captions from the model card. Duration,
   frame rate and resolution are added to the prompt the same way the reference does.
 - The KV history is kept in full by default. `--model-args cosmos3_window=<latent frames>,cosmos3_sink=<frames>`
-  bounds it for long videos.
+  bounds it for long videos (window 2 or more, sink below the window).
 - Keep flash attention on (`--flash-attn auto`, the default, picks it on CUDA); without it each frame is about 2.4x slower.
 
 ## Example

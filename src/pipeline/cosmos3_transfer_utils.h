@@ -137,7 +137,8 @@ namespace sd::cosmos3 {
         }
 
         bool valid() const {
-            return window_frames == 0 || (sink_frames >= 0 && recent_pairs() >= 0);
+            // A 1-frame window would carry no history between latent frames.
+            return window_frames == 0 || (window_frames >= 2 && sink_frames >= 0 && recent_pairs() >= 0);
         }
     };
 
