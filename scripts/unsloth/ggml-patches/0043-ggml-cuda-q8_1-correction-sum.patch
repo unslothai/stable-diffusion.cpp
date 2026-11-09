@@ -1,7 +1,8 @@
 Upstream ggml-org/llama.cpp 8fc037672 (#31247, "cuda: potential fix for Q8_1 correction sum"), MIT.
 quantize_q8_1 and quantize_mmq_q8_1 stored the Q8_1 block sum from the float activations instead of d * sum of the
 quantized values, so the min / offset term of Q4_0 / Q5_0 (MMVQ), Q4_1 / Q5_1 and Q2_K / Q4_K / Q5_K (MMQ) did not
-match the integer dot product. Other types are unchanged.
+match the integer dot product. IQ1_S (MMVQ and MMQ) reads the same sum for its +-delta term and changes too.
+Other types are unchanged.
 
 diff --git a/src/ggml-cuda/quantize.cu b/src/ggml-cuda/quantize.cu
 index ea089a8c6..727764cdd 100644
