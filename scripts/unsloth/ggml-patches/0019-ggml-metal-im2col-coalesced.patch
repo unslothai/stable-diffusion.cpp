@@ -1,0 +1,137 @@
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 1d2e0318..6b71301e 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -2363,6 +2363,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col_flat(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_IM2COL);
++
++    GGML_ASSERT(ggml_is_contiguous(op->src[1]));
++    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->type         == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
++
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_im2col_flat_%s", ggml_type_name(op->type));
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_CONV_TRANSPOSE_1D);
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 48d77221..0bf43efd 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -162,6 +162,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col_flat       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 1aa237bc..a05eb366 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4696,6 +4696,28 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
+         /*.KHW  =*/ KH * KW,
+     };
+ 
++    // 1x1 / 2x2 kernels: kernel_im2col below runs KH*KW threads per threadgroup (1 for a 1x1 conv), so use one
++    // thread per dst element. From 3x3 up the per-patch kernels are as fast or faster (test-backend-ops perf).
++    // GGML_METAL_IM2COL_LEGACY=1 keeps the per-patch kernels for every size.
++    static const bool im2col_legacy = getenv("GGML_METAL_IM2COL_LEGACY") != nullptr;
++
++    if (!im2col_legacy && KH*KW <= 4) {
++        auto pipeline = ggml_metal_library_get_pipeline_im2col_flat(lib, op);
++
++        const int32_t  max_t = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
++        const int32_t  nth   = std::min<int32_t>(std::min<int32_t>(256, max_t), ((CHW + 31)/32)*32);
++        const int32_t  ntg0  = (CHW + nth - 1)/nth;
++
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, ntg0, OH, OW, nth, 1, 1);
++
++        return 1;
++    }
++
+     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
+ 
+     if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+diff --git a/src/ggml-metal/kernels/conv.metal b/src/ggml-metal/kernels/conv.metal
+index a5d5aa9d..16d7fc4f 100644
+--- a/src/ggml-metal/kernels/conv.metal
++++ b/src/ggml-metal/kernels/conv.metal
+@@ -64,6 +64,55 @@ kernel void kernel_im2col(
+ template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
+ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
+ 
++// one thread per destination element along CHW (the contiguous dst dimension): full SIMD groups for small
++// kernels. kernel_im2col above runs KH*KW threads per threadgroup when N == 1, i.e. one thread for a 1x1 conv.
++// grid: [ceil(CHW/ntg0), OH, OW], threadgroup: [ntg0, 1, 1]
++template <typename T>
++kernel void kernel_im2col_flat(
++        constant ggml_metal_kargs_im2col & args,
++        device const float * x,
++        device        char * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3  tgpg[[threadgroups_per_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int64_t chw = (int64_t) tgpig[0]*ntg[0] + tpitg[0];
++    if (chw >= args.CHW) {
++        return;
++    }
++
++    const int64_t OH  = tgpg[1];
++    const int64_t OW  = tgpg[2];
++    const int64_t ioh = tgpig[1];
++    const int64_t iow = tgpig[2];
++
++    const int64_t iic = chw / args.KHW;
++    const int64_t khw = chw - iic*args.KHW;
++    const int64_t ikh = khw / args.KW;
++    const int64_t ikw = khw - ikh*args.KW;
++
++    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
++    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
++
++    const int64_t dst_n = OH*OW*(int64_t) args.CHW;
++
++    device T * pdst = (device T *) dst + (ioh*OW + iow)*args.CHW + chw;
++
++    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
++        for (int64_t in = 0; in < args.N; ++in) {
++            pdst[in*dst_n] = 0.0f;
++        }
++    } else {
++        device const float * px = x + iic*args.ofs1 + iih*args.IW + iiw;
++        for (int64_t in = 0; in < args.N; ++in) {
++            pdst[in*dst_n] = px[in*args.ofs0];
++        }
++    }
++}
++
++template [[host_name("kernel_im2col_flat_f32")]] kernel im2col_t kernel_im2col_flat<float>;
++template [[host_name("kernel_im2col_flat_f16")]] kernel im2col_t kernel_im2col_flat<half>;
++
+ // TODO: optimize
+ typedef void (im2col_ext_t)(
+         constant ggml_metal_kargs_im2col & args,
