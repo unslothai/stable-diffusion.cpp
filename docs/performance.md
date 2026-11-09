@@ -32,8 +32,10 @@ segment count change.
 path. Performance depends on GPU architecture, backend, driver, model, and
 tensor shapes, so enabling direct convolution can either improve or reduce speed.
 
-Automatic selection uses small benchmarks on Vulkan, implicit GEMM checks on
-CUDA/HIP/MUSA, and the direct kernels on CPU when ggml carries the row-run
+Automatic selection checks direct 2D convolution output against im2col on
+Vulkan and uses it for the VAE (timing is not used; the diffusion model keeps
+im2col and direct 3D stays off there), uses implicit GEMM checks on
+CUDA/HIP/MUSA, and uses the direct kernels on CPU when ggml carries the row-run
 patch (see [backend selection](backend.md)). It does not guarantee the fastest
 end-to-end generation.
 Compare `on` and `off` with the same model and generation settings over

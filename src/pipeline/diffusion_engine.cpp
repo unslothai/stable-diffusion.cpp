@@ -1020,7 +1020,7 @@ void StableDiffusionGGML::configure_weight_loading() {
     bool have_int8_tensorwise = false;
     bool have_quant_type_rule = false;
     for (const auto& [_, tensor_storage] : model_loader.get_tensor_storage_map()) {
-        if (tensor_storage.is_int8_tensorwise) {
+        if (tensor_storage.is_int8_tensorwise || tensor_storage.w4_convrot_kind) {
             have_int8_tensorwise = true;
         }
         if (tensor_storage.expected_type < GGML_TYPE_COUNT && ggml_is_quantized(tensor_storage.expected_type)) {
@@ -1052,7 +1052,7 @@ void StableDiffusionGGML::configure_weight_loading() {
     } else if (sd_ctx_params->lora_apply_mode == LORA_APPLY_IMMEDIATELY) {
         if (have_int8_tensorwise) {
             LOG_WARN(
-                "INT8 tensorwise weights do not support the immediately LoRA apply mode; "
+                "ComfyUI INT8/packed INT4 weights do not support the immediately LoRA apply mode; "
                 "using at_runtime instead");
             apply_lora_immediately = false;
         } else if (row_split_active()) {
@@ -1250,6 +1250,18 @@ bool StableDiffusionGGML::conv_direct_for(SDBackendModule module, bool conv3d) {
     }
     if (any_enabled && !enabled) {
         LOG_INFO("conv%dd direct auto: %s -> off (compute devices disagree)", conv3d ? 3 : 2, sd_backend_module_name(module));
+    }
+    // Vulkan: auto turns direct 2D convolution on for the VAE only. There it decodes faster in a fraction of the
+    // memory (1.2x on AMD's Windows driver, 1.5x on RADV, 6.7x at 1024 px), but in UNet sampling (SD1.5, 512 px) it
+    // ran 11% slower than im2col on AMD's Windows driver and tied on RADV, so the diffusion model and ControlNet keep
+    // im2col unless asked (--conv-direct auto,diffusion=on).
+    if (enabled && !conv3d && module != SDBackendModule::VAE) {
+        for (auto backend : backends) {
+            if (sd_backend_is(backend, "Vulkan")) {
+                LOG_INFO("conv2d direct auto: %s -> off (Vulkan: VAE only)", sd_backend_module_name(module));
+                return false;
+            }
+        }
     }
     return enabled;
 }
@@ -2291,6 +2303,10 @@ static sd::Tensor<float> batch_two_condition_tensors(const sd::Tensor<float>& a,
     return sd::ops::concat(a, b, static_cast<size_t>(batch_dim));
 }
 
+bool StableDiffusionGGML::set_control_type(sd_control_type_t type) {
+    return control_net == nullptr || control_net->set_control_type(type);
+}
+
 void StableDiffusionGGML::compute_sample_controls(const sd::Tensor<float>& control_image,
                                                   const sd::Tensor<float>& noised_input,
                                                   const sd::Tensor<float>& timesteps_tensor,
@@ -3047,7 +3063,7 @@ int StableDiffusionGGML::video_frames_to_latent_frames(int frames) {
         latent_frames = ((frames - 1) / 8) + 1;
     } else if (sd_version_is_minimax_h3(version)) {
         latent_frames = frames <= 5 ? 2 : ((frames - 5) / 17) * 5 + 2;
-    } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
+    } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version) || sd_version_is_cosmos3(version)) {
         latent_frames = ((frames - 1) / 4) + 1;
     }
     return latent_frames;
@@ -3063,7 +3079,7 @@ int StableDiffusionGGML::latent_frames_to_video_frames(int latent_frames) {
     if (sd_version_is_minimax_h3(version)) {
         return latent_frames <= 2 ? 5 : ((latent_frames - 2) / 5) * 17 + 5;
     }
-    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
+    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version) || sd_version_is_cosmos3(version)) {
         return (latent_frames - 1) * 4 + 1;
     }
     return latent_frames;
