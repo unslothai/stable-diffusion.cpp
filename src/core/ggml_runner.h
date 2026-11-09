@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -84,6 +85,8 @@ struct GGMLRunnerContext {
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
     std::function<void(ggml_tensor*, const void*)> set_backend_tensor_data;
     std::map<std::pair<ggml_tensor*, int>, ggml_tensor*> int8_convrot_cache;
+    // F32 activation -> CPU matmul dot-input conversions shared by sibling projections in this graph.
+    std::map<std::tuple<ggml_tensor*, int, int64_t, int64_t, int64_t, int64_t>, ggml_tensor*> cpu_dot_input_cache;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {

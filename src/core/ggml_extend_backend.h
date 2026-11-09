@@ -95,6 +95,17 @@ void sd_untag_matmul_only_weight(ggml_tensor* weight);
 bool sd_is_matmul_only_weight(const ggml_tensor* weight);
 // Unallocated weight: answers whether repacking is enabled.
 bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight);
+// Sharing one F32 -> dot-input conversion between CPU matmuls that read the same activation
+// (separate Q/K/V and similar sibling projections). SD_CPU_SHARE_DOT_INPUT=0 disables it.
+bool sd_cpu_share_dot_input_enabled();
+// The activation type the CPU MUL_MAT kernel converts an F32 input to for this quantized
+// weight type (Q8_0 / Q8_1 / Q8_K), found from the backend's own supports_op answer.
+// GGML_TYPE_COUNT when the backend is not CPU, the weight is not quantized, or the
+// backend does not accept a pre-converted input for it.
+ggml_type sd_cpu_mul_mat_dot_input_type(ggml_backend_t backend, ggml_type weight_type);
+// A quantized weight in a plain host buffer that the generic CPU MUL_MAT reads directly
+// (not an AMX / CPU_REPACK / other extra buffer, which need F32 activations).
+bool sd_weight_uses_generic_cpu_mul_mat(const ggml_tensor* weight);
 ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_dev, const ggml_tensor* weight);
 bool sd_backend_supports_cuda_mma(ggml_backend_t backend);
 bool sd_backend_supports_hip_mma(ggml_backend_t backend);

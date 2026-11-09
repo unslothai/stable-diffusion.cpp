@@ -349,9 +349,37 @@ public:
                 out = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
             }
         } else {
+            if (scale == 1.f) {
+                x = shared_cpu_dot_input(ctx, x, w);
+            }
             out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
         }
         return out;
+    }
+
+private:
+    // The generic CPU MUL_MAT converts its F32 input to the weight's dot-input type (Q8_K,
+    // Q8_0, Q8_1) inside every matmul, so separate Q/K/V and other sibling projections of one
+    // activation repeat the same conversion. Convert once per graph and let every eligible
+    // matmul on that activation read the converted rows: the same per-row quantization the
+    // kernel runs, so outputs are bit-identical. Repacked (AMX, CPU_REPACK) weights keep F32.
+    ggml_tensor* shared_cpu_dot_input(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* w) {
+        if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !sd_cpu_share_dot_input_enabled() ||
+            !sd_weight_uses_generic_cpu_mul_mat(w)) {
+            return x;
+        }
+        const ggml_type dot_type = sd_cpu_mul_mat_dot_input_type(ctx->backend, w->type);
+        if (dot_type == GGML_TYPE_COUNT || x->ne[0] != w->ne[0] || x->ne[0] % ggml_blck_size(dot_type) != 0) {
+            return x;
+        }
+        const auto key = std::make_tuple(x, (int)dot_type, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+        auto cached    = ctx->cpu_dot_input_cache.find(key);
+        if (cached != ctx->cpu_dot_input_cache.end()) {
+            return cached->second;
+        }
+        ggml_tensor* converted = ggml_cast(ctx->ggml_ctx, x, dot_type);
+        ctx->cpu_dot_input_cache.emplace(key, converted);
+        return converted;
     }
 };
 

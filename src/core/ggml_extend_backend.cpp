@@ -494,6 +494,74 @@ bool sd_weight_may_be_cpu_repacked(const ggml_tensor* weight) {
     return !ggml_backend_buft_is_host(buft) && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
+bool sd_cpu_share_dot_input_enabled() {
+    static const bool env_enabled = [] {
+        const char* v = std::getenv("SD_CPU_SHARE_DOT_INPUT");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    return env_enabled;
+}
+
+ggml_type sd_cpu_mul_mat_dot_input_type(ggml_backend_t backend, ggml_type weight_type) {
+    if (!sd_backend_is_cpu(backend) || !ggml_is_quantized(weight_type)) {
+        return GGML_TYPE_COUNT;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    static std::mutex cache_mutex;
+    static std::map<std::pair<ggml_backend_dev_t, int>, ggml_type> cache;
+    const auto key = std::make_pair(dev, (int)weight_type);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+    ggml_type found = GGML_TYPE_COUNT;
+    ggml_init_params params;
+    params.mem_size   = ggml_tensor_overhead() * 16;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = true;
+    ggml_context* ctx = ggml_init(params);
+    if (ctx != nullptr) {
+        // 256 columns fit every weight and dot-input block size.
+        const int64_t k = 256;
+        ggml_tensor* w  = ggml_new_tensor_2d(ctx, weight_type, k, 1);
+        ggml_tensor* x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 2);
+        for (ggml_type candidate : {GGML_TYPE_Q8_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1}) {
+            if (k % ggml_blck_size(candidate) != 0 || k % ggml_blck_size(weight_type) != 0) {
+                continue;
+            }
+            ggml_tensor* converted = ggml_cast(ctx, x, candidate);
+            ggml_tensor* mm        = ggml_mul_mat(ctx, w, converted);
+            // The CPU backend accepts a non-F32 src1 for a quantized weight only when it is
+            // exactly that weight type's dot-input type, which it then reads without converting.
+            if (ggml_backend_supports_op(backend, mm) && ggml_backend_supports_op(backend, converted)) {
+                found = candidate;
+                break;
+            }
+        }
+        ggml_free(ctx);
+    }
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache[key] = found;
+    return found;
+}
+
+bool sd_weight_uses_generic_cpu_mul_mat(const ggml_tensor* weight) {
+    if (weight == nullptr || weight->buffer == nullptr || weight->op != GGML_OP_NONE ||
+        !ggml_is_quantized(weight->type) || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+        sd_weight_may_be_cpu_repacked(weight)) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+    if (!ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
 ggml_backend_buffer_type_t sd_cpu_repack_buffer_type_for(ggml_backend_dev_t cpu_dev, const ggml_tensor* weight) {
     if (cpu_dev == nullptr || ggml_backend_dev_type(cpu_dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
         !sd_is_matmul_only_weight(weight) || !sd_cpu_weight_repack_enabled() ||
