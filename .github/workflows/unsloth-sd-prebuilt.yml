@@ -345,8 +345,7 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # sd-cli and sd-server share one libstable-diffusion instead of each embedding it.
-          # The rpath is relative, never an absolute path into the build tree.
+          # sd-cli and sd-server share one libstable-diffusion (relative rpath, never the build tree).
           if [ "$(uname -s)" = "Darwin" ]; then RPATH='@loader_path'; else RPATH='$ORIGIN'; fi
           CPU_VARIANTS="-DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=$RPATH"
           if [ -n "${{ matrix.cpu_floor }}" ]; then
