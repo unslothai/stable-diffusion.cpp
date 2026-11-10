@@ -6,18 +6,9 @@
 #include <cstdint>
 
 namespace sd {
-    // Device memory this process released that a free-memory reading may not show yet.
-    //
-    // Some drivers report a release late (Windows WDDM destroys allocations asynchronously), so a reading
-    // taken right after a large free can count that memory as used. Memory used outside what the process
-    // tracks is (total - free - tracked). That figure growing right after the process released tracked
-    // memory is credited back, up to the bytes released since the last consistent reading. A driver that
-    // reports releases at once shows no growth, so the credit is 0 and the reading is used as is.
-    // window_ms bounds how long a release can be credited, so growth that really is another process taking
-    // memory stops being credited; 0 disables the credit. Credits below MIN_CREDIT_BYTES are ignored: allocator
-    // pools growing while the process releases a little look the same, and the capacity margin covers them.
-    // A caller that relies on a credit confirms it with a real allocation of what it needs (set_verified) or drops it
-    // (reject); a later, larger request needs its own confirmation.
+    // Credits back device memory this process released that a late driver (e.g. WDDM) still reports as used:
+    // growth of untracked use (total - free - tracked) within window_ms of a release, capped at bytes released.
+    // MIN_CREDIT_BYTES filters allocator-pool noise. Callers confirm a credit with a real allocation (set_verified).
     class DeviceReleaseCredit {
     public:
         static constexpr size_t MIN_CREDIT_BYTES = 256ULL * 1024ULL * 1024ULL;
@@ -35,15 +26,14 @@ namespace sd {
             }
         }
 
-        // Bytes to add to reported_free. fresh: the reading was just taken (only fresh readings re-anchor).
+        // Only fresh readings re-anchor.
         size_t credit(size_t reported_free, size_t total, size_t tracked_bytes, int64_t now_ms, bool fresh) {
             if (total == 0) {
                 return 0;
             }
             const size_t used      = total - std::min(reported_free, total);
             const size_t untracked = used > tracked_bytes ? used - tracked_bytes : 0;
-            // Memory taken since a confirmation, by this process (tracked) or anyone else (untracked), comes out of the
-            // size it confirmed; nothing is ever added back.
+            // Any memory taken since a confirmation shrinks it; nothing is ever added back.
             if (verified_bytes_ > 0) {
                 size_t consumed = tracked_bytes > verified_tracked_ ? tracked_bytes - verified_tracked_ : 0;
                 consumed += untracked > verified_untracked_ ? untracked - verified_untracked_ : 0;
@@ -86,8 +76,8 @@ namespace sd {
         uint64_t released_at_anchor_ = 0;
         int64_t first_release_ms_   = -1;
         size_t verified_bytes_      = 0;
-        size_t verified_tracked_    = 0;  // tracked bytes at the last reading
-        size_t verified_untracked_  = 0;  // untracked bytes at the last reading
+        size_t verified_tracked_    = 0;
+        size_t verified_untracked_  = 0;
     };
 }
 

@@ -164,7 +164,7 @@ private:
         size_t available_budget_bytes = SIZE_MAX;
         bool requires_reclamation     = false;
         bool split_placement          = false;
-        size_t release_credit_bytes   = 0;  // part of available_device_bytes that is released, not yet reported
+        size_t release_credit_bytes   = 0;  // released, not yet reported as free
         bool fits() const {
             return required_device_bytes <= available_device_bytes &&
                    required_budget_bytes <= available_budget_bytes;

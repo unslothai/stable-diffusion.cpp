@@ -2184,7 +2184,6 @@ bool ModelManager::fits_compute_backend_capacity(
     if (capacity.requires_reclamation || !capacity.fits()) {
         return false;
     }
-    // A credit that decides this check is confirmed here too (one allocation), not only on the reclaiming path.
     return request.compute_backend == nullptr || release_credit_holds(request.compute_backend, capacity);
 }
 
