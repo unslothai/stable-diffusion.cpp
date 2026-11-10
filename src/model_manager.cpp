@@ -2181,7 +2181,15 @@ bool ModelManager::fits_compute_backend_capacity(
         return false;
     }
     const auto capacity = check_capacity(request, states);
-    return !capacity.requires_reclamation && capacity.fits();
+    if (capacity.requires_reclamation || !capacity.fits()) {
+        return false;
+    }
+    // An unconfirmed credit that decides the check goes through ensure_compute_backend_capacity, which confirms it.
+    if (capacity.release_credit_bytes == 0 || request.compute_backend == nullptr ||
+        capacity.available_device_bytes - capacity.release_credit_bytes >= capacity.required_device_bytes) {
+        return true;
+    }
+    return release_credit(ggml_backend_get_device(request.compute_backend)).verified();
 }
 
 bool ModelManager::ensure_compute_backend_capacity(
