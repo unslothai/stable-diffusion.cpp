@@ -387,6 +387,11 @@ public:
 
     SDCondition get_learned_condition(const ConditionerParams& params);
 
+    // Frees idle CPU-resident weights of `release` when loading `next` would not fit in available RAM.
+    void release_host_weights_if_needed(const std::set<ModelComponent>& release,
+                                        const std::set<ModelComponent>& next,
+                                        const char* next_phase);
+
     void reset_generation_extensions();
 
     void prepare_generation_extensions(const sd_pm_params_t& pm_params,

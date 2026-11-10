@@ -93,16 +93,31 @@ public:
         return value;
     }
 
-    SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& input) {
-        if (capacity_ == 0) {
-            return conditioner.get_learned_condition(n_threads, input);
-        }
-        // The key drops a size the conditioner never reads; the conditioner still gets the real one.
+    static ConditionerParams cache_key(const Conditioner& conditioner, const ConditionerParams& input) {
         ConditionerParams params = input;
         if (!strict() && !conditioner.condition_uses_size()) {
             params.width  = -1;
             params.height = -1;
         }
+        return params;
+    }
+
+    bool contains(const Conditioner& conditioner, const ConditionerParams& input) const {
+        if (capacity_ == 0) {
+            return false;
+        }
+        const ConditionerParams params = cache_key(conditioner, input);
+        return std::any_of(entries_.begin(), entries_.end(), [&](const Entry& entry) {
+            return same_params(entry.params, params);
+        });
+    }
+
+    SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& input) {
+        if (capacity_ == 0) {
+            return conditioner.get_learned_condition(n_threads, input);
+        }
+        // The key drops a size the conditioner never reads; the conditioner still gets the real one.
+        const ConditionerParams params = cache_key(conditioner, input);
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
             if (same_params(it->params, params)) {
                 entries_.splice(entries_.begin(), entries_, it);

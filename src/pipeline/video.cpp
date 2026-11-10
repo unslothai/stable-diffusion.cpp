@@ -1200,7 +1200,7 @@ namespace sd::pipeline {
                                                                                 const GenerationRequest& request,
                                                                                 const ImageGenerationLatents& latents,
                                                                                 const RefImageParams& ref_image_params) {
-        ConditionerRunnerEndOnExit conditioner_runner_end{sd->cond_stage_model.get()};
+        ConditionerRunnerEndOnExit conditioner_runner_end{sd->cond_stage_model.get(), sd};
 
         ImageGenerationEmbeds embeds;
         ConditionerParams condition_params;
