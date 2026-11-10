@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/legacy-q8.cpp b/src/ggml-cpu/legacy-q8.cpp
-index aa940ea..35857c7 100644
+index 0b7c74e..06e1065 100644
 --- a/src/ggml-cpu/legacy-q8.cpp
 +++ b/src/ggml-cpu/legacy-q8.cpp
 @@ -13,6 +13,7 @@
@@ -39,7 +39,7 @@ index aa940ea..35857c7 100644
          } else if (strcmp(env, "1") != 0 && strcmp(env, "all") != 0) {
              uint64_t sel = 0;
              char buf[256];
-@@ -166,11 +174,345 @@ size_t s_offset(int type, int64_t nb, int64_t n) {
+@@ -168,11 +176,345 @@ size_t s_offset(int type, int64_t nb, int64_t n) {
  #endif
  }
  
@@ -385,7 +385,7 @@ index aa940ea..35857c7 100644
  #if defined(LQ8_ARM) || defined(LQ8_X86)
      return type_enabled(type) && ne00 % QK8_0 == 0 && ne01 % 4 == 0 && n >= k_min_rows;
  #else
-@@ -180,6 +522,11 @@ bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n)
+@@ -182,6 +524,11 @@ bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n)
  }
  
  size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n) {
@@ -397,7 +397,7 @@ index aa940ea..35857c7 100644
      const int64_t nb = ne00 / QK8_0;
      size_t sz = s_offset(type, nb, n);
      if (has_min(type)) {
-@@ -189,6 +536,12 @@ size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n) {
+@@ -191,6 +538,12 @@ size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n) {
  }
  
  void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void * act, void * work, int ith, int nth) {
@@ -410,7 +410,7 @@ index aa940ea..35857c7 100644
      const int64_t nb   = ne00 / QK8_0;
      const size_t  arow = (size_t) nb * act_block_size(type);
      const uint8_t * a  = (const uint8_t *) act;
-@@ -238,6 +591,16 @@ void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void *
+@@ -240,6 +593,16 @@ void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void *
  void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int type, int64_t ne00, int64_t ne01, int64_t n,
                                  const void * w, size_t w_stride, const void * act, const void * work,
                                  float * dst, int64_t dst_stride, int ith, int nth) {
@@ -427,7 +427,7 @@ index aa940ea..35857c7 100644
      const int nb = (int) (ne00 / QK8_0);
      const size_t wblk = ggml_type_size((enum ggml_type) type);
      const bool mins = has_min(type);
-@@ -315,7 +678,7 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+@@ -317,7 +680,7 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
                  }
              }
          }
@@ -436,7 +436,7 @@ index aa940ea..35857c7 100644
          struct ggml_compute_params p1 = *params;
          p1.ith = 0;
          p1.nth = 1;
-@@ -326,6 +689,9 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+@@ -328,6 +691,9 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
          if (mins) {
              add_min_terms(mt, nr, nb, s, 0, n, dst + r0, dst_stride);
          }
