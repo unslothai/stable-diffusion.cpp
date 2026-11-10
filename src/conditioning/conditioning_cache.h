@@ -2,6 +2,8 @@
 #define __SD_CONDITIONING_CONDITIONING_CACHE_H__
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 #include <list>
 #include <tuple>
 
@@ -82,16 +84,40 @@ public:
         entries_.clear();
     }
 
-    bool contains(const ConditionerParams& params) const {
-        return capacity_ > 0 && std::any_of(entries_.begin(), entries_.end(), [&](const Entry& entry) {
-                   return same_params(entry.params, params);
-               });
+    // SD_COND_CACHE_STRICT=1 restores the old keys: size always in the key, cleared on any LoRA change.
+    static bool strict() {
+        static const bool value = [] {
+            const char* env = getenv("SD_COND_CACHE_STRICT");
+            return env != nullptr && env[0] != '\0' && std::string(env) != "0";
+        }();
+        return value;
     }
 
-    SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& params) {
-        if (capacity_ == 0) {
-            return conditioner.get_learned_condition(n_threads, params);
+    static ConditionerParams cache_key(const Conditioner& conditioner, const ConditionerParams& input) {
+        ConditionerParams params = input;
+        if (!strict() && !conditioner.condition_uses_size()) {
+            params.width  = -1;
+            params.height = -1;
         }
+        return params;
+    }
+
+    bool contains(const Conditioner& conditioner, const ConditionerParams& input) const {
+        if (capacity_ == 0) {
+            return false;
+        }
+        const ConditionerParams params = cache_key(conditioner, input);
+        return std::any_of(entries_.begin(), entries_.end(), [&](const Entry& entry) {
+            return same_params(entry.params, params);
+        });
+    }
+
+    SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& input) {
+        if (capacity_ == 0) {
+            return conditioner.get_learned_condition(n_threads, input);
+        }
+        // The key drops a size the conditioner never reads; the conditioner still gets the real one.
+        const ConditionerParams params = cache_key(conditioner, input);
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
             if (same_params(it->params, params)) {
                 entries_.splice(entries_.begin(), entries_, it);
@@ -99,7 +125,7 @@ public:
                 return entries_.front().condition;
             }
         }
-        auto condition = conditioner.get_learned_condition(n_threads, params);
+        auto condition = conditioner.get_learned_condition(n_threads, input);
         if (!condition.empty()) {
             if (entries_.size() == capacity_) {
                 entries_.pop_back();

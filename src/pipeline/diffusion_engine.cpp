@@ -1868,7 +1868,8 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
         conditioning_cache_->clear();
         return false;
     }
-    if (!std::equal(all_loras.begin(), all_loras.end(),
+    auto conditioning_loras = conditioning_relevant_loras(all_loras);
+    if (!std::equal(conditioning_loras.begin(), conditioning_loras.end(),
                     conditioning_loras_.begin(), conditioning_loras_.end(),
                     [](const ModelManager::LoraSpec& a, const ModelManager::LoraSpec& b) {
                         return a.file_id == b.file_id && a.file_revision == b.file_revision &&
@@ -1896,12 +1897,46 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
     if (!all_loras.empty()) {
         LOG_INFO("apply_loras completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
     }
-    conditioning_loras_ = std::move(all_loras);
+    conditioning_loras_ = std::move(conditioning_loras);
     return true;
 }
 
+// Drops LoRAs that touch only denoiser/VAE tensors, unless the conditioner holds such tensors.
+std::vector<ModelManager::LoraSpec> StableDiffusionGGML::conditioning_relevant_loras(const std::vector<ModelManager::LoraSpec>& loras) {
+    if (ConditioningCache::strict() || model_manager == nullptr || !cond_stage_model ||
+        (loras.empty() && conditioning_loras_.empty())) {
+        return loras;
+    }
+    auto outside_conditioner = [](const std::string& name) {
+        return is_diffusion_model_name(name) || is_first_stage_model_name(name);
+    };
+    std::map<std::string, ggml_tensor*> cond_tensors;
+    cond_stage_model->get_param_tensors(cond_tensors);
+    for (const auto& entry : cond_tensors) {
+        if (outside_conditioner(entry.first)) {
+            return loras;
+        }
+    }
+    std::vector<ModelManager::LoraSpec> relevant;
+    for (const auto& spec : loras) {
+        bool denoiser_or_vae_only = spec.file_id != 0;
+        if (denoiser_or_vae_only) {
+            for (const auto& entry : model_manager->loader().file_tensors(spec.file_id, version)) {
+                if (!outside_conditioner(entry.first)) {
+                    denoiser_or_vae_only = false;
+                    break;
+                }
+            }
+        }
+        if (!denoiser_or_vae_only) {
+            relevant.push_back(spec);
+        }
+    }
+    return relevant;
+}
+
 SDCondition StableDiffusionGGML::get_learned_condition(const ConditionerParams& params) {
-    if (!conditioning_cache_->contains(params)) {
+    if (!conditioning_cache_->contains(*cond_stage_model, params)) {
         release_host_weights_if_needed({ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::VAE},
                                        {ModelComponent::Conditioner},
                                        "text encoding");

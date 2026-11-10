@@ -1,0 +1,447 @@
+diff --git a/src/ggml-cpu/CMakeLists.txt b/src/ggml-cpu/CMakeLists.txt
+index 9bcd600..57e5024 100644
+--- a/src/ggml-cpu/CMakeLists.txt
++++ b/src/ggml-cpu/CMakeLists.txt
+@@ -46,6 +46,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/tiled/tiled-kernel.cpp
+         ggml-cpu/tiled/tiled-kernel.h
+         ggml-cpu/iqk/iqk_gemm.cpp
++        ggml-cpu/legacy-q8.cpp
++        ggml-cpu/legacy-q8.h
+         ggml-cpu/iqk/iqk_gemm.h
+         ggml-cpu/iqk/iqk_common.h
+         ggml-cpu/iqk/iqk_gemm_kquants.cpp
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 5be5221..032fe4c 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -16,6 +16,7 @@
+ #include "common.h"
+ #include "tiled/tiled.h"
+ #include "iqk/iqk_gemm.h"
++#include "legacy-q8.h"
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+@@ -1541,6 +1542,20 @@ UseGgmlGemm1:;
+ 
+     ggml_barrier(params->threadpool);
+ 
++    // Q5_0 / Q4_1 / Q5_1 at batch >= 32: weight rows converted to Q8_0 a chunk at a time, Q8_0 GEMM (legacy-q8.h)
++    if (!params->use_ref && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne02 == 1 && ne03 == 1 &&
++        ggml_is_contiguous(dst) && ggml_cpu_legacy_q8_applies(src0->type, ne00, ne01, ne11*ne12*ne13)) {
++        const int64_t n     = ne11*ne12*ne13;
++        const size_t  nbw1  = ggml_row_size(vec_dot_type, ne10);
++        char *        work  = (char *) params->wdata + GGML_PAD(nbw1*n, 64) + ggml_tiled_wdata_size(params->nth, dst);
++        work = (char *) GGML_PAD((uintptr_t) work, 64);
++        ggml_cpu_legacy_q8_prepare(src0->type, ne00, n, params->wdata, work, ith, nth);
++        ggml_barrier(params->threadpool);
++        ggml_cpu_legacy_q8_compute(params, src0->type, ne00, ne01, n, src0->data, nb01, params->wdata, work,
++                                   (float *) dst->data, nb1/sizeof(float), ith, nth);
++        return;
++    }
++
+ #if GGML_USE_LLAMAFILE
+     if (!params->use_ref && src1->type != vec_dot_type && ggml_cpu_sgemm_type_enabled(src0->type)) {
+         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+@@ -3083,6 +3098,15 @@ struct ggml_cplan ggml_graph_plan(
+                         // Workspace for tiled (see tiled.h)
+                         cur = GGML_PAD(cur, 64);
+                         cur += ggml_tiled_wdata_size(n_tasks, node);
++                        // converted activations of the legacy-quant Q8_0 path (see legacy-q8.h)
++                        {
++                            const struct ggml_tensor * s0 = node->src[0];
++                            const struct ggml_tensor * s1 = node->src[1];
++                            const int64_t n = s1->ne[1]*s1->ne[2]*s1->ne[3];
++                            if (s1->type == GGML_TYPE_F32 && ggml_cpu_legacy_q8_applies(s0->type, s0->ne[0], s0->ne[1], n)) {
++                                cur += ggml_cpu_legacy_q8_wsize(s0->type, s0->ne[0], n);
++                            }
++                        }
+                     } break;
+                 case GGML_OP_MUL_MAT_ID:
+                     {
+diff --git a/src/ggml-cpu/legacy-q8.cpp b/src/ggml-cpu/legacy-q8.cpp
+new file mode 100644
+index 0000000..0b7c74e
+--- /dev/null
++++ b/src/ggml-cpu/legacy-q8.cpp
+@@ -0,0 +1,336 @@
++// Q5_0 / Q4_1 / Q5_1 mul_mat through the Q8_0 GEMM kernels (see legacy-q8.h).
++//
++// Why: these types had no repack / AMX layout and their vec_dot or tinyBLAS kernels unpack the 4 / 5 bit weights
++// again for every activation tile, so at diffusion batch sizes (hundreds to thousands of rows) they ran 2.2-4.7x
++// slower than Q8_0 / Q4_0 on the same CPU (3072 x 3072 x 1024 mul_mat: Neoverse N2 Q5_0 4.3x, Q5_1 4.7x, Q4_1 3.6x;
++// Apple M1 2.4-2.9x; Xeon 8559C Q5_0 2.6x, Q5_1 2.2x). Here every weight row is unpacked once per mul_mat.
++//
++// Exactness: Q5_0 values (-16..15), Q4_1 (0..15) and Q5_1 (0..31) are stored as int8 with their own fp16 block
++// scale, so each block's integer dot product with the activation block is the one vec_dot forms; only the float
++// sum over blocks runs in the GEMM kernel's order. Q4_1 / Q5_1 then add sum_b m_b * s_b (fp16 min times the fp16
++// activation block sum of Q8_1), the same terms vec_dot adds per block.
++
++#include "legacy-q8.h"
++
++#include "ggml-cpu-impl.h"
++#include "ggml-cpu.h"
++#include "ggml.h"
++#include "repack.h"
++#include "traits.h"
++
++#if defined(GGML_USE_LLAMAFILE)
++#include "llamafile/sgemm.h"
++#endif
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++#define LQ8_ARM 1
++#if defined(__ARM_FEATURE_MATMUL_INT8)
++#define LQ8_BL 8  // q8_0 4x8 (i8mm) GEMM, as the q8_0 repack picks on this build
++#else
++#define LQ8_BL 4  // q8_0 4x4 (dotprod) GEMM
++#endif
++#elif defined(GGML_USE_LLAMAFILE) && (defined(__x86_64__) || defined(_M_X64)) && \
++    (defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__))
++#define LQ8_X86 1
++#endif
++
++namespace {
++
++constexpr int64_t k_min_rows  = 32;  // activation rows (batch); below this the master path is kept
++constexpr int     k_chunk     = 64;  // weight rows converted per step (multiple of 4)
++
++uint64_t g_types = 0;
++int g_debug = 0;
++std::atomic<uint64_t> g_seen{0};
++std::once_flag g_once;
++
++void init_types() {
++    uint64_t mask = (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_1);
++    const char * env = getenv("GGML_CPU_LEGACY_CONVERT");
++    if (env != NULL) {
++        if (strcmp(env, "0") == 0 || strcmp(env, "none") == 0) {
++            mask = 0;
++        } else if (strcmp(env, "1") != 0 && strcmp(env, "all") != 0) {
++            uint64_t sel = 0;
++            char buf[256];
++            snprintf(buf, sizeof(buf), "%s", env);
++            for (char * tok = strtok(buf, ", "); tok != NULL; tok = strtok(NULL, ", ")) {
++                for (int t = 0; t < GGML_TYPE_COUNT && t < 64; ++t) {
++                    const char * name = ggml_type_name((enum ggml_type) t);
++                    if (name != NULL && strcmp(name, tok) == 0) {
++                        sel |= 1ull << t;
++                    }
++                }
++            }
++            mask &= sel;
++        }
++    }
++    g_types = mask;
++    const char * dbg = getenv("GGML_CPU_IQK_DEBUG");
++    g_debug = dbg != NULL ? atoi(dbg) : 0;
++}
++
++bool type_enabled(int type) {
++    std::call_once(g_once, init_types);
++    return type >= 0 && type < 64 && ((g_types >> type) & 1);
++}
++
++bool has_min(int type) { return type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1; }
++
++// bit b of a byte -> byte 0x10 at position b (the qh expansion of the generic q5 kernels). Built at compile time:
++// a dynamic initializer here would run (vectorized with this variant's ISA) when ggml_backend_load_all opens the
++// library to score it, also on CPUs that cannot run the variant.
++struct qh_table {
++    uint64_t t[256];
++    constexpr qh_table() : t{} {
++        for (int i = 0; i < 256; ++i) {
++            uint64_t v = 0;
++            for (int b = 0; b < 8; ++b) {
++                if ((i >> b) & 1) v |= 0x10ull << (8*b);
++            }
++            t[i] = v;
++        }
++    }
++};
++constexpr qh_table k_qh{};
++
++// one weight block -> 32 int8 values (block order), its fp16 scale and (Q4_1 / Q5_1) its fp16 min
++inline void unpack_block(int type, const void * blk, int8_t * v, ggml_half * d, ggml_half * m) {
++    const uint8_t * qs;
++    uint8_t hb[32];
++    int8_t  off;
++    bool    high;
++    if (type == GGML_TYPE_Q5_0) {
++        const block_q5_0 * x = (const block_q5_0 *) blk;
++        *d = x->d; qs = x->qs; off = -16; high = true;
++        uint32_t qh; memcpy(&qh, x->qh, 4);
++        for (int t = 0; t < 4; ++t) { uint64_t e = k_qh.t[(qh >> (8*t)) & 0xff]; memcpy(hb + 8*t, &e, 8); }
++    } else if (type == GGML_TYPE_Q5_1) {
++        const block_q5_1 * x = (const block_q5_1 *) blk;
++        memcpy(d, (const uint8_t *) x, 2); memcpy(m, (const uint8_t *) x + 2, 2); qs = x->qs; off = 0; high = true;
++        uint32_t qh; memcpy(&qh, x->qh, 4);
++        for (int t = 0; t < 4; ++t) { uint64_t e = k_qh.t[(qh >> (8*t)) & 0xff]; memcpy(hb + 8*t, &e, 8); }
++    } else {
++        const block_q4_1 * x = (const block_q4_1 *) blk;
++        memcpy(d, (const uint8_t *) x, 2); memcpy(m, (const uint8_t *) x + 2, 2); qs = x->qs; off = 0; high = false;
++    }
++    if (high) {
++        for (int e = 0; e < 16; ++e) {
++            v[e]      = (int8_t) (((qs[e] & 0x0f) | hb[e])      + off);
++            v[e + 16] = (int8_t) (((qs[e] >>   4) | hb[e + 16]) + off);
++        }
++    } else {
++        for (int e = 0; e < 16; ++e) {
++            v[e]      = (int8_t) (qs[e] & 0x0f);
++            v[e + 16] = (int8_t) (qs[e] >> 4);
++        }
++    }
++}
++
++size_t act_block_size(int type) { return has_min(type) ? sizeof(block_q8_1) : sizeof(block_q8_0); }
++
++// activation block: fp16 scale at offset 0 (Q8_0 d, Q8_1 d of the d / s pair), quants at the end
++inline const int8_t * act_qs(int type, const uint8_t * b) { return (const int8_t *) (b + act_block_size(type) - QK8_0); }
++
++std::vector<uint8_t> & tls_buf() {
++    static thread_local std::vector<uint8_t> buf;
++    return buf;
++}
++
++// sum_b m[r][b] * s[j][b] added to dst rows j in [j0, j1), weight rows of the chunk; mt is [nb][nr] (transposed)
++void add_min_terms(const float * mt, int nr, int nb, const float * s, int64_t j0, int64_t j1, float * dst, int64_t ds) {
++    for (int64_t j = j0; j < j1; ++j) {
++        float * c = dst + j*ds;
++        const float * sj = s + j*nb;
++        for (int b = 0; b < nb; ++b) {
++            const float sv = sj[b];
++            const float * mb = mt + (size_t) b*nr;
++            for (int r = 0; r < nr; ++r) {
++                c[r] += mb[r]*sv;
++            }
++        }
++    }
++}
++
++size_t s_offset(int type, int64_t nb, int64_t n) {
++#if defined(LQ8_ARM)
++    (void) type;
++    return GGML_PAD((size_t) (n/4) * nb * sizeof(block_q8_0x4), 64);
++#else
++    return has_min(type) ? GGML_PAD((size_t) n * nb * sizeof(block_q8_0), 64) : 0;
++#endif
++}
++
++} // namespace
++
++extern "C" {
++
++bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n) {
++#if defined(LQ8_ARM) || defined(LQ8_X86)
++    return type_enabled(type) && ne00 % QK8_0 == 0 && ne01 % 4 == 0 && n >= k_min_rows;
++#else
++    (void) type; (void) ne00; (void) ne01; (void) n;
++    return false;
++#endif
++}
++
++size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n) {
++    const int64_t nb = ne00 / QK8_0;
++    size_t sz = s_offset(type, nb, n);
++    if (has_min(type)) {
++        sz += (size_t) n * nb * sizeof(float);
++    }
++    return sz + 64;
++}
++
++void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void * act, void * work, int ith, int nth) {
++    const int64_t nb   = ne00 / QK8_0;
++    const size_t  arow = (size_t) nb * act_block_size(type);
++    const uint8_t * a  = (const uint8_t *) act;
++    uint8_t * w        = (uint8_t *) work;
++#if defined(LQ8_ARM)
++    // activation row quads -> block_q8_0x4 (d of each row, quants interleaved in LQ8_BL-byte runs), like
++    // ggml_quantize_mat_q8_0_4xN lays them out, from the already quantized rows (same values)
++    const int64_t nq = n / 4;
++    for (int64_t q = nq*ith/nth; q < nq*(ith + 1)/nth; ++q) {
++        block_q8_0x4 * out = (block_q8_0x4 *) w + q*nb;
++        for (int64_t b = 0; b < nb; ++b) {
++            for (int r = 0; r < 4; ++r) {
++                const uint8_t * blk = a + (q*4 + r)*arow + b*act_block_size(type);
++                memcpy(&out[b].d[r], blk, sizeof(ggml_half));
++                const int8_t * qs = act_qs(type, blk);
++                for (int k = 0; k < QK8_0/LQ8_BL; ++k) {
++                    memcpy(out[b].qs + k*4*LQ8_BL + r*LQ8_BL, qs + k*LQ8_BL, LQ8_BL);
++                }
++            }
++        }
++    }
++#else
++    if (has_min(type)) {
++        // Q8_1 rows -> Q8_0 rows (tinyBLAS reads block_q8_0)
++        for (int64_t j = n*ith/nth; j < n*(ith + 1)/nth; ++j) {
++            block_q8_0 * out = (block_q8_0 *) w + j*nb;
++            for (int64_t b = 0; b < nb; ++b) {
++                const block_q8_1 * x = (const block_q8_1 *) (a + j*arow) + b;
++                memcpy(&out[b].d, (const uint8_t *) x, 2);
++                memcpy(out[b].qs, x->qs, QK8_0);
++            }
++        }
++    }
++#endif
++    if (has_min(type)) {
++        float * s = (float *) (w + s_offset(type, nb, n));
++        for (int64_t j = n*ith/nth; j < n*(ith + 1)/nth; ++j) {
++            for (int64_t b = 0; b < nb; ++b) {
++                const block_q8_1 * x = (const block_q8_1 *) (a + j*arow) + b;
++                ggml_half sh; memcpy(&sh, (const uint8_t *) x + 2, 2);
++                s[j*nb + b] = ggml_fp16_to_fp32(sh);
++            }
++        }
++    }
++}
++
++void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int type, int64_t ne00, int64_t ne01, int64_t n,
++                                const void * w, size_t w_stride, const void * act, const void * work,
++                                float * dst, int64_t dst_stride, int ith, int nth) {
++    const int nb = (int) (ne00 / QK8_0);
++    const size_t wblk = ggml_type_size((enum ggml_type) type);
++    const bool mins = has_min(type);
++    const float * s = mins ? (const float *) ((const uint8_t *) work + s_offset(type, nb, n)) : nullptr;
++
++    if (ith == 0 && g_debug && !((g_seen.fetch_or(1ull << type) >> type) & 1)) {
++        fprintf(stderr, "ggml-cpu legacy q8 gemm: first %s mul_mat (%lld x %lld x %lld, %d threads)\n", ggml_type_name((enum ggml_type) type),
++                (long long) ne01, (long long) n, (long long) ne00, nth);
++    }
++
++    const int64_t ng = ne01 / 4;
++    const int64_t r_begin = 4*(ng*ith/nth);
++    const int64_t r_end   = 4*(ng*(ith + 1)/nth);
++
++#if defined(LQ8_ARM)
++    const size_t conv_size = (size_t) (k_chunk/4) * nb * sizeof(block_q8_0x4);
++#else
++    const size_t conv_size = (size_t) k_chunk * nb * sizeof(block_q8_0);
++#endif
++    const size_t mt_off = GGML_PAD(conv_size, 64);
++    auto & buf = tls_buf();
++    if (buf.size() < mt_off + (size_t) nb * k_chunk * sizeof(float) + 64) {
++        buf.resize(mt_off + (size_t) nb * k_chunk * sizeof(float) + 64);
++    }
++    uint8_t * conv = buf.data();
++    float   * mt   = (float *) (buf.data() + mt_off);
++
++    for (int64_t r0 = r_begin; r0 < r_end; r0 += k_chunk) {
++        const int nr = (int) (r_end - r0 < k_chunk ? r_end - r0 : k_chunk);
++        int8_t v[4][QK8_0];
++        for (int g = 0; g < nr/4; ++g) {
++            for (int b = 0; b < nb; ++b) {
++                ggml_half d[4], m[4];
++                for (int r = 0; r < 4; ++r) {
++                    const void * blk = (const uint8_t *) w + (r0 + 4*g + r)*w_stride + b*wblk;
++                    unpack_block(type, blk, v[r], &d[r], &m[r]);
++                    if (mins) {
++                        mt[(size_t) b*nr + 4*g + r] = ggml_fp16_to_fp32(m[r]);
++                    }
++#if !defined(LQ8_ARM)
++                    block_q8_0 * o = (block_q8_0 *) conv + (size_t) (4*g + r)*nb + b;
++                    o->d = d[r];
++                    memcpy(o->qs, v[r], QK8_0);
++#endif
++                }
++#if defined(LQ8_ARM)
++                block_q8_0x4 * o = (block_q8_0x4 *) conv + (size_t) g*nb + b;
++                for (int r = 0; r < 4; ++r) {
++                    o->d[r] = d[r];
++                    for (int k = 0; k < QK8_0/LQ8_BL; ++k) {
++                        memcpy(o->qs + k*4*LQ8_BL + r*LQ8_BL, v[r] + k*LQ8_BL, LQ8_BL);
++                    }
++                }
++#endif
++            }
++        }
++#if defined(LQ8_ARM)
++        const int64_t n4 = n & ~(int64_t) 3;
++#if LQ8_BL == 8
++        ggml_gemm_q8_0_4x8_q8_0((int) ne00, dst + r0, (size_t) dst_stride, conv, work, (int) n4, nr);
++#else
++        ggml_gemm_q8_0_4x4_q8_0((int) ne00, dst + r0, (size_t) dst_stride, conv, work, (int) n4, nr);
++#endif
++        if (mins) {
++            add_min_terms(mt, nr, nb, s, 0, n4, dst + r0, dst_stride);
++        }
++        if (n4 < n) {
++            // the last n % 4 activation rows: the master vec_dot, per element
++            const auto * tr = ggml_get_type_traits_cpu((enum ggml_type) type);
++            const size_t arow = (size_t) nb * act_block_size(type);
++            for (int64_t j = n4; j < n; ++j) {
++                for (int r = 0; r < nr; ++r) {
++                    tr->vec_dot((int) ne00, dst + j*dst_stride + r0 + r, 0, (const uint8_t *) w + (r0 + r)*w_stride, 0,
++                                (const uint8_t *) act + j*arow, 0, 1);
++                }
++            }
++        }
++#else
++        struct ggml_compute_params p1 = *params;
++        p1.ith = 0;
++        p1.nth = 1;
++        const void * B = mins ? work : act;
++        const bool ok = llamafile_sgemm(&p1, nr, n, nb, conv, nb, B, nb, dst + r0, dst_stride,
++                                        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_F32);
++        GGML_ASSERT(ok);
++        if (mins) {
++            add_min_terms(mt, nr, nb, s, 0, n, dst + r0, dst_stride);
++        }
++#endif
++    }
++    (void) params;
++}
++
++} // extern "C"
+diff --git a/src/ggml-cpu/legacy-q8.h b/src/ggml-cpu/legacy-q8.h
+new file mode 100644
+index 0000000..0a5f908
+--- /dev/null
++++ b/src/ggml-cpu/legacy-q8.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct ggml_compute_params;
++
++// Q5_0 / Q4_1 / Q5_1 weights at batch sizes >= 32: each thread converts a chunk of weight rows at a time into Q8_0
++// blocks (the integer weight values and the block scales unchanged, so the integer products are the same as in the
++// vec_dot kernels) and runs the Q8_0 GEMM kernel this build already uses for Q8_0 weights on them: the q8_0 4x8 (i8mm)
++// or 4x4 (dotprod) repack GEMM on aarch64, llamafile tinyBLAS on x86. Q4_1 / Q5_1 add their per-block min times the
++// Q8_1 activation block sum afterwards. Nothing is kept resident: the converted chunk lives in a per-thread buffer.
++// GGML_CPU_LEGACY_CONVERT=0 turns it off (master path), or a comma list of ggml type names limits it to those types.
++
++// true when the path takes a mul_mat with these weights (same answer on every thread)
++bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n);
++
++// extra wdata bytes (after the quantized src1 rows) for the converted activations
++size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n);
++
++// phase 1, every thread: rewrite its share of the quantized activation rows (Q8_0 for Q5_0, Q8_1 for Q4_1 / Q5_1)
++// into the layout the GEMM kernel reads; a barrier must follow
++void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void * act, void * work, int ith, int nth);
++
++// phase 2, every thread: its share of the weight rows; dst rows are n rows of ne01 floats, dst_stride floats apart
++void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int type, int64_t ne00, int64_t ne01, int64_t n,
++                                const void * w, size_t w_stride, const void * act, const void * work,
++                                float * dst, int64_t dst_stride, int ith, int nth);
++
++#ifdef __cplusplus
++}
++#endif

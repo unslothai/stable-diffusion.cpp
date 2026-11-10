@@ -1,0 +1,891 @@
+diff --git a/src/ggml-cpu/iqk/iqk_common.h b/src/ggml-cpu/iqk/iqk_common.h
+index 478cf1a..e9278b3 100644
+--- a/src/ggml-cpu/iqk/iqk_common.h
++++ b/src/ggml-cpu/iqk/iqk_common.h
+@@ -134,6 +134,24 @@ bool iqk_set_kernels_kquants(int typeA, mul_mat_t * funcs);
+ bool iqk_set_kernels_iquants(int typeA, mul_mat_t * funcs);
+ bool iqk_set_kernels_1bit(int typeA, mul_mat_t * funcs);
+ 
++#ifdef __aarch64__
++// Large batches on aarch64 (ik_llama.cpp MulMat::is_dequant_better): rows of a K-quant / I-quant weight are
++// converted, 8 at a time, to Q8_K_R8 (8 interleaved rows of int8 quants with one fp16 scale per row per 256
++// weights) in a per-thread buffer, then multiplied by the Q8_K activations with one int8 dot-product kernel.
++typedef struct {
++    ggml_half d[8];
++    int8_t    qs[8*QK_K];
++} block_q8_k_r8;
++
++// convert nrc_x (multiple of 8) rows of n (multiple of 256) weights of `type` (row stride bx) to Q8_K_R8 at vy;
++// false if the type has no converter
++bool iqk_convert_kquants_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x);
++bool iqk_convert_iquants_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x);
++bool iqk_convert_1bit_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x);
++// Q8_K_R8 x Q8_K kernels for 1..8 activation rows
++void iqk_set_kernels_q8_k_r8(mul_mat_t * funcs);
++#endif
++
+ // ==================================================================================================
+ 
+ static inline void make_q4_scales(const uint8_t * scales8, uint32_t * aux32) {
+@@ -749,6 +767,53 @@ static void mul_mat_qX_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
+     }
+ }
+ 
++// Products scale * quant of one 256-weight block (16 groups of 16, scales[16]) as int16, stored to the Q8_K_R8 row
++// k (q8_k points at qs + 4*k bytes); when the largest |product| times d0 exceeds 1 they are rescaled to fit int8.
++// Returns the factor the block scale has to be multiplied with (1 when no rescaling was needed, 0 for an all-zero block).
++static inline float convert_to_q8_k_r8(float d0, const int8x16x2_t * qx, const int8_t * scales, uint32_t * block, uint32_t * q8_k) {
++    auto max_i16 = vdupq_n_u16(0);
++    int16x8x4_t q[8];
++    for (int ib32 = 0; ib32 < 8; ++ib32) {
++        auto scale_l = vdup_n_s8(scales[2*ib32+0]);
++        auto scale_h = vdup_n_s8(scales[2*ib32+1]);
++        q[ib32].val[0] = vmull_s8(scale_l, vget_low_s8 (qx[ib32].val[0]));
++        q[ib32].val[1] = vmull_s8(scale_l, vget_high_s8(qx[ib32].val[0]));
++        q[ib32].val[2] = vmull_s8(scale_h, vget_low_s8 (qx[ib32].val[1]));
++        q[ib32].val[3] = vmull_s8(scale_h, vget_high_s8(qx[ib32].val[1]));
++        max_i16 = vmaxq_u16(max_i16, vmaxq_u16(vreinterpretq_u16_s16(vabsq_s16(q[ib32].val[0])), vreinterpretq_u16_s16(vabsq_s16(q[ib32].val[1]))));
++        max_i16 = vmaxq_u16(max_i16, vmaxq_u16(vreinterpretq_u16_s16(vabsq_s16(q[ib32].val[2])), vreinterpretq_u16_s16(vabsq_s16(q[ib32].val[3]))));
++    }
++    uint16_t imax = vmaxvq_u16(max_i16);
++    if (!imax) {
++        for (int ib32 = 0; ib32 < 8; ++ib32) for (int l = 0; l < 8; ++l) q8_k[64*ib32 + 8*l] = 0;
++        return 0.f;
++    }
++    float dnew = float(imax) * d0;
++    bool needs_scaling = true;
++    if (dnew <= 1.f) {
++        dnew = 1.f; needs_scaling = false;
++    }
++    auto scale = vdupq_n_f32(1/dnew);
++    for (int ib32 = 0; ib32 < 8; ++ib32) {
++        if (needs_scaling) {
++            for (int l = 0; l < 4; ++l) {
++                auto i1 = vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q[ib32].val[l])))));
++                auto i2 = vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q[ib32].val[l])))));
++                q[ib32].val[l] = vcombine_s16(vmovn_s32(i1), vmovn_s32(i2));
++            }
++        }
++        for (int l = 0; l < 2; ++l) {
++            auto s8 = vcombine_s8(vmovn_s16(q[ib32].val[2*l+0]), vmovn_s16(q[ib32].val[2*l+1]));
++            vst1q_s8((int8_t *)block + 16*l, s8);
++        }
++        auto qb = q8_k + 64*ib32;
++        for (int l = 0; l < 8; ++l) {
++            qb[8*l] = block[l];
++        }
++    }
++    return dnew;
++}
++
+ #endif
+ 
+ #endif // IQK_IMPLEMENT
+diff --git a/src/ggml-cpu/iqk/iqk_gemm.cpp b/src/ggml-cpu/iqk/iqk_gemm.cpp
+index 6551112..6259c34 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm.cpp
++++ b/src/ggml-cpu/iqk/iqk_gemm.cpp
+@@ -32,10 +32,12 @@
+ 
+ #include "ggml.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <vector>
+ 
+ namespace {
+ 
+@@ -56,9 +58,15 @@ constexpr uint64_t k_iqk_built_types = 0;
+ 
+ std::atomic<uint64_t> g_iqk_types{k_iqk_built_types};
+ std::atomic<int64_t>  g_iqk_count[64];
++#if defined(IQK_IMPLEMENT) && defined(__aarch64__)
++std::atomic<int64_t>  g_iqk_conv_count[64];  // Q8_K_R8 conversions (aarch64), for the debug line
++#endif
+ int                   g_iqk_debug = 0;
+ bool                  g_iqk_first = false;
+ bool                  g_iqk_auto  = false;
++// aarch64: K-quant / I-quant rows converted to Q8_K_R8 from this many activation rows up (0 = never;
++// GGML_CPU_IQK_CONVERT=0 turns it off, GGML_CPU_IQK_CONVERT_MIN_NY overrides the threshold)
++int                   g_iqk_convert_min_ny = 0;
+ 
+ #ifdef IQK_IMPLEMENT
+ 
+@@ -115,6 +123,47 @@ void iqk_mul_mat_NxM(const mul_mat_t * funcs, int n, const void * vx, size_t bx,
+     }
+ }
+ 
++#ifdef __aarch64__
++bool iqk_convert_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    return iqk_convert_kquants_q8_k_r8(type, n, vx, bx, vy, nrc_x) || iqk_convert_iquants_q8_k_r8(type, n, vx, bx, vy, nrc_x) ||
++           iqk_convert_1bit_q8_k_r8(type, n, vx, bx, vy, nrc_x);
++}
++
++bool iqk_has_q8_k_r8_convert(int type) {
++    switch (type) {
++        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_IQ4_XS:
++        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
++        case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
++            return true;
++        default:
++            return false;
++    }
++}
++
++// split_units_and_columns of ik_llama.cpp iqk_mul_mat.cpp: nunit units of nrow rows times Ny columns over the threads;
++// a thread mostly gets whole units with all columns (one conversion per unit), only the remainder is split by columns
++template <typename Work>
++void iqk_split_units_and_columns(int nunit, int nrow, int Ny, int max_units, int ith, int nth, const Work & work) {
++    constexpr int k_y_blk = 8;
++    const int64_t nyb   = (Ny + k_y_blk - 1)/k_y_blk;
++    const int64_t nwork = nunit*nyb;
++    const int64_t w_end = nwork*(ith + 1)/nth;
++    for (int64_t w = nwork*ith/nth; w < w_end; ) {
++        const int u = (int)(w/nyb);
++        const int b = (int)(w - u*nyb);
++        if (b == 0 && w + nyb <= w_end) {
++            const int nu = (int) std::min<int64_t>(max_units, (w_end - w)/nyb);
++            work(u*nrow, nu*nrow, 0, Ny);
++            w += nu*nyb;
++        } else {
++            const int b1 = (int) std::min<int64_t>(nyb, b + (w_end - w));
++            work(u*nrow, nrow, b*k_y_blk, std::min<int>(Ny, b1*k_y_blk));
++            w += b1 - b;
++        }
++    }
++}
++#endif
++
+ #endif // IQK_IMPLEMENT
+ 
+ } // namespace
+@@ -149,6 +198,13 @@ void ggml_cpu_iqk_init(void) {
+         mask &= sel;
+     }
+     g_iqk_types.store(mask);
++#if defined(IQK_IMPLEMENT) && defined(__aarch64__)
++    {
++        const char * cv = getenv("GGML_CPU_IQK_CONVERT");
++        const char * mn = getenv("GGML_CPU_IQK_CONVERT_MIN_NY");
++        g_iqk_convert_min_ny = cv != NULL && atoi(cv) == 0 ? 0 : (mn != NULL ? std::max(1, atoi(mn)) : 32);
++    }
++#endif
+     const char * dbg = getenv("GGML_CPU_IQK_DEBUG");
+     g_iqk_debug = dbg != NULL ? atoi(dbg) : 0;
+     if (g_iqk_debug) {
+@@ -158,6 +214,9 @@ void ggml_cpu_iqk_init(void) {
+             if ((mask >> t) & 1) fprintf(stderr, " %s", ggml_type_name((enum ggml_type) t));
+         }
+         fprintf(stderr, "\n");
++        if (g_iqk_convert_min_ny > 0) {
++            fprintf(stderr, "ggml-cpu iqk gemm: Q8_K_R8 conversion from %d activation rows\n", g_iqk_convert_min_ny);
++        }
+     }
+ }
+ 
+@@ -212,6 +271,38 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+     if (ne00 % QK_K != 0 || Nx <= 0 || Ny <= 0 || Nx > INT32_MAX || Ny > INT32_MAX || ne00 > INT32_MAX) {
+         return false;
+     }
++#ifdef __aarch64__
++    // large batches: rows converted to Q8_K_R8 32 at a time (per thread, reused for every activation column)
++    if (g_iqk_convert_min_ny > 0 && Ny >= g_iqk_convert_min_ny && Nx % 8 == 0 && iqk_has_q8_k_r8_convert(type)) {
++        mul_mat_t funcs[IQK_MAX_NY];
++        iqk_set_kernels_q8_k_r8(funcs);
++        if (ith == 0) {
++            g_iqk_count[type].fetch_add(1, std::memory_order_relaxed);
++            const int64_t prev = g_iqk_conv_count[type].fetch_add(1, std::memory_order_relaxed);
++            if (g_iqk_debug && prev == 0) {
++                fprintf(stderr, "ggml-cpu iqk gemm: first %s mul_mat (%lld x %lld x %lld, %d threads, via Q8_K_R8)\n",
++                        ggml_type_name((enum ggml_type) type), (long long) Nx, (long long) Ny, (long long) ne00, nth);
++            }
++        }
++        constexpr int k_rows = 8;
++        constexpr int k_x_step = 32;
++        const size_t row_size_qx = (size_t) (ne00/QK_K) * sizeof(block_q8_k_r8) / k_rows;
++        thread_local std::vector<char> f;
++        bool ok = true;
++        iqk_split_units_and_columns((int) Nx/k_rows, k_rows, (int) Ny, k_x_step/k_rows, ith, nth,
++                [&](int ix, int nrc_x, int first_y, int last_y) {
++            if (!ok) return;
++            if (f.size() < row_size_qx*nrc_x) f.resize(row_size_qx*nrc_x);
++            if (!iqk_convert_q8_k_r8(type, (int) ne00, (const char *) A + ix*stride_A, stride_A, f.data(), nrc_x)) {
++                ok = false; return;
++            }
++            DataInfo info{C + ix, (const char *) B, stride_C, stride_B, first_y};
++            iqk_mul_mat_NxM(funcs, (int) ne00, f.data(), row_size_qx, info, nrc_x, last_y);
++        });
++        GGML_ASSERT(ok);
++        return true;
++    }
++#endif
+     mul_mat_t funcs[IQK_MAX_NY];
+     if (!iqk_set_kernels(type, funcs)) {
+         return false;
+diff --git a/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp b/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
+index 43ba745..ac5105a 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
++++ b/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
+@@ -348,8 +348,122 @@ void mul_mat_iq1_m_q8_K(int n, const void * vx, size_t bx, const DataInfo& info,
+     }
+ }
+ 
++// ---- Q8_K_R8 converters for large batches (ik_llama.cpp iqk_gemm_1bit.cpp, aarch64) ----
++
++union iqk_iq1m_scale_t { ggml_half f16; uint16_t u16; };
++
++static void iqk_convert_iq1_s_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq1_s * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    int8_t ls[16];
++
++    uint32_t block[8];
++
++    int8x16x2_t qx[8];
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq1_s *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = 0.125f * GGML_FP16_TO_FP32(x8[k][i].d);
++                auto qs = x8[k][i].qs;
++                auto qh = x8[k][i].qh;
++                int8x16x2_t value;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    ls[2*ib32 + 0] = ls[2*ib32 + 1] = (2*((qh[ib32] >> 12) & 7) + 1);
++                    value.val[0] = vreinterpretq_s8_u64(uint64x2_t{iq1s_grid[qs[0] | ((qh[ib32] << 8) & 0x700)], iq1s_grid[qs[1] | ((qh[ib32] << 5) & 0x700)]});
++                    value.val[1] = vreinterpretq_s8_u64(uint64x2_t{iq1s_grid[qs[2] | ((qh[ib32] << 2) & 0x700)], iq1s_grid[qs[3] | ((qh[ib32] >> 1) & 0x700)]});
++                    value.val[0] = vshlq_n_s8(vaddq_s8(value.val[0], vdupq_n_s8(1)), 3);
++                    value.val[1] = vshlq_n_s8(vaddq_s8(value.val[1], vdupq_n_s8(1)), 3);
++                    auto delta = vdupq_n_s8(qh[ib32] & 0x8000 ? -9 : -7);
++                    qx[ib32].val[0] = vaddq_s8(value.val[0], delta);
++                    qx[ib32].val[1] = vaddq_s8(value.val[1], delta);
++                    qs += 4;
++                }
++                float dnew = convert_to_q8_k_r8(1.f/126, qx, ls, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_iq1_m_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq1_m * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    int8_t ls[16];
++
++    uint32_t block[8];
++
++    int8x16x2_t qx[8];
++
++    uint32x4x2_t mask = {uint32x4_t{0x00000008, 0x00000008, 0x00000080, 0x00000080}, uint32x4_t {0x00080000, 0x00080000, 0x00800000, 0x00800000}};
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq1_m *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                const uint16_t * sc = (const uint16_t *)x8[k][i].scales;
++                iqk_iq1m_scale_t scale;
++                scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
++                float d = 0.125f * GGML_FP16_TO_FP32(scale.f16);
++                auto qs = x8[k][i].qs;
++                auto qh = x8[k][i].qh;
++                int8x16x2_t value;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    ls[2*ib32 + 0] = (2*((sc[ib32/2] >> (6*(ib32%2)+0)) & 0x7) + 1);
++                    ls[2*ib32 + 1] = (2*((sc[ib32/2] >> (6*(ib32%2)+3)) & 0x7) + 1);
++                    //value = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[1] << 4) & 0x700)], iq1s_grid[qs[2] | ((qh[1] << 8) & 0x700)],
++                    //                          iq1s_grid[qs[1] | ((qh[0] << 4) & 0x700)], iq1s_grid[qs[0] | ((qh[0] << 8) & 0x700)]);
++                    value.val[0] = vreinterpretq_s8_u64(uint64x2_t{iq1s_grid[qs[0] | ((qh[0] << 8) & 0x700)], iq1s_grid[qs[1] | ((qh[0] << 4) & 0x700)]});
++                    value.val[1] = vreinterpretq_s8_u64(uint64x2_t{iq1s_grid[qs[2] | ((qh[1] << 8) & 0x700)], iq1s_grid[qs[3] | ((qh[1] << 4) & 0x700)]});
++                    value.val[0] = vshlq_n_s8(vaddq_s8(value.val[0], vdupq_n_s8(1)), 3);
++                    value.val[1] = vshlq_n_s8(vaddq_s8(value.val[1], vdupq_n_s8(1)), 3);
++
++                    auto aux = vdupq_n_u32(qh[0] | qh[1] << 16);
++                    uint32x4x2_t delta_mask{ vceqq_u32(vandq_u32(aux, mask.val[0]), mask.val[0]), vceqq_u32(vandq_u32(aux, mask.val[1]), mask.val[1]) };
++                    int8x16x2_t delta{ vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[0]))),
++                                        vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[1]))) };
++                    qx[ib32].val[0] = vsubq_s8(value.val[0], delta.val[0]);
++                    qx[ib32].val[1] = vsubq_s8(value.val[1], delta.val[1]);
++
++                    qs += 4;
++                    qh += 2;
++                }
++                float dnew = convert_to_q8_k_r8(1.f/126, qx, ls, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
+ } // namespace
+ 
++bool iqk_convert_1bit_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    if (n % QK_K != 0 || nrc_x % 8 != 0) return false;
++    switch (type) {
++        case GGML_TYPE_IQ1_S: iqk_convert_iq1_s_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_IQ1_M: iqk_convert_iq1_m_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        default: return false;
++    }
++    return true;
++}
++
+ #endif
+ 
+ bool iqk_set_kernels_1bit(int typeA, mul_mat_t * funcs) {
+diff --git a/src/ggml-cpu/iqk/iqk_gemm_iquants.cpp b/src/ggml-cpu/iqk/iqk_gemm_iquants.cpp
+index f916fee..bdd31ad 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm_iquants.cpp
++++ b/src/ggml-cpu/iqk/iqk_gemm_iquants.cpp
+@@ -1150,8 +1150,226 @@ struct DequantizerIQ3S final : public BaseDequantizer<block_iq3_s> {
+ 
+ };
+ 
++// ---- Q8_K_R8 converters for large batches (ik_llama.cpp iqk_gemm_iquants.cpp, aarch64) ----
++
++static void iqk_convert_iq2_xxs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq2_xxs * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    int8_t   ls[16];
++    uint32_t block[8];
++    uint32_t aux32[2];
++    const uint8_t * aux8 = (const uint8_t *)aux32;
++
++    int8x16x2_t xv[8];
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq2_xxs *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = 0.125f * GGML_FP16_TO_FP32(x8[k][i].d);
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    std::memcpy(aux32, x8[k][i].qs + 4*ib32, 2*sizeof(uint32_t));
++                    ls[2*ib32+0] = ls[2*ib32+1] = (2*(aux32[1] >> 28) + 1);
++                    xv[ib32].val[0] = vreinterpretq_s8_u64(uint64x2_t{iq2xxs_grid[aux8[0]], iq2xxs_grid[aux8[1]]});
++                    xv[ib32].val[1] = vreinterpretq_s8_u64(uint64x2_t{iq2xxs_grid[aux8[2]], iq2xxs_grid[aux8[3]]});
++                    apply_signs_2((uint8x16_t *)xv[ib32].val, keven_signs, aux32[1]);
++                }
++                float dnew = convert_to_q8_k_r8(1.f/124, xv, ls, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_iq2_xs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq2_xs * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    uint32_t block[8];
++
++    int8x16x2_t xv[8];
++
++    union { int8x16_t vec; int8_t val[16]; } helper;
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq2_xs *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = 0.125f * GGML_FP16_TO_FP32(x8[k][i].d);
++                auto aux = vld1_u8(x8[k][i].scales);
++                auto scales_l = vand_u8(aux, vdup_n_u8(0xf));
++                auto scales_h = vshr_n_u8(aux, 4);
++                auto aux1 = vcombine_u8(vzip1_u8(scales_l, scales_h), vzip2_u8(scales_l, scales_h));
++                helper.vec = vreinterpretq_s8_u8(vorrq_u8(vshlq_n_u8(aux1, 1), vdupq_n_u8(1)));
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    xv[ib32].val[0] = vreinterpretq_s8_u64(uint64x2_t{iq2xs_grid[x8[k][i].qs[4*ib32+0] & 511], iq2xs_grid[x8[k][i].qs[4*ib32+1] & 511]});
++                    xv[ib32].val[1] = vreinterpretq_s8_u64(uint64x2_t{iq2xs_grid[x8[k][i].qs[4*ib32+2] & 511], iq2xs_grid[x8[k][i].qs[4*ib32+3] & 511]});
++                    auto s1 = vreinterpretq_s8_u64(uint64x2_t{keven_signs[x8[k][i].qs[4*ib32+0] >> 9], keven_signs[x8[k][i].qs[4*ib32+1] >> 9]});
++                    auto s2 = vreinterpretq_s8_u64(uint64x2_t{keven_signs[x8[k][i].qs[4*ib32+2] >> 9], keven_signs[x8[k][i].qs[4*ib32+3] >> 9]});
++                    xv[ib32].val[0] = vmulq_s8(xv[ib32].val[0], s1);
++                    xv[ib32].val[1] = vmulq_s8(xv[ib32].val[1], s2);
++                }
++                float dnew = convert_to_q8_k_r8(1.f/124, xv, helper.val, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_iq2_s_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq2_s * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    uint32_t block[8];
++
++    union { int8x16_t vec; int8_t val[16]; } helper;
++    int8x16x2_t xv[8];
++
++    SignHelper sh;
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq2_s *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = 0.125f * GGML_FP16_TO_FP32(x8[k][i].d);
++                auto aux = vld1_u8(x8[k][i].scales);
++                auto scales_l = vand_u8(aux, vdup_n_u8(0xf));
++                auto scales_h = vshr_n_u8(aux, 4);
++                auto aux1 = vcombine_u8(vzip1_u8(scales_l, scales_h), vzip2_u8(scales_l, scales_h));
++                helper.vec = vreinterpretq_s8_u8(vorrq_u8(vshlq_n_u8(aux1, 1), vdupq_n_u8(1)));
++                for (int j = 0; j < 2; ++j) {
++                    auto qs = x8[k][i].qs + 16*j;
++                    auto qh = x8[k][i].qh + 4*j;
++                    auto signs16 = vld1q_u8(qs + QK_K/8);
++                    sh.init();
++                    DequantizerIQ2S::make4(sh, signs16, qs+0, qh+0, (uint8x16_t *)&xv[4*j+0]);
++                    DequantizerIQ2S::make4(sh, signs16, qs+8, qh+2, (uint8x16_t *)&xv[4*j+2]);
++                }
++                float dnew = convert_to_q8_k_r8(1.f/124, xv, helper.val, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_iq3_xxs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq3_xxs * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    int8_t ls[16];
++    int8x16x2_t xv[8];
++    uint32_t block[8];
++    uint32_t aux32;
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq3_xxs *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = 0.25f * GGML_FP16_TO_FP32(x8[k][i].d);
++                auto qs  = x8[k][i].qs;
++                auto sas = qs + QK_K/4;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    std::memcpy(&aux32, sas + 4*ib32, sizeof(uint32_t));
++                    ls[2*ib32 + 0] = ls[2*ib32 + 1] = (2*(aux32 >> 28) + 1);
++                    xv[ib32].val[0] = vreinterpretq_s8_u32(uint32x4_t{iq3xxs_grid[qs[0]], iq3xxs_grid[qs[1]], iq3xxs_grid[qs[2]], iq3xxs_grid[qs[3]]});
++                    xv[ib32].val[1] = vreinterpretq_s8_u32(uint32x4_t{iq3xxs_grid[qs[4]], iq3xxs_grid[qs[5]], iq3xxs_grid[qs[6]], iq3xxs_grid[qs[7]]});
++                    apply_signs_2((uint8x16_t *)xv[ib32].val, keven_signs, aux32);
++                    qs += 8;
++                }
++                float dnew = convert_to_q8_k_r8(1.f/124, xv, ls, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_iq3_s_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq3_s * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    int8_t ls[16];
++    SignHelper sh;
++
++    uint32_t block[8];
++    int8x16x2_t xv[8];
++
++    static const int16_t k_shift[8] = {8, 7, 6, 5, 4, 3, 2, 1};
++    const auto hshift  = vld1q_s16(k_shift);
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq3_s *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = GGML_FP16_TO_FP32(x8[k][i].d);
++                for (int j = 0; j < 2; ++j) {
++                    const auto * qs = x8[k][i].qs + 32*j;
++                    const auto * qh = x8[k][i].qh + 4*j;
++                    const auto signs16 = vld1q_u8(x8[k][i].signs + 16*j);
++                    sh.init();
++                    DequantizerIQ3S::make4(sh, signs16, qs+ 0, qh+0, hshift, (uint8x16_t *)&xv[4*j+0]);
++                    DequantizerIQ3S::make4(sh, signs16, qs+16, qh+2, hshift, (uint8x16_t *)&xv[4*j+2]);
++                }
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    ls[2*ib32 + 0] = ls[2*ib32 + 1] = (2*((x8[k][i].scales[ib32/2] >> 4*(ib32%2)) & 0xf) + 1);
++                }
++                float dnew = convert_to_q8_k_r8(1.f/127, xv, ls, block, (uint32_t *)y[i].qs + k);
++                y[i].d[k] = GGML_FP32_TO_FP16(d*dnew);
++            }
++        }
++        y += nb;
++    }
++}
++
+ } // namespace
+ 
++bool iqk_convert_iquants_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    if (n % QK_K != 0 || nrc_x % 8 != 0) return false;
++    switch (type) {
++        case GGML_TYPE_IQ2_XXS: iqk_convert_iq2_xxs_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_IQ2_XS:  iqk_convert_iq2_xs_q8_k_r8 (n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_IQ2_S:   iqk_convert_iq2_s_q8_k_r8  (n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_IQ3_XXS: iqk_convert_iq3_xxs_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_IQ3_S:   iqk_convert_iq3_s_q8_k_r8  (n, vx, bx, vy, nrc_x); break;
++        default: return false;
++    }
++    return true;
++}
++
+ bool iqk_set_kernels_iquants(int typeA, mul_mat_t * kernels) {
+     switch (typeA) {
+         case GGML_TYPE_IQ2_XXS: IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_K_T, DequantizerIQ2XXS, kernels); break;
+diff --git a/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp b/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp
+index 916de2a..bae9723 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp
++++ b/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp
+@@ -1142,8 +1142,301 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
+ 
+ };
+ 
++
++// ---- Q8_K_R8 path for large batches (ik_llama.cpp iqk_gemm_kquants.cpp, aarch64) ----
++
++template <int nrc_y>
++static void mul_mat_q8_k_r8_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
++    GGML_ASSERT(nrc_x%8 == 0);
++    Q8<nrc_y, block_q8_K> q8(info);
++    int nbl = n / QK_K;
++    float32x4_t acc[2*nrc_y] = {};
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        const block_q8_k_r8 * iq8 = (const block_q8_k_r8 *)((const char *)vx + ix*bx);
++        for (int ibl = 0; ibl < nbl; ++ibl) {
++            auto d4l = vcvt_f32_f16(vld1_f16((const float16_t *)iq8[ibl].d+0));
++            auto d4h = vcvt_f32_f16(vld1_f16((const float16_t *)iq8[ibl].d+4));
++            int32x4_t isum[2*nrc_y] = {};
++            for (int ib = 0; ib < QK_K/16; ++ib) {
++                auto q1 = vld1q_s8_x4(iq8[ibl].qs + 128*ib +  0);
++                auto q2 = vld1q_s8_x4(iq8[ibl].qs + 128*ib + 64);
++                for (int iy = 0; iy < nrc_y; ++iy) {
++                    auto y = vld1q_s8(q8.y[iy][ibl].qs+16*ib);
++                    isum[2*iy+0] = vdotq_laneq_s32(isum[2*iy+0], q1.val[0], y, 0);
++                    isum[2*iy+1] = vdotq_laneq_s32(isum[2*iy+1], q1.val[1], y, 0);
++                    isum[2*iy+0] = vdotq_laneq_s32(isum[2*iy+0], q1.val[2], y, 1);
++                    isum[2*iy+1] = vdotq_laneq_s32(isum[2*iy+1], q1.val[3], y, 1);
++                    isum[2*iy+0] = vdotq_laneq_s32(isum[2*iy+0], q2.val[0], y, 2);
++                    isum[2*iy+1] = vdotq_laneq_s32(isum[2*iy+1], q2.val[1], y, 2);
++                    isum[2*iy+0] = vdotq_laneq_s32(isum[2*iy+0], q2.val[2], y, 3);
++                    isum[2*iy+1] = vdotq_laneq_s32(isum[2*iy+1], q2.val[3], y, 3);
++                }
++            }
++            for (int iy = 0; iy < nrc_y; ++iy) {
++                auto d8 = vdupq_n_f32(q8.scale(iy, ibl));
++                acc[2*iy+0] = vfmaq_f32(acc[2*iy+0], vmulq_f32(d4l, d8), vcvtq_f32_s32(isum[2*iy+0]));
++                acc[2*iy+1] = vfmaq_f32(acc[2*iy+1], vmulq_f32(d4h, d8), vcvtq_f32_s32(isum[2*iy+1]));
++            }
++        }
++        for (int iy = 0; iy < nrc_y; ++iy) {
++            info.store(ix+0, iy, acc[2*iy+0]);
++            info.store(ix+4, iy, acc[2*iy+1]);
++            acc[2*iy+0] = acc[2*iy+1] = vdupq_n_f32(0.f);
++        }
++    }
++}
++
++static void iqk_convert_q2_k_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_q2_K * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    float32_t f_values[QK_K];
++    uint32_t block[8];
++
++    int8x16x2_t xv[4];
++
++    auto ml = vdupq_n_u8(0x03);
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_q2_K *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                auto vd = vdupq_n_f32(GGML_FP16_TO_FP32(x8[k][i].data.data.d));
++                auto vm = vdupq_n_f32(-GGML_FP16_TO_FP32(x8[k][i].data.data.dmin));
++                auto block_max = vdupq_n_f32(0);
++                for (int i128 = 0; i128 < 2; ++i128) {
++                    auto bits = vld1q_u8_x2(x8[k][i].qs+32*i128);
++                    xv[0].val[0] = vreinterpretq_s8_u8(vandq_u8(bits.val[0], ml));
++                    xv[0].val[1] = vreinterpretq_s8_u8(vandq_u8(bits.val[1], ml));
++                    xv[1].val[0] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[0], 2), ml));
++                    xv[1].val[1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[1], 2), ml));
++                    xv[2].val[0] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[0], 4), ml));
++                    xv[2].val[1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[1], 4), ml));
++                    xv[3].val[0] = vreinterpretq_s8_u8(vshrq_n_u8(bits.val[0], 6));
++                    xv[3].val[1] = vreinterpretq_s8_u8(vshrq_n_u8(bits.val[1], 6));
++                    for (int l = 0; l < 4; ++l) {
++                        auto d1 = vdupq_n_s8(x8[k][i].scales[8*i128 + 2*l + 0] & 0xf);
++                        auto d2 = vdupq_n_s8(x8[k][i].scales[8*i128 + 2*l + 1] & 0xf);
++                        auto q1_8 = vmulq_s8(d1, xv[l].val[0]);
++                        auto q2_8 = vmulq_s8(d2, xv[l].val[1]);
++                        auto q1_16_1 = vmovl_s8(vget_low_s8 (q1_8));
++                        auto q1_16_2 = vmovl_s8(vget_high_s8(q1_8));
++                        auto q2_16_1 = vmovl_s8(vget_low_s8 (q2_8));
++                        auto q2_16_2 = vmovl_s8(vget_high_s8(q2_8));
++                        float32x4x4_t f1{vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_16_1))), vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1_16_1))),
++                                         vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_16_2))), vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1_16_2)))};
++                        float32x4x4_t f2{vcvtq_f32_s32(vmovl_s16(vget_low_s16(q2_16_1))), vcvtq_f32_s32(vmovl_s16(vget_high_s16(q2_16_1))),
++                                         vcvtq_f32_s32(vmovl_s16(vget_low_s16(q2_16_2))), vcvtq_f32_s32(vmovl_s16(vget_high_s16(q2_16_2)))};
++
++                        auto m1 = vmulq_f32(vm, vcvtq_f32_s32(vdupq_n_s32(x8[k][i].scales[8*i128 + 2*l + 0] >> 4)));
++                        auto m2 = vmulq_f32(vm, vcvtq_f32_s32(vdupq_n_s32(x8[k][i].scales[8*i128 + 2*l + 1] >> 4)));
++
++                        for (int j = 0; j < 4; ++j) {
++                            f1.val[j] = vfmaq_f32(m1, vd, f1.val[j]);
++                            f2.val[j] = vfmaq_f32(m2, vd, f2.val[j]);
++                        }
++                        vst1q_f32_x4(f_values + 128*i128 + 32*l +  0, f1);
++                        vst1q_f32_x4(f_values + 128*i128 + 32*l + 16, f2);
++
++                        auto max1 = vmaxq_f32(vmaxq_f32(vabsq_f32(f1.val[0]), vabsq_f32(f1.val[1])), vmaxq_f32(vabsq_f32(f1.val[2]), vabsq_f32(f1.val[3])));
++                        auto max2 = vmaxq_f32(vmaxq_f32(vabsq_f32(f2.val[0]), vabsq_f32(f2.val[1])), vmaxq_f32(vabsq_f32(f2.val[2]), vabsq_f32(f2.val[3])));
++                        block_max = vmaxq_f32(block_max, vmaxq_f32(max1, max2));
++                    }
++                }
++                auto max = vmaxvq_f32(block_max);
++                float d = max / 127.f;
++                auto id = vdupq_n_f32(d != 0.0f ? 1/d : 0.0f);
++                y[i].d[k] = GGML_FP32_TO_FP16(d);
++                int16x8x4_t i16;
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    auto v1 = vld1q_f32_x4(f_values + 32*ib32 +  0);
++                    auto v2 = vld1q_f32_x4(f_values + 32*ib32 + 16);
++                    i16.val[0] = vcombine_s16(vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v1.val[0]))), vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v1.val[1]))));
++                    i16.val[1] = vcombine_s16(vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v1.val[2]))), vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v1.val[3]))));
++                    i16.val[2] = vcombine_s16(vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v2.val[0]))), vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v2.val[1]))));
++                    i16.val[3] = vcombine_s16(vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v2.val[2]))), vmovn_s32(vcvtnq_s32_f32(vmulq_f32(id, v2.val[3]))));
++                    vst1q_s8((int8_t *)block +  0, vcombine_s8(vmovn_s16(i16.val[0]), vmovn_s16(i16.val[1])));
++                    vst1q_s8((int8_t *)block + 16, vcombine_s8(vmovn_s16(i16.val[2]), vmovn_s16(i16.val[3])));
++                    auto q8 = (uint32_t *)y[i].qs + 64*ib32;
++                    for (int l = 0; l < 4; ++l) {
++                        q8[8*l + k +  0] = block[l + 0];
++                        q8[8*l + k + 32] = block[l + 4];
++                    }
++                }
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_q3_k_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_q3_K * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    uint32_t block[8];
++    int8x16x2_t xv[8];
++    uint32_t aux32[4];
++
++    auto ml  = vdupq_n_s8(0x03);
++    auto mh  = vdupq_n_s8(0x04);
++    auto mlu = vdupq_n_u8(0x03);
++    auto mhu = vdupq_n_u8(0x04);
++
++    union { int8x16_t vec; int8_t val[16]; } helper;
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_q3_K *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = GGML_FP16_TO_FP32(x8[k][i].d);
++                auto sc16 = (const uint16_t *)x8[k][i].scales;
++                uint32_t aux0 = sc16[0] | (sc16[1] << 16);
++                uint32_t aux1 = sc16[2] | (sc16[3] << 16);
++                uint32_t aux2 = sc16[4] | (sc16[5] << 16);
++                aux32[0] =  (aux0       & 0x0f0f0f0f) | ((aux2 << 4) & 0x30303030);
++                aux32[1] =  (aux1       & 0x0f0f0f0f) | ((aux2 << 2) & 0x30303030);
++                aux32[2] = ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030);
++                aux32[3] = ((aux1 >> 4) & 0x0f0f0f0f) | ((aux2 >> 2) & 0x30303030);
++                helper.vec = vaddq_s8(vld1q_s8((const int8_t *)aux32), vdupq_n_s8(-32));
++                auto hbits = vld1q_u8_x2(x8[k][i].hmask);
++                auto max_i16 = vdupq_n_s16(0);
++                for (int i128 = 0; i128 < 2; ++i128) {
++                    auto q2bits = vld1q_u8_x2(x8[k][i].qs + 32*i128);
++                    xv[4*i128+0].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q2bits.val[0], mlu), vandq_u8(vshlq_n_u8(hbits.val[0], 2), mhu))), mh);
++                    xv[4*i128+0].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q2bits.val[1], mlu), vandq_u8(vshlq_n_u8(hbits.val[1], 2), mhu))), mh);
++                    xv[4*i128+1].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[0], 2), mlu), vandq_u8(vshlq_n_u8(hbits.val[0], 1), mhu))), mh);
++                    xv[4*i128+1].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[1], 2), mlu), vandq_u8(vshlq_n_u8(hbits.val[1], 1), mhu))), mh);
++                    xv[4*i128+2].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[0], 4), mlu), vandq_u8(hbits.val[0], mhu))), mh);
++                    xv[4*i128+2].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[1], 4), mlu), vandq_u8(hbits.val[1], mhu))), mh);
++                    xv[4*i128+3].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q2bits.val[0], 6), vandq_u8(vshrq_n_u8(hbits.val[0], 1), mhu))), mh);
++                    xv[4*i128+3].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q2bits.val[1], 6), vandq_u8(vshrq_n_u8(hbits.val[1], 1), mhu))), mh);
++                    hbits.val[0] = vshrq_n_u8(hbits.val[0], 4);
++                    hbits.val[1] = vshrq_n_u8(hbits.val[1], 4);
++
++                    for (int l = 0; l < 4; ++l) {
++                        auto s1 = vdup_n_s8(helper.val[8*i128+2*l+0]);
++                        auto s2 = vdup_n_s8(helper.val[8*i128+2*l+1]);
++                        auto q16_1 = vmull_s8(s1, vget_low_s8 (xv[4*i128+l].val[0]));
++                        auto q16_2 = vmull_s8(s1, vget_high_s8(xv[4*i128+l].val[0]));
++                        auto q16_3 = vmull_s8(s2, vget_low_s8 (xv[4*i128+l].val[1]));
++                        auto q16_4 = vmull_s8(s2, vget_high_s8(xv[4*i128+l].val[1]));
++                        auto max1  = vmaxq_s16(vabsq_s16(q16_1), vabsq_s16(q16_2));
++                        auto max2  = vmaxq_s16(vabsq_s16(q16_3), vabsq_s16(q16_4));
++                        max_i16    = vmaxq_s16(max_i16, vmaxq_s16(max1, max2));
++                    }
++                }
++                auto imax16 = vmaxvq_s16(max_i16);
++                bool needs_scaling = true;
++                float dnew = float(imax16) / 127;
++                if (dnew < 1.f) {
++                    dnew = 1.f; needs_scaling = false;
++                }
++                d *= dnew;
++                y[i].d[k] = GGML_FP32_TO_FP16(d);
++                auto scale = vdupq_n_f32(std::abs(dnew) > 1e-9f ? 1/dnew : 0.f);
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    auto s1 = vdup_n_s8(helper.val[2*ib32+0]);
++                    auto s2 = vdup_n_s8(helper.val[2*ib32+1]);
++                    auto q16_1 = vmull_s8(s1, vget_low_s8 (xv[ib32].val[0]));
++                    auto q16_2 = vmull_s8(s1, vget_high_s8(xv[ib32].val[0]));
++                    auto q16_3 = vmull_s8(s2, vget_low_s8 (xv[ib32].val[1]));
++                    auto q16_4 = vmull_s8(s2, vget_high_s8(xv[ib32].val[1]));
++                    if (needs_scaling) {
++                        int32x4x4_t i1{vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q16_1))))),
++                                       vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_1))))),
++                                       vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q16_2))))),
++                                       vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_2)))))};
++                        int32x4x4_t i2{vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q16_3))))),
++                                       vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_3))))),
++                                       vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q16_4))))),
++                                       vcvtnq_s32_f32(vmulq_f32(scale, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_4)))))};
++                        int16x8x4_t i3{vcombine_s16(vmovn_s32(i1.val[0]), vmovn_s32(i1.val[1])),
++                                       vcombine_s16(vmovn_s32(i1.val[2]), vmovn_s32(i1.val[3])),
++                                       vcombine_s16(vmovn_s32(i2.val[0]), vmovn_s32(i2.val[1])),
++                                       vcombine_s16(vmovn_s32(i2.val[2]), vmovn_s32(i2.val[3]))};
++                        vst1q_s8((int8_t *)block +  0, vcombine_s8(vmovn_s16(i3.val[0]), vmovn_s16(i3.val[1])));
++                        vst1q_s8((int8_t *)block + 16, vcombine_s8(vmovn_s16(i3.val[2]), vmovn_s16(i3.val[3])));
++                    } else {
++                        vst1q_s8((int8_t *)block +  0, vcombine_s8(vmovn_s16(q16_1), vmovn_s16(q16_2)));
++                        vst1q_s8((int8_t *)block + 16, vcombine_s8(vmovn_s16(q16_3), vmovn_s16(q16_4)));
++                    }
++                    auto qs = (uint32_t *)y[i].qs + 64*ib32;
++                    for (int l = 0; l < 8; ++l) {
++                        qs[8*l + k] = block[l];
++                    }
++                }
++            }
++        }
++        y += nb;
++    }
++}
++
++static void iqk_convert_iq4_xs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    GGML_ASSERT(n%QK_K == 0);
++    GGML_ASSERT(nrc_x%8 == 0);
++
++    int nb = n/QK_K;
++
++    const block_iq4_xs * x8[8];
++
++    block_q8_k_r8 * y = (block_q8_k_r8 *)vy;
++
++    auto values = vld1q_s8(kvalues_iq4nl);
++
++    int8_t   ls[16];
++    float    dnew[8];
++    uint32_t block[8];
++    int8x16x2_t xv[8];
++
++    for (int ix = 0; ix < nrc_x; ix += 8) {
++        for (int k = 0; k < 8; ++k) x8[k] = (const block_iq4_xs *)((const char *)vx + (ix + k)*bx);
++        for (int i = 0; i < nb; ++i) {
++            for (int k = 0; k < 8; ++k) {
++                float d = GGML_FP16_TO_FP32(x8[k][i].d);
++                for (int ib32 = 0; ib32 < 8; ++ib32) {
++                    ls[2*ib32+0] = ls[2*ib32+1] = (((x8[k][i].scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((x8[k][i].scales_h >> 2*ib32) & 3) << 4)) - 32;
++                    auto bits = vld1q_u8(x8[k][i].qs + 16*ib32);
++                    xv[ib32].val[0] = vqtbl1q_s8(values, vandq_u8(bits, vdupq_n_u8(0xf)));
++                    xv[ib32].val[1] = vqtbl1q_s8(values, vshrq_n_u8(bits, 4));
++                }
++                dnew[k] = d * convert_to_q8_k_r8(1.f/127, xv, ls, block, (uint32_t *)y[i].qs + k);
++            }
++            vst1_f16((float16_t *)y[i].d + 0, vcvt_f16_f32(vld1q_f32(dnew+0)));
++            vst1_f16((float16_t *)y[i].d + 4, vcvt_f16_f32(vld1q_f32(dnew+4)));
++        }
++        y += nb;
++    }
++}
++
+ } // namespace
+ 
++bool iqk_convert_kquants_q8_k_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x) {
++    if (n % QK_K != 0 || nrc_x % 8 != 0) return false;
++    switch (type) {
++        case GGML_TYPE_Q2_K:   iqk_convert_q2_k_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_Q3_K:   iqk_convert_q3_k_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        case GGML_TYPE_IQ4_XS: iqk_convert_iq4_xs_q8_k_r8(n, vx, bx, vy, nrc_x); break;
++        default: return false;
++    }
++    return true;
++}
++
++void iqk_set_kernels_q8_k_r8(mul_mat_t * funcs) {
++    IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_k_r8_q8_k, funcs);
++}
++
+ bool iqk_set_kernels_kquants(int typeA, mul_mat_t * kernels) {
+     switch (typeA) {
+         case GGML_TYPE_Q2_K:   IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_K_T, DequantizerQ2K,   kernels); break;
