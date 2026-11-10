@@ -62,10 +62,10 @@ index 5be5221..032fe4c 100644
                      {
 diff --git a/src/ggml-cpu/legacy-q8.cpp b/src/ggml-cpu/legacy-q8.cpp
 new file mode 100644
-index 0000000..aa940ea
+index 0000000..0b7c74e
 --- /dev/null
 +++ b/src/ggml-cpu/legacy-q8.cpp
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,336 @@
 +// Q5_0 / Q4_1 / Q5_1 mul_mat through the Q8_0 GEMM kernels (see legacy-q8.h).
 +//
 +// Why: these types had no repack / AMX layout and their vec_dot or tinyBLAS kernels unpack the 4 / 5 bit weights
@@ -152,10 +152,12 @@ index 0000000..aa940ea
 +
 +bool has_min(int type) { return type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1; }
 +
-+// bit b of a byte -> byte 0x10 at position b (the qh expansion of the generic q5 kernels)
++// bit b of a byte -> byte 0x10 at position b (the qh expansion of the generic q5 kernels). Built at compile time:
++// a dynamic initializer here would run (vectorized with this variant's ISA) when ggml_backend_load_all opens the
++// library to score it, also on CPUs that cannot run the variant.
 +struct qh_table {
 +    uint64_t t[256];
-+    qh_table() {
++    constexpr qh_table() : t{} {
 +        for (int i = 0; i < 256; ++i) {
 +            uint64_t v = 0;
 +            for (int b = 0; b < 8; ++b) {
@@ -165,7 +167,7 @@ index 0000000..aa940ea
 +        }
 +    }
 +};
-+const qh_table k_qh;
++constexpr qh_table k_qh{};
 +
 +// one weight block -> 32 int8 values (block order), its fp16 scale and (Q4_1 / Q5_1) its fp16 min
 +inline void unpack_block(int type, const void * blk, int8_t * v, ggml_half * d, ggml_half * m) {
