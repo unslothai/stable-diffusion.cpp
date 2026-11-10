@@ -47,6 +47,7 @@ void ModelManager::free_prefetch_block(PrefetchBlock& block) {
         }
         staging_block->staged_tensors.clear();
         if (staging_block->buffer != nullptr) {
+            note_device_release(staging_block->buffer);
             ggml_backend_buffer_free(staging_block->buffer);
             staging_block->buffer = nullptr;
         }
