@@ -1,0 +1,496 @@
+diff --git a/src/ggml-cpu/legacy-q8.cpp b/src/ggml-cpu/legacy-q8.cpp
+index 0b7c74e..06e1065 100644
+--- a/src/ggml-cpu/legacy-q8.cpp
++++ b/src/ggml-cpu/legacy-q8.cpp
+@@ -13,6 +13,7 @@
+ #include "legacy-q8.h"
+ 
+ #include "ggml-cpu-impl.h"
++#include "simd-mappings.h"
+ #include "ggml-cpu.h"
+ #include "ggml.h"
+ #include "repack.h"
+@@ -22,7 +23,12 @@
+ #include "llamafile/sgemm.h"
+ #endif
+ 
++#if defined(__AVX2__)
++#include <immintrin.h>
++#endif
++
+ #include <atomic>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -47,6 +53,7 @@ constexpr int64_t k_min_rows  = 32;  // activation rows (batch); below this the
+ constexpr int     k_chunk     = 64;  // weight rows converted per step (multiple of 4)
+ 
+ uint64_t g_types = 0;
++bool g_convert_off = false;  // GGML_CPU_LEGACY_CONVERT=0: master path for every legacy type (tiled included)
+ int g_debug = 0;
+ std::atomic<uint64_t> g_seen{0};
+ std::once_flag g_once;
+@@ -57,6 +64,7 @@ void init_types() {
+     if (env != NULL) {
+         if (strcmp(env, "0") == 0 || strcmp(env, "none") == 0) {
+             mask = 0;
++            g_convert_off = true;
+         } else if (strcmp(env, "1") != 0 && strcmp(env, "all") != 0) {
+             uint64_t sel = 0;
+             char buf[256];
+@@ -168,11 +176,345 @@ size_t s_offset(int type, int64_t nb, int64_t n) {
+ #endif
+ }
+ 
++
++// ------------------------------------------------------------------------------------------------------------------
++// x86 AVX2 / AVX-VNNI / AVX512-VNNI: int8 tiled GEMM for the legacy types (Q8_0 / Q4_0 / Q5_0 / Q4_1 / Q5_1 / IQ4_NL).
++//
++// Why: their x86 GEMMs (tinyBLAS, the q4_0 / iq4_nl 8x8 repack, vec_dot) scale every 32-block product in float inside
++// the innermost loop, so on AVX2 they ran 1.4-2.5x slower than the K-quants on the tiled path (3072 x 3072 x 1024,
++// 4 threads, Zen 4: Q8_0 140 ms, Q5_0 190, Q5_1 203 vs Q4_K 76). Here the activation rows are interleaved once per
++// mul_mat into groups of 8 columns x 4 bytes, so one 4-byte weight broadcast feeds 8 columns: per 32-block the
++// integer dot product of each (weight row, column) pair is formed in an int32 lane (maddubs + madd on AVX2, dpbusd
++// with VNNI), then one float FMA applies d_w * d_a (plus m_w * s_a for Q4_1 / Q5_1) per block.
++//
++// Exactness: the weights are unpacked to their integer values (unsigned, offset removed through the activation block
++// sum, so q - 8 for Q4_0, q - 16 for Q5_0; Q8_0 / IQ4_NL signed, sign trick on AVX2, +128 offset with VNNI); every
++// block's integer dot product is the one vec_dot forms, only the float sum over blocks runs in another order.
++// GGML_CPU_LEGACY_TILED=0 turns it off (the tinyBLAS Q8_0 route above for Q5_0 / Q4_1 / Q5_1, master for the rest).
++#if (defined(__x86_64__) || defined(_M_X64)) && defined(__AVX2__)
++#define LQT_X86 1
++#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
++#define LQT_VNNI 1
++#endif
++
++constexpr int k_lqt_cols  = 8;   // activation columns per group (one ymm of int32 / float lanes)
++constexpr int k_lqt_rows  = 4;   // weight rows per micro kernel call
++constexpr int k_lqt_chunk = 64;  // weight rows unpacked per step
++// activation rows (batch) from which the tiled path runs; GGML_CPU_LEGACY_TILED_MIN_ROWS overrides both. 3072 x 3072
++// mul_mat, 8 threads, Xeon 8559C haswell build: tiled beat the master paths from 8 rows on (Q4_0 0.24 vs 0.38 ms repack
++// at 8 rows, Q5_1 0.37 vs 0.41) and Q8_0 tinyBLAS from 16 (0.51 vs 0.73 ms); below that the weight unpack dominates
++int64_t k_lqt_min_rows      = 8;
++int64_t k_lqt_min_rows_q8_0 = 16;
++
++struct lqt_ablk {
++    int8_t  q[k_lqt_cols * QK8_0]; // [k / 4][col][4]
++    float   d[k_lqt_cols];
++    int32_t sum[k_lqt_cols];       // sum of the 32 activation codes of the block
++    float   s[k_lqt_cols];         // Q8_1 s (Q4_1 / Q5_1)
++};
++static_assert(sizeof(lqt_ablk) % 32 == 0, "lqt_ablk must keep 32-byte alignment");
++
++uint64_t g_lqt_types = 0;
++std::once_flag g_lqt_once;
++
++void lqt_init() {
++    uint64_t mask = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q5_0) |
++                    (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_1) | (1ull << GGML_TYPE_IQ4_NL);
++    const char * env = getenv("GGML_CPU_LEGACY_TILED");
++    if (env != NULL) {
++        if (strcmp(env, "0") == 0 || strcmp(env, "none") == 0) {
++            mask = 0;
++        } else if (strcmp(env, "1") != 0 && strcmp(env, "all") != 0) {
++            uint64_t sel = 0;
++            char buf[256];
++            snprintf(buf, sizeof(buf), "%s", env);
++            for (char * tok = strtok(buf, ", "); tok != NULL; tok = strtok(NULL, ", ")) {
++                for (int t = 0; t < GGML_TYPE_COUNT && t < 64; ++t) {
++                    const char * name = ggml_type_name((enum ggml_type) t);
++                    if (name != NULL && strcmp(name, tok) == 0) {
++                        sel |= 1ull << t;
++                    }
++                }
++            }
++            mask &= sel;
++        }
++    }
++    g_lqt_types = mask;
++    const char * mr = getenv("GGML_CPU_LEGACY_TILED_MIN_ROWS");
++    if (mr != NULL && atoi(mr) > 0) {
++        k_lqt_min_rows = k_lqt_min_rows_q8_0 = atoi(mr);
++    }
++}
++
++bool lqt_enabled(int type) {
++    std::call_once(g_lqt_once, lqt_init);
++    return type >= 0 && type < 64 && ((g_lqt_types >> type) & 1);
++}
++
++bool lqt_signed(int type) { return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL; }
++
++const int8_t k_lqt_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
++
++// one weight row of nb blocks -> nb*32 bytes (block element order), d and (Q4_1 / Q5_1) m per block
++void lqt_unpack_row(int type, const uint8_t * row, int nb, uint8_t * q, float * d, float * m) {
++    const size_t bs = ggml_type_size((enum ggml_type) type);
++    for (int b = 0; b < nb; ++b) {
++        const uint8_t * blk = row + (size_t) b*bs;
++        uint8_t * o = q + (size_t) b*QK8_0;
++        ggml_half h;
++        memcpy(&h, blk, sizeof(h));
++        d[b] = GGML_CPU_FP16_TO_FP32(h);
++        switch (type) {
++            case GGML_TYPE_Q8_0: {
++                const block_q8_0 * x = (const block_q8_0 *) blk;
++#if defined(LQT_VNNI)
++                const __m256i v = _mm256_loadu_si256((const __m256i *) x->qs);
++                _mm256_storeu_si256((__m256i *) o, _mm256_xor_si256(v, _mm256_set1_epi8((char) 0x80)));
++#else
++                memcpy(o, x->qs, QK8_0);
++#endif
++            } break;
++            case GGML_TYPE_IQ4_NL: {
++                const block_iq4_nl * x = (const block_iq4_nl *) blk;
++                const __m128i lut = _mm_loadu_si128((const __m128i *) k_lqt_iq4nl);
++                const __m128i v   = _mm_loadu_si128((const __m128i *) x->qs);
++                __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(v, _mm_set1_epi8(0x0f)));
++                __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0f)));
++#if defined(LQT_VNNI)
++                lo = _mm_xor_si128(lo, _mm_set1_epi8((char) 0x80));
++                hi = _mm_xor_si128(hi, _mm_set1_epi8((char) 0x80));
++#endif
++                _mm_storeu_si128((__m128i *) o, lo);
++                _mm_storeu_si128((__m128i *) (o + 16), hi);
++            } break;
++            case GGML_TYPE_Q4_0:
++            case GGML_TYPE_Q4_1: {
++                const uint8_t * qs = type == GGML_TYPE_Q4_0 ? ((const block_q4_0 *) blk)->qs : ((const block_q4_1 *) blk)->qs;
++                if (type == GGML_TYPE_Q4_1) {
++                    memcpy(&h, blk + 2, sizeof(h));
++                    m[b] = GGML_CPU_FP16_TO_FP32(h);
++                }
++                const __m128i v = _mm_loadu_si128((const __m128i *) qs);
++                _mm_storeu_si128((__m128i *) o,        _mm_and_si128(v, _mm_set1_epi8(0x0f)));
++                _mm_storeu_si128((__m128i *) (o + 16), _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0f)));
++            } break;
++            default: { // Q5_0 / Q5_1
++                const uint8_t * qs;
++                uint32_t qh;
++                if (type == GGML_TYPE_Q5_0) {
++                    qs = ((const block_q5_0 *) blk)->qs; memcpy(&qh, ((const block_q5_0 *) blk)->qh, 4);
++                } else {
++                    qs = ((const block_q5_1 *) blk)->qs; memcpy(&qh, ((const block_q5_1 *) blk)->qh, 4);
++                    memcpy(&h, blk + 2, sizeof(h));
++                    m[b] = GGML_CPU_FP16_TO_FP32(h);
++                }
++                uint8_t hb[32];
++                for (int t = 0; t < 4; ++t) { uint64_t e = k_qh.t[(qh >> (8*t)) & 0xff]; memcpy(hb + 8*t, &e, 8); }
++                const __m128i v = _mm_loadu_si128((const __m128i *) qs);
++                _mm_storeu_si128((__m128i *) o,        _mm_or_si128(_mm_and_si128(v, _mm_set1_epi8(0x0f)), _mm_loadu_si128((const __m128i *) hb)));
++                _mm_storeu_si128((__m128i *) (o + 16), _mm_or_si128(_mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0f)),
++                                                                     _mm_loadu_si128((const __m128i *) (hb + 16))));
++            } break;
++        }
++    }
++}
++
++inline __m256 lqt_fma(__m256 a, __m256 b, __m256 c) {
++#if defined(__FMA__)
++    return _mm256_fmadd_ps(a, b, c);
++#else
++    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
++#endif
++}
++
++// 4 weight rows (q at row stride wrow bytes, d / m at stride nb) x one group of 8 columns over all nb blocks.
++// SIGNED: signed weight bytes, AVX2 sign trick; else unsigned bytes with BIAS removed via the activation block sum.
++template <bool SIGNED, bool MINS, int BIAS>
++void lqt_kernel(const uint8_t * q, size_t wrow, const float * d, const float * m, int nb, const lqt_ablk * A, float * out) {
++    __m256 facc[k_lqt_rows];
++    for (int r = 0; r < k_lqt_rows; ++r) facc[r] = _mm256_setzero_ps();
++#if !defined(LQT_VNNI)
++    const __m256i ones = _mm256_set1_epi16(1);
++#endif
++    for (int b = 0; b < nb; ++b) {
++        const lqt_ablk & a = A[b];
++        __m256i iacc[k_lqt_rows];
++        for (int r = 0; r < k_lqt_rows; ++r) iacc[r] = _mm256_setzero_si256();
++        const uint8_t * qb = q + (size_t) b*QK8_0;
++        for (int kg = 0; kg < QK8_0/4; ++kg) {
++            const __m256i c = _mm256_load_si256((const __m256i *) (a.q + kg*32));
++            for (int r = 0; r < k_lqt_rows; ++r) {
++                int32_t w4;
++                memcpy(&w4, qb + r*wrow + kg*4, 4);
++                const __m256i wb = _mm256_set1_epi32(w4);
++#if defined(LQT_VNNI)
++                static_assert(!SIGNED || BIAS == 0, "");
++#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
++                iacc[r] = _mm256_dpbusd_epi32(iacc[r], wb, c);
++#else
++                iacc[r] = _mm256_dpbusd_avx_epi32(iacc[r], wb, c);
++#endif
++#else
++                __m256i p;
++                if constexpr (SIGNED) {
++                    p = _mm256_maddubs_epi16(_mm256_sign_epi8(wb, wb), _mm256_sign_epi8(c, wb));
++                } else {
++                    p = _mm256_maddubs_epi16(wb, c);
++                }
++                iacc[r] = _mm256_add_epi32(iacc[r], _mm256_madd_epi16(p, ones));
++#endif
++            }
++        }
++        if constexpr (BIAS != 0) {
++            const __m256i bv = _mm256_mullo_epi32(_mm256_load_si256((const __m256i *) a.sum), _mm256_set1_epi32(BIAS));
++            for (int r = 0; r < k_lqt_rows; ++r) iacc[r] = _mm256_sub_epi32(iacc[r], bv);
++        }
++        const __m256 da = _mm256_load_ps(a.d);
++        for (int r = 0; r < k_lqt_rows; ++r) {
++            facc[r] = lqt_fma(_mm256_cvtepi32_ps(iacc[r]), _mm256_mul_ps(_mm256_set1_ps(d[r*nb + b]), da), facc[r]);
++        }
++        if constexpr (MINS) {
++            const __m256 sv = _mm256_load_ps(a.s);
++            for (int r = 0; r < k_lqt_rows; ++r) {
++                facc[r] = lqt_fma(_mm256_set1_ps(m[r*nb + b]), sv, facc[r]);
++            }
++        }
++    }
++    for (int r = 0; r < k_lqt_rows; ++r) _mm256_storeu_ps(out + r*k_lqt_cols, facc[r]);
++}
++
++typedef void (*lqt_kernel_t)(const uint8_t *, size_t, const float *, const float *, int, const lqt_ablk *, float *);
++
++lqt_kernel_t lqt_pick(int type) {
++    switch (type) {
++        case GGML_TYPE_Q4_0: return lqt_kernel<false, false, 8>;
++        case GGML_TYPE_Q5_0: return lqt_kernel<false, false, 16>;
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_1: return lqt_kernel<false, true, 0>;
++#if defined(LQT_VNNI)
++        default:             return lqt_kernel<false, false, 128>;  // Q8_0 / IQ4_NL stored + 128
++#else
++        default:             return lqt_kernel<true, false, 0>;
++#endif
++    }
++}
++
++size_t lqt_wsize(int64_t ne00, int64_t n) {
++    const int64_t ng = (n + k_lqt_cols - 1) / k_lqt_cols;
++    return (size_t) ng * (ne00 / QK8_0) * sizeof(lqt_ablk) + 64;
++}
++
++void lqt_prepare(int type, int64_t ne00, int64_t n, const void * act, void * work, int ith, int nth) {
++    const int64_t nb   = ne00 / QK8_0;
++    const int64_t ng   = (n + k_lqt_cols - 1) / k_lqt_cols;
++    const size_t  ab   = act_block_size(type);
++    const size_t  arow = (size_t) nb * ab;
++    lqt_ablk * A = (lqt_ablk *) GGML_PAD((uintptr_t) work, 64);
++    const bool mins = has_min(type);
++    for (int64_t g = ng*ith/nth; g < ng*(ith + 1)/nth; ++g) {
++        for (int64_t b = 0; b < nb; ++b) {
++            lqt_ablk & o = A[g*nb + b];
++            for (int c = 0; c < k_lqt_cols; ++c) {
++                const int64_t j = g*k_lqt_cols + c;
++                if (j >= n) {
++                    o.d[c] = 0.0f; o.sum[c] = 0; o.s[c] = 0.0f;
++                    for (int kg = 0; kg < QK8_0/4; ++kg) memset(o.q + kg*32 + c*4, 0, 4);
++                    continue;
++                }
++                const uint8_t * blk = (const uint8_t *) act + j*arow + b*ab;
++                ggml_half h;
++                memcpy(&h, blk, sizeof(h));
++                o.d[c] = GGML_CPU_FP16_TO_FP32(h);
++                if (mins) {
++                    memcpy(&h, blk + 2, sizeof(h));
++                    o.s[c] = GGML_CPU_FP16_TO_FP32(h);
++                } else {
++                    o.s[c] = 0.0f;
++                }
++                const int8_t * qs = act_qs(type, blk);
++                int32_t sum = 0;
++                for (int e = 0; e < QK8_0; ++e) sum += qs[e];
++                o.sum[c] = sum;
++                for (int kg = 0; kg < QK8_0/4; ++kg) memcpy(o.q + kg*32 + c*4, qs + kg*4, 4);
++            }
++        }
++    }
++}
++
++void lqt_compute(int type, int64_t ne00, int64_t ne01, int64_t n, const void * w, size_t w_stride, const void * work,
++                 float * dst, int64_t dst_stride, int ith, int nth) {
++    const int nb = (int) (ne00 / QK8_0);
++    const int64_t ng = (n + k_lqt_cols - 1) / k_lqt_cols;
++    const lqt_ablk * A = (const lqt_ablk *) GGML_PAD((uintptr_t) work, 64);
++    const lqt_kernel_t kern = lqt_pick(type);
++
++    const int64_t nband = ne01 / k_lqt_rows;
++    const int64_t r_begin = k_lqt_rows*(nband*ith/nth);
++    const int64_t r_end   = k_lqt_rows*(nband*(ith + 1)/nth);
++
++    const size_t wrow  = (size_t) nb * QK8_0;
++    const size_t q_sz  = GGML_PAD(wrow * k_lqt_chunk, 64);
++    const size_t dm_sz = GGML_PAD((size_t) nb * k_lqt_chunk * sizeof(float), 64);
++    auto & buf = tls_buf();
++    if (buf.size() < q_sz + 2*dm_sz + 64) {
++        buf.resize(q_sz + 2*dm_sz + 64);
++    }
++    uint8_t * q = (uint8_t *) GGML_PAD((uintptr_t) buf.data(), 64);
++    float   * d = (float *) (q + q_sz);
++    float   * m = (float *) ((uint8_t *) d + dm_sz);
++    alignas(32) float out[k_lqt_rows * k_lqt_cols];
++
++    for (int64_t r0 = r_begin; r0 < r_end; r0 += k_lqt_chunk) {
++        const int nr = (int) (r_end - r0 < k_lqt_chunk ? r_end - r0 : k_lqt_chunk);
++        for (int r = 0; r < nr; ++r) {
++            lqt_unpack_row(type, (const uint8_t *) w + (r0 + r)*w_stride, nb, q + r*wrow, d + (size_t) r*nb, m + (size_t) r*nb);
++        }
++        for (int64_t g = 0; g < ng; ++g) {
++            const int ncol = (int) (n - g*k_lqt_cols < k_lqt_cols ? n - g*k_lqt_cols : k_lqt_cols);
++            for (int rb = 0; rb < nr; rb += k_lqt_rows) {
++                kern(q + rb*wrow, wrow, d + (size_t) rb*nb, m + (size_t) rb*nb, nb, A + g*nb, out);
++                for (int c = 0; c < ncol; ++c) {
++                    float * o = dst + (g*k_lqt_cols + c)*dst_stride + r0 + rb;
++                    for (int r = 0; r < k_lqt_rows; ++r) o[r] = out[r*k_lqt_cols + c];
++                }
++            }
++        }
++    }
++}
++#endif // x86 && __AVX2__
++
+ } // namespace
+ 
+ extern "C" {
+ 
++#if defined(LQT_X86)
++// the tiled x86 path takes this mul_mat (same answer on every thread)
++static bool lqt_applies(int type, int64_t ne00, int64_t ne01, int64_t n) {
++    std::call_once(g_once, init_types);
++    return !g_convert_off && lqt_enabled(type) && ne00 % QK8_0 == 0 && ne01 % k_lqt_rows == 0 &&
++           n >= (type == GGML_TYPE_Q8_0 ? k_lqt_min_rows_q8_0 : k_lqt_min_rows);
++}
++#endif
++
++bool ggml_cpu_legacy_tiled_prefers(int type) {
++#if defined(LQT_X86)
++    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_IQ4_NL) {
++        return false;
++    }
++    std::call_once(g_once, init_types);
++    return !g_convert_off && lqt_enabled(type);
++#else
++    (void) type;
++    return false;
++#endif
++}
++
+ bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n) {
++#if defined(LQT_X86)
++    if (lqt_applies(type, ne00, ne01, n)) {
++        return true;
++    }
++#endif
+ #if defined(LQ8_ARM) || defined(LQ8_X86)
+     return type_enabled(type) && ne00 % QK8_0 == 0 && ne01 % 4 == 0 && n >= k_min_rows;
+ #else
+@@ -182,6 +524,11 @@ bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n)
+ }
+ 
+ size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n) {
++#if defined(LQT_X86)
++    if (lqt_applies(type, ne00, 4, n)) {
++        return lqt_wsize(ne00, n);
++    }
++#endif
+     const int64_t nb = ne00 / QK8_0;
+     size_t sz = s_offset(type, nb, n);
+     if (has_min(type)) {
+@@ -191,6 +538,12 @@ size_t ggml_cpu_legacy_q8_wsize(int type, int64_t ne00, int64_t n) {
+ }
+ 
+ void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void * act, void * work, int ith, int nth) {
++#if defined(LQT_X86)
++    if (lqt_applies(type, ne00, 4, n)) {
++        lqt_prepare(type, ne00, n, act, work, ith, nth);
++        return;
++    }
++#endif
+     const int64_t nb   = ne00 / QK8_0;
+     const size_t  arow = (size_t) nb * act_block_size(type);
+     const uint8_t * a  = (const uint8_t *) act;
+@@ -240,6 +593,16 @@ void ggml_cpu_legacy_q8_prepare(int type, int64_t ne00, int64_t n, const void *
+ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int type, int64_t ne00, int64_t ne01, int64_t n,
+                                 const void * w, size_t w_stride, const void * act, const void * work,
+                                 float * dst, int64_t dst_stride, int ith, int nth) {
++#if defined(LQT_X86)
++    if (lqt_applies(type, ne00, ne01, n)) {
++        if (ith == 0 && g_debug && !((g_seen.fetch_or(1ull << type) >> type) & 1)) {
++            fprintf(stderr, "ggml-cpu legacy q8 gemm: first %s mul_mat (%lld x %lld x %lld, %d threads, tiled)\n",
++                    ggml_type_name((enum ggml_type) type), (long long) ne01, (long long) n, (long long) ne00, nth);
++        }
++        lqt_compute(type, ne00, ne01, n, w, w_stride, work, dst, dst_stride, ith, nth);
++        return;
++    }
++#endif
+     const int nb = (int) (ne00 / QK8_0);
+     const size_t wblk = ggml_type_size((enum ggml_type) type);
+     const bool mins = has_min(type);
+@@ -317,7 +680,7 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+                 }
+             }
+         }
+-#else
++#elif defined(LQ8_X86)
+         struct ggml_compute_params p1 = *params;
+         p1.ith = 0;
+         p1.nth = 1;
+@@ -328,6 +691,9 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+         if (mins) {
+             add_min_terms(mt, nr, nb, s, 0, n, dst + r0, dst_stride);
+         }
++#else
++        GGML_UNUSED(act); GGML_UNUSED(dst); GGML_UNUSED(dst_stride); GGML_UNUSED(s);
++        GGML_ABORT("legacy q8 path without a kernel on this build");  // unreachable: applies() is false here
+ #endif
+     }
+     (void) params;
+diff --git a/src/ggml-cpu/legacy-q8.h b/src/ggml-cpu/legacy-q8.h
+index 0a5f908..ea054c9 100644
+--- a/src/ggml-cpu/legacy-q8.h
++++ b/src/ggml-cpu/legacy-q8.h
+@@ -17,6 +17,11 @@ struct ggml_compute_params;
+ // Q8_1 activation block sum afterwards. Nothing is kept resident: the converted chunk lives in a per-thread buffer.
+ // GGML_CPU_LEGACY_CONVERT=0 turns it off (master path), or a comma list of ggml type names limits it to those types.
+ 
++// true when CPU_REPACK should leave weights of this type (Q4_0 / IQ4_NL) in the plain buffer for the x86 tiled legacy
++// GEMM, which measured faster than the q4_0 / iq4_nl 8x8 repack at diffusion batch sizes (same rule shape as
++// ggml_cpu_tiled_prefers); false on other builds and with GGML_CPU_LEGACY_TILED=0 / GGML_CPU_LEGACY_CONVERT=0
++bool ggml_cpu_legacy_tiled_prefers(int type);
++
+ // true when the path takes a mul_mat with these weights (same answer on every thread)
+ bool ggml_cpu_legacy_q8_applies(int type, int64_t ne00, int64_t ne01, int64_t n);
+ 
+diff --git a/src/ggml-cpu/repack.cpp b/src/ggml-cpu/repack.cpp
+index c02953b..6480428 100644
+--- a/src/ggml-cpu/repack.cpp
++++ b/src/ggml-cpu/repack.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "repack.h"
+ #include "tiled/tiled.h"
++#include "legacy-q8.h"
+ 
+ #if defined(__GNUC__)
+ #pragma GCC diagnostic ignored "-Woverlength-strings"
+@@ -4973,7 +4974,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+ #endif
+ 
+     if (cur->type == GGML_TYPE_Q4_0) {
+-        if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
++        // x86: the tiled legacy GEMM (plain buffer) measured faster than this repack (see legacy-q8.cpp)
++        if ((ggml_cpu_has_avx2() && !ggml_cpu_legacy_tiled_prefers(cur->type)) ||
++            (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
+             if (cur->ne[1] % 8 == 0) {
+                 return &q4_0_8x8_q8_0;
+             }
+@@ -5072,7 +5075,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+             }
+         }
+     } else if (cur->type == GGML_TYPE_IQ4_NL) {
+-        if (ggml_cpu_has_avx2()) {
++        if (ggml_cpu_has_avx2() && !ggml_cpu_legacy_tiled_prefers(cur->type)) {
+             if (cur->ne[1] % 8 == 0) {
+                 return &iq4_nl_8x8_q8_0;
+             }
