@@ -82,7 +82,7 @@ index 478cf1a..e9278b3 100644
  
  #endif // IQK_IMPLEMENT
 diff --git a/src/ggml-cpu/iqk/iqk_gemm.cpp b/src/ggml-cpu/iqk/iqk_gemm.cpp
-index 6551112..748989b 100644
+index 6551112..6259c34 100644
 --- a/src/ggml-cpu/iqk/iqk_gemm.cpp
 +++ b/src/ggml-cpu/iqk/iqk_gemm.cpp
 @@ -32,10 +32,12 @@
@@ -98,7 +98,13 @@ index 6551112..748989b 100644
  
  namespace {
  
-@@ -59,6 +61,9 @@ std::atomic<int64_t>  g_iqk_count[64];
+@@ -56,9 +58,15 @@ constexpr uint64_t k_iqk_built_types = 0;
+ 
+ std::atomic<uint64_t> g_iqk_types{k_iqk_built_types};
+ std::atomic<int64_t>  g_iqk_count[64];
++#if defined(IQK_IMPLEMENT) && defined(__aarch64__)
++std::atomic<int64_t>  g_iqk_conv_count[64];  // Q8_K_R8 conversions (aarch64), for the debug line
++#endif
  int                   g_iqk_debug = 0;
  bool                  g_iqk_first = false;
  bool                  g_iqk_auto  = false;
@@ -108,7 +114,7 @@ index 6551112..748989b 100644
  
  #ifdef IQK_IMPLEMENT
  
-@@ -115,6 +120,47 @@ void iqk_mul_mat_NxM(const mul_mat_t * funcs, int n, const void * vx, size_t bx,
+@@ -115,6 +123,47 @@ void iqk_mul_mat_NxM(const mul_mat_t * funcs, int n, const void * vx, size_t bx,
      }
  }
  
@@ -156,7 +162,7 @@ index 6551112..748989b 100644
  #endif // IQK_IMPLEMENT
  
  } // namespace
-@@ -149,6 +195,13 @@ void ggml_cpu_iqk_init(void) {
+@@ -149,6 +198,13 @@ void ggml_cpu_iqk_init(void) {
          mask &= sel;
      }
      g_iqk_types.store(mask);
@@ -170,7 +176,7 @@ index 6551112..748989b 100644
      const char * dbg = getenv("GGML_CPU_IQK_DEBUG");
      g_iqk_debug = dbg != NULL ? atoi(dbg) : 0;
      if (g_iqk_debug) {
-@@ -158,6 +211,9 @@ void ggml_cpu_iqk_init(void) {
+@@ -158,6 +214,9 @@ void ggml_cpu_iqk_init(void) {
              if ((mask >> t) & 1) fprintf(stderr, " %s", ggml_type_name((enum ggml_type) t));
          }
          fprintf(stderr, "\n");
@@ -180,7 +186,7 @@ index 6551112..748989b 100644
      }
  }
  
-@@ -212,6 +268,37 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+@@ -212,6 +271,38 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
      if (ne00 % QK_K != 0 || Nx <= 0 || Ny <= 0 || Nx > INT32_MAX || Ny > INT32_MAX || ne00 > INT32_MAX) {
          return false;
      }
@@ -190,7 +196,8 @@ index 6551112..748989b 100644
 +        mul_mat_t funcs[IQK_MAX_NY];
 +        iqk_set_kernels_q8_k_r8(funcs);
 +        if (ith == 0) {
-+            const int64_t prev = g_iqk_count[type].fetch_add(1, std::memory_order_relaxed);
++            g_iqk_count[type].fetch_add(1, std::memory_order_relaxed);
++            const int64_t prev = g_iqk_conv_count[type].fetch_add(1, std::memory_order_relaxed);
 +            if (g_iqk_debug && prev == 0) {
 +                fprintf(stderr, "ggml-cpu iqk gemm: first %s mul_mat (%lld x %lld x %lld, %d threads, via Q8_K_R8)\n",
 +                        ggml_type_name((enum ggml_type) type), (long long) Nx, (long long) Ny, (long long) ne00, nth);
