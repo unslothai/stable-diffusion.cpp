@@ -40,6 +40,12 @@ namespace sd {
             if (total == 0) {
                 return 0;
             }
+            // What this process allocated since a confirmation came out of the size it confirmed.
+            if (verified_bytes_ > 0 && tracked_bytes > verified_tracked_) {
+                const size_t consumed = tracked_bytes - verified_tracked_;
+                verified_bytes_       = consumed >= verified_bytes_ ? 0 : verified_bytes_ - consumed;
+            }
+            verified_tracked_ = tracked_bytes;
             const size_t used      = total - std::min(reported_free, total);
             const size_t untracked = used > tracked_bytes ? used - tracked_bytes : 0;
             const uint64_t pending = released_ - released_at_anchor_;
@@ -77,6 +83,7 @@ namespace sd {
         uint64_t released_at_anchor_ = 0;
         int64_t first_release_ms_   = -1;
         size_t verified_bytes_      = 0;
+        size_t verified_tracked_    = 0;  // tracked bytes at the last reading
     };
 }
 
