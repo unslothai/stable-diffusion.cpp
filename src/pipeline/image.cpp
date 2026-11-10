@@ -207,7 +207,6 @@ namespace sd::pipeline {
         if (version == VERSION_P_H3_IMAGE) {
             return pack_ph3_image_latent(image, previous);
         }
-        // MiniMax-H3-Image has no audio stream: the latent is one 24-channel frame.
         auto video = image.dim() == 4 ? image.unsqueeze(2) : image;
         GGML_ASSERT(video.dim() == 5 && video.shape()[2] == 1 && video.shape()[3] == 24 && video.shape()[4] == 1);
         return video;

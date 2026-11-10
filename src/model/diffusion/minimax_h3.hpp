@@ -45,7 +45,6 @@ namespace MiniMaxH3 {
         float norm_eps                   = 1e-5f;
         float qk_norm_eps                = 1e-5f;
         float final_norm_eps             = 1e-5f;
-        // MiniMax-H3-Image has no audio stream: no audio_patch_proj / audio_out.
         bool audio_enabled = true;
         // Distilled per-step output heads stacked in final_layer.video_out (head 0 whole, heads 1.. stored as
         // offsets from head 0), one per step of a fixed sigma grid.

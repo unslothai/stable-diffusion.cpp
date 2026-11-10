@@ -172,7 +172,6 @@ static inline bool sd_version_is_minimax_h3(SDVersion version) {
     return version == VERSION_MINIMAX_H3 || version == VERSION_P_H3_IMAGE || version == VERSION_MINIMAX_H3_IMAGE;
 }
 
-// Single-frame image pipelines on the MiniMax-H3 DiT.
 static inline bool sd_version_is_h3_image(SDVersion version) {
     return version == VERSION_P_H3_IMAGE || version == VERSION_MINIMAX_H3_IMAGE;
 }
