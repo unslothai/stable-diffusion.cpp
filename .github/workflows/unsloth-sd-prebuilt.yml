@@ -279,7 +279,9 @@ jobs:
             runner: macos-15-intel
             arch: x86_64
             # BLAS off: its matmul path was only measured on Apple Silicon.
-            defines: "-DSD_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+            # GGML_METAL=OFF is what turns Metal off: SD_METAL only ever turns it on, and ggml
+            # defaults it on for Apple, so SD_METAL=OFF alone still built and shipped libggml-metal.
+            defines: "-DSD_METAL=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
             gate: "true"
             cpu_floor: x64
           - label: Linux-Ubuntu-22.04-x86_64
