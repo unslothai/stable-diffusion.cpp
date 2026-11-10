@@ -2184,12 +2184,8 @@ bool ModelManager::fits_compute_backend_capacity(
     if (capacity.requires_reclamation || !capacity.fits()) {
         return false;
     }
-    // An unconfirmed credit that decides the check goes through ensure_compute_backend_capacity, which confirms it.
-    if (capacity.release_credit_bytes == 0 || request.compute_backend == nullptr ||
-        capacity.available_device_bytes - capacity.release_credit_bytes >= capacity.required_device_bytes) {
-        return true;
-    }
-    return release_credit(ggml_backend_get_device(request.compute_backend)).verified(capacity.required_device_bytes);
+    // A credit that decides this check is confirmed here too (one allocation), not only on the reclaiming path.
+    return request.compute_backend == nullptr || release_credit_holds(request.compute_backend, capacity);
 }
 
 bool ModelManager::ensure_compute_backend_capacity(
