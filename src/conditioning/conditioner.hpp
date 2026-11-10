@@ -159,8 +159,7 @@ public:
     virtual void set_scale_overrides(float linear_scale, float attn_scale) {}
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
     virtual void runner_end() {}
-    // False only when get_learned_condition never reads ConditionerParams::width / height:
-    // the conditioning cache then reuses one entry across output sizes.
+    // False only if get_learned_condition never reads params width/height (cache then ignores size).
     virtual bool condition_uses_size() const { return true; }
 };
 

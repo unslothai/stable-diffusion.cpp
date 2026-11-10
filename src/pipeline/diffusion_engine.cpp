@@ -1899,8 +1899,7 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
     return true;
 }
 
-// The LoRAs that can change a conditioning: all of them unless one provably touches only denoiser / VAE tensors
-// and the conditioner holds none of those.
+// Drops LoRAs that touch only denoiser/VAE tensors, unless the conditioner holds such tensors.
 std::vector<ModelManager::LoraSpec> StableDiffusionGGML::conditioning_relevant_loras(const std::vector<ModelManager::LoraSpec>& loras) {
     if (ConditioningCache::strict() || model_manager == nullptr || !cond_stage_model ||
         (loras.empty() && conditioning_loras_.empty())) {
