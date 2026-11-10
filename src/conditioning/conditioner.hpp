@@ -159,11 +159,17 @@ public:
     virtual void set_scale_overrides(float linear_scale, float attn_scale) {}
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
     virtual void runner_end() {}
+    // False only when get_learned_condition never reads ConditionerParams::width / height:
+    // the conditioning cache then reuses one entry across output sizes.
+    virtual bool condition_uses_size() const { return true; }
 };
 
 // ldm.modules.encoders.modules.FrozenCLIPEmbedder
 // Ref: https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/cad87bf4e3e0b0a759afa94e933527c3123d59bc/modules/sd_hijack_clip.py#L283
 struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
+    // Only SDXL's ADM vector encodes the output size.
+    bool condition_uses_size() const override { return sd_version_is_sdxl(version); }
+
     SDVersion version = VERSION_SD1;
     std::shared_ptr<Tokenizer> tokenizer;
     std::shared_ptr<CLIPTextModelRunner> text_model;
@@ -646,6 +652,8 @@ struct FrozenCLIPVisionEmbedder : public GGMLRunner {
 };
 
 struct SD3CLIPEmbedder : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     std::shared_ptr<Tokenizer> clip_l_tokenizer;
     std::shared_ptr<Tokenizer> clip_g_tokenizer;
     T5UniGramTokenizer t5_tokenizer;
@@ -1091,6 +1099,8 @@ struct SD3CLIPEmbedder : public Conditioner {
 };
 
 struct FluxCLIPEmbedder : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     std::shared_ptr<Tokenizer> clip_l_tokenizer;
     T5UniGramTokenizer t5_tokenizer;
     std::shared_ptr<CLIPTextModelRunner> clip_l;
@@ -1387,6 +1397,8 @@ struct FluxCLIPEmbedder : public Conditioner {
 };
 
 struct T5CLIPEmbedder : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     T5UniGramTokenizer t5_tokenizer;
     std::shared_ptr<T5Runner> t5;
     size_t chunk_len = 512;
@@ -1634,6 +1646,8 @@ struct T5CLIPEmbedder : public Conditioner {
 };
 
 struct MiniT2IConditioner : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     T5UniGramTokenizer tokenizer;
     std::shared_ptr<T5Runner> t5;
     size_t prompt_length = 256;
@@ -1755,6 +1769,8 @@ struct MiniT2IConditioner : public Conditioner {
 
 // Cosmos3 encodes the prompt inside its transformer; the transfer pipeline tokenizes it.
 struct Cosmos3Conditioner : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     SDCondition get_learned_condition(int n_threads, const ConditionerParams& conditioner_params) override {
         SD_UNUSED(n_threads);
         SD_UNUSED(conditioner_params);
@@ -1771,6 +1787,8 @@ struct Cosmos3Conditioner : public Conditioner {
 };
 
 struct SenseNovaU1Conditioner : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     static constexpr size_t kMaxPromptTokens = 12288;
     SenseNovaU1Tokenizer tokenizer;
 
@@ -1839,6 +1857,8 @@ struct SenseNovaU1Conditioner : public Conditioner {
 };
 
 struct AnimaConditioner : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     std::shared_ptr<Tokenizer> qwen_tokenizer;
     T5UniGramTokenizer t5_tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
@@ -1990,6 +2010,8 @@ struct AnimaConditioner : public Conditioner {
 };
 
 struct LLMEmbedder : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     SDVersion version;
     std::shared_ptr<Tokenizer> tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
@@ -3384,6 +3406,8 @@ struct LLMEmbedder : public Conditioner {
 };
 
 struct MingImageEmbedder : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     std::shared_ptr<Tokenizer> tokenizer;
     std::shared_ptr<MingImageTE::MingImageTextRunner> text_model;
     const std::string prefix = "text_encoders.llm";
@@ -3719,6 +3743,8 @@ struct LLaDAImageEmbedder : public Conditioner {
 };
 
 struct LTXAVEmbedder : public Conditioner {
+    bool condition_uses_size() const override { return false; }
+
     static constexpr int64_t kHiddenSize = 3840;
     static constexpr int64_t kNumStates  = 49;
     static constexpr int64_t kMinLength  = 1024;
