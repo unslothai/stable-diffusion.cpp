@@ -2005,11 +2005,11 @@ bool ModelManager::release_credit_holds(ggml_backend_t backend, const CapacityCh
     }
     // The credit decides this check: confirm it once with a real allocation of what is needed.
     auto& credit = release_credit(ggml_backend_get_device(backend));
-    if (credit.verified()) {
+    if (credit.verified(capacity.required_device_bytes)) {
         return true;
     }
     if (try_device_allocation(backend, capacity.required_device_bytes)) {
-        credit.set_verified();
+        credit.set_verified(capacity.required_device_bytes);
         return true;
     }
     LOG_WARN("model manager: %s could not allocate %.2f MB; not counting %.2f MB of released memory as free",
@@ -2189,7 +2189,7 @@ bool ModelManager::fits_compute_backend_capacity(
         capacity.available_device_bytes - capacity.release_credit_bytes >= capacity.required_device_bytes) {
         return true;
     }
-    return release_credit(ggml_backend_get_device(request.compute_backend)).verified();
+    return release_credit(ggml_backend_get_device(request.compute_backend)).verified(capacity.required_device_bytes);
 }
 
 bool ModelManager::ensure_compute_backend_capacity(

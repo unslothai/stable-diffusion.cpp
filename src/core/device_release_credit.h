@@ -16,7 +16,8 @@ namespace sd {
     // window_ms bounds how long a release can be credited, so growth that really is another process taking
     // memory stops being credited; 0 disables the credit. Credits below MIN_CREDIT_BYTES are ignored: allocator
     // pools growing while the process releases a little look the same, and the capacity margin covers them.
-    // A caller that relies on a credit confirms it once with a real allocation (set_verified) or drops it (reject).
+    // A caller that relies on a credit confirms it with a real allocation of what it needs (set_verified) or drops it
+    // (reject); a later, larger request needs its own confirmation.
     class DeviceReleaseCredit {
     public:
         static constexpr size_t MIN_CREDIT_BYTES = 256ULL * 1024ULL * 1024ULL;
@@ -55,17 +56,17 @@ namespace sd {
                 anchor_untracked_   = untracked;
                 released_at_anchor_ = released_;
                 first_release_ms_   = -1;
-                verified_           = false;
+                verified_bytes_     = 0;
             }
             return result;
         }
 
-        bool verified() const { return verified_; }
-        void set_verified() { verified_ = true; }
+        bool verified(size_t bytes) const { return bytes <= verified_bytes_; }
+        void set_verified(size_t bytes) { verified_bytes_ = std::max(verified_bytes_, bytes); }
         // The next fresh reading re-anchors, so nothing released so far is credited again.
         void reject() {
-            anchored_ = false;
-            verified_ = false;
+            anchored_       = false;
+            verified_bytes_ = 0;
         }
 
     private:
@@ -75,7 +76,7 @@ namespace sd {
         uint64_t released_          = 0;
         uint64_t released_at_anchor_ = 0;
         int64_t first_release_ms_   = -1;
-        bool verified_              = false;
+        size_t verified_bytes_      = 0;
     };
 }
 
