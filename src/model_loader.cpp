@@ -603,6 +603,11 @@ SDVersion ModelLoader::get_sd_version() const {
             }
             return VERSION_MINIMAX_H3;
         }
+        if (tensor_storage.name.find("model.diffusion_model.video_patch_proj.weight") != std::string::npos &&
+            tensor_storage_map.count("model.diffusion_model.blocks.0.attn.qkv_proj.weight")) {
+            // MiniMax-H3-Image: the H3 DiT without its audio stream (no audio_patch_proj / audio_out).
+            return VERSION_MINIMAX_H3_IMAGE;
+        }
         if (name == "model.diffusion_model.y_embedder.layer_pool.weight" &&
             tensor_storage_map.count("model.diffusion_model.modulation_cores.adaln_img.weight")) {
             return VERSION_IRIS;

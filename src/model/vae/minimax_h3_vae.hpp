@@ -1,7 +1,6 @@
 #ifndef __SD_MODEL_VAE_MINIMAX_H3_VAE_HPP__
 #define __SD_MODEL_VAE_MINIMAX_H3_VAE_HPP__
 
-#include <thread>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -10,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -27,6 +27,16 @@ namespace MiniMaxH3VAE {
     struct MiniMaxH3VAEConfig {
         int num_layers   = 36;
         int patch_size_t = 4;
+        // MiniMax-H3-Image: a 1024-wide (16 x 64 heads) decoder with (h, w) RoPE over half of each head, a 2D
+        // post_quant_conv and an unused mask_token. The video and P-H3-Image decoders are 2048 wide with (t, h, w) RoPE.
+        int decoder_dim         = 2048;
+        bool decoder_2d         = false;
+        bool has_mask_token     = false;
+        bool post_quant_conv_2d = false;
+
+        int decoder_heads() const {
+            return decoder_dim / 64;
+        }
 
         static MiniMaxH3VAEConfig detect_from_weights(const String2TensorStorage& tensors, const std::string& prefix) {
             MiniMaxH3VAEConfig config;
@@ -46,7 +56,18 @@ namespace MiniMaxH3VAE {
                 if (layers > 0) {
                     config.num_layers = layers;
                 }
-                LOG_VERBOSE("minimax_h3_vae: layers=%d, patch_size_t=%d", config.num_layers, config.patch_size_t);
+                config.decoder_dim = static_cast<int>(proj->second.ne[0]);
+                if (config.decoder_dim % 64 != 0) {
+                    throw std::runtime_error("unsupported MiniMax-H3 VAE decoder width");
+                }
+                // A 5D Conv3d weight is stored folded to [1, 1, 1, 24 * 24]; the 2D one stays [1, 1, 24, 24].
+                auto post_quant           = tensors.find(prefix + ".post_quant_conv.weight");
+                config.post_quant_conv_2d = post_quant != tensors.end() && post_quant->second.ne[2] == 24 &&
+                                            post_quant->second.ne[3] == 24;
+                config.decoder_2d         = config.post_quant_conv_2d;
+                config.has_mask_token     = config.patch_size_t != 1 || tensors.count(prefix + ".decoder.mask_token");
+                LOG_VERBOSE("minimax_h3_vae: layers=%d, patch_size_t=%d, dim=%d, 2d=%d",
+                            config.num_layers, config.patch_size_t, config.decoder_dim, config.decoder_2d ? 1 : 0);
             }
             return config;
         }
@@ -311,11 +332,12 @@ namespace MiniMaxH3VAE {
     }
 
     struct DecoderAttention : public GGMLBlock {
-        static constexpr int num_head = 32;
         static constexpr int head_dim = 64;
-        static constexpr int dim      = num_head * head_dim;
+        int num_head;
+        int dim;
 
-        DecoderAttention() {
+        explicit DecoderAttention(int dim)
+            : num_head(dim / head_dim), dim(dim) {
             blocks["to_qkv"] = std::make_shared<Linear>(dim, dim * 3, true);
             blocks["to_out"] = std::make_shared<Linear>(dim, dim, true);
         }
@@ -474,12 +496,10 @@ namespace MiniMaxH3VAE {
     };
 
     struct DecoderFeedForward : public GGMLBlock {
-        static constexpr int dim       = 2048;
-        static constexpr int kInnerDim = dim * 4;
-
-        DecoderFeedForward() {
-            blocks["w1"] = std::make_shared<Linear>(dim, kInnerDim * 2, true);
-            blocks["w2"] = std::make_shared<Linear>(kInnerDim, dim, true);
+        explicit DecoderFeedForward(int dim) {
+            const int inner_dim = dim * 4;
+            blocks["w1"]        = std::make_shared<Linear>(dim, inner_dim * 2, true);
+            blocks["w2"]        = std::make_shared<Linear>(inner_dim, dim, true);
         }
 
         // fused_glu is kept for the fast-path callers; upstream (#2250) now always uses the native GLU.
@@ -493,13 +513,14 @@ namespace MiniMaxH3VAE {
     };
 
     struct DecoderBlock : public GGMLBlock {
-        static constexpr int dim = 2048;
+        int dim;
 
-        DecoderBlock() {
+        explicit DecoderBlock(int dim)
+            : dim(dim) {
             blocks["norm1"] = std::make_shared<RMSNorm>(dim, 1e-5f);
-            blocks["attn"]  = std::make_shared<DecoderAttention>();
+            blocks["attn"]  = std::make_shared<DecoderAttention>(dim);
             blocks["norm2"] = std::make_shared<RMSNorm>(dim, 1e-5f);
-            blocks["ff"]    = std::make_shared<DecoderFeedForward>();
+            blocks["ff"]    = std::make_shared<DecoderFeedForward>(dim);
         }
 
         void init_params(ggml_context* ctx,
@@ -535,18 +556,19 @@ namespace MiniMaxH3VAE {
     };
 
     struct Decoder : public GGMLBlock {
-        static constexpr int dim = 2048;
+        int dim;
         int num_layers;
         static constexpr int num_register_tokens = 4;
         static constexpr int patch_size          = 16;
         int patch_size_t;
+        bool has_mask_token;
 
         explicit Decoder(const MiniMaxH3VAEConfig& config)
-            : num_layers(config.num_layers), patch_size_t(config.patch_size_t) {
+            : dim(config.decoder_dim), num_layers(config.num_layers), patch_size_t(config.patch_size_t), has_mask_token(config.has_mask_token) {
             blocks["x_embedder"] = std::make_shared<Linear>(24, dim, true);
             for (int i = 0; i < num_layers; ++i) {
                 blocks["transformer_blocks." + std::to_string(i)] =
-                    std::make_shared<DecoderBlock>();
+                    std::make_shared<DecoderBlock>(dim);
             }
             blocks["norm_out"] = std::make_shared<LayerNorm>(dim, 1e-5f, true, true);
             blocks["proj_out"] = std::make_shared<Linear>(dim,
@@ -564,7 +586,7 @@ namespace MiniMaxH3VAE {
                                                            GGML_TYPE_F32,
                                                            dim,
                                                            num_register_tokens);
-            if (patch_size_t != 1) {
+            if (has_mask_token) {
                 params["mask_token"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, dim);
             }
         }
@@ -652,16 +674,21 @@ namespace MiniMaxH3VAE {
 
     struct MiniMaxH3VideoVAE : public GGMLBlock {
         bool single_frame;
+        bool post_quant_conv_2d;
 
         explicit MiniMaxH3VideoVAE(const MiniMaxH3VAEConfig& config)
-            : single_frame(config.patch_size_t == 1) {
+            : single_frame(config.patch_size_t == 1), post_quant_conv_2d(config.post_quant_conv_2d) {
             blocks["encoder"]         = std::make_shared<Encoder>();
             blocks["quant_conv"]      = std::make_shared<Conv3d>(48,
                                                                  48,
                                                                  std::tuple{1, 1, 1});
-            blocks["post_quant_conv"] = std::make_shared<Conv3d>(24,
-                                                                 24,
-                                                                 std::tuple{1, 1, 1});
+            if (post_quant_conv_2d) {
+                blocks["post_quant_conv"] = std::make_shared<Conv2d>(24, 24, std::pair{1, 1});
+            } else {
+                blocks["post_quant_conv"] = std::make_shared<Conv3d>(24,
+                                                                     24,
+                                                                     std::tuple{1, 1, 1});
+            }
             blocks["decoder"]         = std::make_shared<Decoder>(config);
         }
 
@@ -685,15 +712,116 @@ namespace MiniMaxH3VAE {
                             ggml_tensor* pixel_std,
                             ggml_tensor* rope_a = nullptr,
                             ggml_tensor* rope_b = nullptr) {
-            auto post_quant = std::dynamic_pointer_cast<Conv3d>(blocks["post_quant_conv"]);
             auto decoder    = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
-            auto pixels     = decoder->forward(ctx, post_quant->forward(ctx, latent), pe, rope_a, rope_b);
+            if (post_quant_conv_2d) {
+                // [W, H, T, C * N] with T = 1 decodes as [W, H, C, N] through the 2D 1x1 convolution.
+                GGML_ASSERT(latent->ne[2] == 1);
+                auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["post_quant_conv"]);
+                auto x    = ggml_reshape_4d(ctx->ggml_ctx, latent, latent->ne[0], latent->ne[1], 24, latent->ne[3] / 24);
+                x         = conv->forward(ctx, x);
+                latent    = ggml_reshape_4d(ctx->ggml_ctx, x, latent->ne[0], latent->ne[1], 1, latent->ne[3]);
+            } else {
+                latent = std::dynamic_pointer_cast<Conv3d>(blocks["post_quant_conv"])->forward(ctx, latent);
+            }
+            auto pixels     = decoder->forward(ctx, latent, pe, rope_a, rope_b);
             pixels          = ggml_add(ctx->ggml_ctx,
                                        ggml_mul(ctx->ggml_ctx, pixels, pixel_std),
                                        pixel_mean);
             return ggml_clamp(ctx->ggml_ctx, pixels, 0.f, 1.f);
         }
     };
+
+    // The MiniMax-H3-Image release tiles its VAE as diffusers' AutoencoderKLMiniMaxH3Image does: the fewest
+    // `tile`-pixel tiles whose overlaps are all >= `min_overlap`, the slack spread round-robin over the overlaps in
+    // `ratio` steps, every overlap blended linearly over its whole width.
+    struct ImageTileAxis {
+        std::vector<int64_t> starts;
+        int64_t size = 0;
+        std::vector<int64_t> overlaps;
+    };
+
+    static ImageTileAxis split_image_tiles(int64_t length, int64_t tile, int64_t min_overlap, int64_t ratio) {
+        ImageTileAxis axis;
+        if (tile >= length) {
+            axis.starts = {0};
+            axis.size   = length;
+            return axis;
+        }
+        int64_t count = (length + tile - 1) / tile;
+        while (tile * count - min_overlap * (count - 1) - length < 0) {
+            ++count;
+        }
+        axis.overlaps.assign(static_cast<size_t>(count - 1), min_overlap);
+        int64_t remaining = tile * count - min_overlap * (count - 1) - length;
+        for (int64_t i = 0; i < remaining / ratio; ++i) {
+            axis.overlaps[static_cast<size_t>(i % (count - 1))] += ratio;
+        }
+        axis.starts = {0};
+        for (int64_t i = 0; i + 1 < count; ++i) {
+            axis.starts.push_back(axis.starts.back() + tile - axis.overlaps[static_cast<size_t>(i)]);
+        }
+        axis.size = tile;
+        return axis;
+    }
+
+    // tiles[i][j] are [W, H, C...] tensors (C... flattened into planes) of the tile at row i, column j.
+    static sd::Tensor<float> stitch_image_tiles(const std::vector<std::vector<sd::Tensor<float>>>& tiles,
+                                                const ImageTileAxis& rows,
+                                                const ImageTileAxis& cols,
+                                                int64_t out_w,
+                                                int64_t out_h) {
+        std::vector<int64_t> shape = tiles[0][0].shape();
+        shape[0]                   = out_w;
+        shape[1]                   = out_h;
+        sd::Tensor<float> output(shape);
+        const int64_t planes = tiles[0][0].numel() / (tiles[0][0].shape()[0] * tiles[0][0].shape()[1]);
+        int64_t y0           = 0;
+        for (size_t i = 0; i < tiles.size(); ++i) {
+            int64_t x0     = 0;
+            int64_t keep_h = 0;
+            for (size_t j = 0; j < tiles[i].size(); ++j) {
+                const auto& tile     = tiles[i][j];
+                const int64_t tw     = tile.shape()[0];
+                const int64_t th     = tile.shape()[1];
+                const int64_t ext_h  = i > 0 ? std::min({rows.overlaps[i - 1], tiles[i - 1][j].shape()[1], th}) : 0;
+                const int64_t ext_w  = j > 0 ? std::min({cols.overlaps[j - 1], tiles[i][j - 1].shape()[0], tw}) : 0;
+                const int64_t crop_h = i + 1 < tiles.size() ? th - rows.overlaps[i] : th;
+                const int64_t crop_w = j + 1 < tiles[i].size() ? tw - cols.overlaps[j] : tw;
+                keep_h               = crop_h;
+                for (int64_t p = 0; p < planes; ++p) {
+                    const float* cur = tile.data() + p * tw * th;
+                    auto vertical    = [&](int64_t x, int64_t y) {
+                        float value = cur[y * tw + x];
+                        if (y < ext_h) {
+                            const auto& above = tiles[i - 1][j];
+                            const int64_t aw  = above.shape()[0];
+                            const int64_t ah  = above.shape()[1];
+                            const float w     = static_cast<float>(y) / ext_h;
+                            value             = above.data()[p * aw * ah + (ah - ext_h + y) * aw + x] * (1.f - w) + value * w;
+                        }
+                        return value;
+                    };
+                    for (int64_t y = 0; y < crop_h; ++y) {
+                        float* dst = output.data() + p * out_w * out_h + (y0 + y) * out_w + x0;
+                        for (int64_t x = 0; x < crop_w; ++x) {
+                            float value = vertical(x, y);
+                            if (x < ext_w) {
+                                const auto& left = tiles[i][j - 1];
+                                const int64_t lw = left.shape()[0];
+                                const int64_t lh = left.shape()[1];
+                                const float w    = static_cast<float>(x) / ext_w;
+                                value            = left.data()[p * lw * lh + y * lw + (lw - ext_w + x)] * (1.f - w) + value * w;
+                            }
+                            dst[x] = value;
+                        }
+                    }
+                }
+                x0 += crop_w;
+            }
+            y0 += keep_h;
+        }
+        return output;
+    }
 
     struct MiniMaxH3VideoVAERunner : public VAE {
         MiniMaxH3VAEConfig config;
@@ -735,6 +863,9 @@ namespace MiniMaxH3VAE {
         }
 
         std::string get_desc() override {
+            if (config.decoder_2d) {
+                return "minimax_h3_image_vae";
+            }
             return config.patch_size_t == 1 ? "p_h3_image_vae" : "minimax_h3_video_vae";
         }
 
@@ -844,12 +975,67 @@ namespace MiniMaxH3VAE {
             return current;
         }
 
+        bool use_release_image_tiles(bool circular_x, bool circular_y) const {
+            static const bool enabled = env_int("SD_H3_IMAGE_VAE_TILES", 1) != 0;
+            return config.decoder_2d && enabled && !circular_x && !circular_y;
+        }
+
+        // One graph per tile of the release layout (256-pixel tiles, >= 64-pixel overlaps), stitched as the release
+        // stitches them. `decode` tiles latents [W, H, 1, 24], `encode` pixels [W, H, 1, 3].
+        sd::Tensor<float> compute_release_image_tiles(int n_threads, const sd::Tensor<float>& input, bool decode_graph) {
+            constexpr int64_t tile_pixels = 256;
+            constexpr int64_t min_overlap = 64;
+            const int64_t ratio           = get_scale_factor();
+            const int64_t in_scale        = decode_graph ? ratio : 1;
+            const int64_t width           = input.shape()[0] * in_scale;
+            const int64_t height          = input.shape()[1] * in_scale;
+            auto rows                     = split_image_tiles(height, tile_pixels, min_overlap, ratio);
+            auto cols                     = split_image_tiles(width, tile_pixels, min_overlap, ratio);
+            std::vector<std::vector<sd::Tensor<float>>> tiles(rows.starts.size());
+            for (size_t i = 0; i < rows.starts.size(); ++i) {
+                for (size_t j = 0; j < cols.starts.size(); ++j) {
+                    auto piece = sd::ops::slice(input, 1, rows.starts[i] / in_scale, (rows.starts[i] + rows.size) / in_scale);
+                    piece      = sd::ops::slice(piece, 0, cols.starts[j] / in_scale, (cols.starts[j] + cols.size) / in_scale);
+                    auto out   = _compute(n_threads, piece, decode_graph);
+                    if (out.empty()) {
+                        LOG_ERROR("MiniMax-H3-Image VAE %s failed on tile %zu,%zu", decode_graph ? "decode" : "encode", i, j);
+                        return {};
+                    }
+                    if (!decode_graph && out.shape()[2] > 1) {
+                        out = sd::ops::slice(out, 2, out.shape()[2] - 1, out.shape()[2]);
+                    }
+                    tiles[i].push_back(std::move(out));
+                }
+            }
+            if (decode_graph) {
+                return stitch_image_tiles(tiles, rows, cols, width, height);
+            }
+            auto scale_axis = [&](ImageTileAxis axis) {
+                for (auto& v : axis.starts) {
+                    v /= ratio;
+                }
+                for (auto& v : axis.overlaps) {
+                    v /= ratio;
+                }
+                axis.size /= ratio;
+                return axis;
+            };
+            return stitch_image_tiles(tiles, scale_axis(rows), scale_axis(cols), width / ratio, height / ratio);
+        }
+
         sd::Tensor<float> encode(int n_threads,
                                  const sd::Tensor<float>& x,
                                  sd_tiling_params_t tiling_params,
                                  bool circular_x = false,
                                  bool circular_y = false) override {
             auto input  = ensure_video_shape(x);
+            if (input.shape()[2] == 1 && use_release_image_tiles(circular_x, circular_y)) {
+                int64_t t0  = ggml_time_ms();
+                auto result = compute_release_image_tiles(n_threads, input, false);
+                runner_end();
+                LOG_VERBOSE("computing vae encode graph completed, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
+                return result;
+            }
             auto tiling = resolve_tiling_params(tiling_params);
             if (config.patch_size_t == 1 && input.shape()[2] != 1) {
                 LOG_ERROR("P-H3-Image VAE encodes single-frame images only");
@@ -902,6 +1088,15 @@ namespace MiniMaxH3VAE {
             if (config.patch_size_t == 1 && input.shape()[2] != 1) {
                 LOG_ERROR("P-H3-Image VAE decodes single-frame latents only");
                 return {};
+            }
+            if (input.shape()[2] == 1 && use_release_image_tiles(circular_x, circular_y)) {
+                int64_t t0  = ggml_time_ms();
+                auto result = compute_release_image_tiles(n_threads, input, true);
+                runner_end();
+                if (!silent) {
+                    LOG_VERBOSE("computing vae decode graph completed, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
+                }
+                return result;
             }
             if (input.shape()[2] == 1) {
                 auto decoded = VAE::decode(n_threads,
@@ -1288,13 +1483,20 @@ namespace MiniMaxH3VAE {
             for (int i = 0; i < 5; ++i) {
                 ids.push_back({0.f, 0.f, 0.f});
             }
-            auto values = Rope::embed_nd(ids,
-                                         1,
-                                         100.f,
-                                         std::vector<int>{16, 16, 16});
+            if (config.decoder_2d) {
+                // (h, w) only, 16 channels each: rope_dim_ratio 0.5 of the 64-channel heads.
+                for (auto& id : ids) {
+                    id.erase(id.begin());
+                }
+            }
+            const int axes = config.decoder_2d ? 2 : 3;
+            auto values    = Rope::embed_nd(ids,
+                                            1,
+                                            100.f,
+                                            std::vector<int>(axes, 16));
             return sd::Tensor<float>({2,
                                       2,
-                                      24,
+                                      8 * axes,
                                       static_cast<int64_t>(ids.size())},
                                      std::move(values));
         }

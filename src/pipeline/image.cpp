@@ -174,6 +174,45 @@ namespace sd::pipeline {
         return packed;
     }
 
+    // MiniMax-H3-Image keeps a reference's own size while its short edge is within [min_edge, max_edge], else
+    // scales it to the nearer bound, both sides rounded to 32; crop_to_patches drops a ragged edge for the VAE.
+    static sd::Tensor<float> bound_h3_image_short_edge(const sd::Tensor<float>& image,
+                                                       int64_t min_edge,
+                                                       int64_t max_edge,
+                                                       bool crop_to_patches) {
+        constexpr int64_t multiple = 32;
+        const int64_t width        = image.shape()[0];
+        const int64_t height       = image.shape()[1];
+        const int64_t short_edge   = std::min(width, height);
+        sd::Tensor<float> result   = image;
+        if (short_edge < min_edge || short_edge > max_edge) {
+            const double scale       = static_cast<double>(short_edge < min_edge ? min_edge : max_edge) / short_edge;
+            const int64_t new_width  = std::max<int64_t>(multiple, static_cast<int64_t>(std::nearbyint(width * scale / multiple)) * multiple);
+            const int64_t new_height = std::max<int64_t>(multiple, static_cast<int64_t>(std::nearbyint(height * scale / multiple)) * multiple);
+            result                   = sd::ops::interpolate(image, {new_width, new_height, image.shape()[2], image.shape()[3]}, sd::ops::InterpolateMode::Lanczos);
+        }
+        if (crop_to_patches) {
+            const int64_t crop_width  = result.shape()[0] / multiple * multiple;
+            const int64_t crop_height = result.shape()[1] / multiple * multiple;
+            if (crop_width != result.shape()[0] || crop_height != result.shape()[1]) {
+                result = sd::ops::slice(sd::ops::slice(result, 0, 0, crop_width), 1, 0, crop_height);
+            }
+        }
+        return result;
+    }
+
+    static sd::Tensor<float> pack_h3_image_latent(SDVersion version,
+                                                  const sd::Tensor<float>& image,
+                                                  const sd::Tensor<float>& previous = {}) {
+        if (version == VERSION_P_H3_IMAGE) {
+            return pack_ph3_image_latent(image, previous);
+        }
+        // MiniMax-H3-Image has no audio stream: the latent is one 24-channel frame.
+        auto video = image.dim() == 4 ? image.unsqueeze(2) : image;
+        GGML_ASSERT(video.dim() == 5 && video.shape()[2] == 1 && video.shape()[3] == 24 && video.shape()[4] == 1);
+        return video;
+    }
+
     static std::optional<ImageGenerationLatents> prepare_image_generation_latents(StableDiffusionGGML* sd,
                                                                                   const sd_img_gen_params_t* sd_img_gen_params,
                                                                                   GenerationRequest* request,
@@ -359,6 +398,8 @@ namespace sd::pipeline {
             if (sd->version == VERSION_P_H3_IMAGE) {
                 auto resized = resize_ph3_reference(ref_images[i], int64_t(request->width) * request->height);
                 ref_latent   = sd->encode_first_stage(resized);
+            } else if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
+                ref_latent = sd->encode_first_stage(bound_h3_image_short_edge(ref_images[i], 1024, 2048, true));
             } else if (ref_image_params.resize_before_vae && !sd_version_is_pid(sd->version)) {
                 LOG_VERBOSE("auto resize ref images");
                 double vae_width;
@@ -486,14 +527,15 @@ namespace sd::pipeline {
         }
 
         ImageGenerationLatents latents;
-        if (sd->version == VERSION_P_H3_IMAGE) {
-            init_latent = pack_ph3_image_latent(init_latent);
+        if (sd_version_is_h3_image(sd->version)) {
+            init_latent = pack_h3_image_latent(sd->version, init_latent);
             latent_mask = latent_mask.unsqueeze(2);
             for (size_t i = 0; i < ref_latents.size(); ++i) {
                 latents.minimax_reference_blocks.push_back({MiniMaxH3ReferenceKind::IMAGE, static_cast<int32_t>(i), -1});
             }
             for (auto& image : ref_images) {
-                image = resize_ph3_reference(image, 1000000);
+                image = sd->version == VERSION_P_H3_IMAGE ? resize_ph3_reference(image, 1000000)
+                                                          : bound_h3_image_short_edge(image, 1024, 1024, false);
             }
         }
         latents.init_latent              = std::move(init_latent);
@@ -548,7 +590,7 @@ namespace sd::pipeline {
         if (cond.c_concat.empty() && ref_image_params.pass_to_dit) {
             cond.c_concat = latents->concat_latent;  // TODO: optimize
         }
-        if (sd->version == VERSION_P_H3_IMAGE && ref_image_params.pass_to_dit) {
+        if (sd_version_is_h3_image(sd->version) && ref_image_params.pass_to_dit) {
             cond.c_reference_blocks = latents->minimax_reference_blocks;
         }
 
@@ -595,7 +637,7 @@ namespace sd::pipeline {
             if (uncond.c_concat.empty() && ref_image_params.pass_to_dit) {
                 uncond.c_concat = latents->concat_latent;  // TODO: optimize
             }
-            if (sd->version == VERSION_P_H3_IMAGE && ref_image_params.pass_to_dit) {
+            if (sd_version_is_h3_image(sd->version) && ref_image_params.pass_to_dit) {
                 uncond.c_reference_blocks = latents->minimax_reference_blocks;
             }
         }
@@ -1099,7 +1141,7 @@ namespace sd::pipeline {
                 sd->rng->manual_seed(cur_seed);
                 sd->sampler_rng->manual_seed(cur_seed);
 
-                auto hires_source          = sd->version == VERSION_P_H3_IMAGE
+                auto hires_source          = sd_version_is_h3_image(sd->version)
                                                  ? sd::ops::slice(final_latents[b], 3, 0, 24)
                                                  : final_latents[b];
                 sd::Tensor<float> upscaled = upscale_hires_latent(sd,
@@ -1109,8 +1151,8 @@ namespace sd::pipeline {
                 if (upscaled.empty()) {
                     return false;
                 }
-                if (sd->version == VERSION_P_H3_IMAGE) {
-                    upscaled = pack_ph3_image_latent(upscaled, final_latents[b]);
+                if (sd_version_is_h3_image(sd->version)) {
+                    upscaled = pack_h3_image_latent(sd->version, upscaled, final_latents[b]);
                 }
 
                 sd::Tensor<float> noise = sd::randn_like<float>(upscaled, sd->rng);
