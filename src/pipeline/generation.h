@@ -42,11 +42,18 @@ namespace sd::pipeline {
         SDCondition img_uncond;
     };
 
+    // Frees CPU-resident encoder weights when the denoiser and VAE would not fit beside them (SD_TE_RELEASE=0 disables).
+    void release_conditioner_host_weights_if_needed(StableDiffusionGGML* sd);
+
     struct ConditionerRunnerEndOnExit {
         Conditioner* conditioner = nullptr;
+        StableDiffusionGGML* sd  = nullptr;
         ~ConditionerRunnerEndOnExit() {
             if (conditioner != nullptr) {
                 conditioner->runner_end();
+            }
+            if (sd != nullptr) {
+                release_conditioner_host_weights_if_needed(sd);
             }
         }
     };

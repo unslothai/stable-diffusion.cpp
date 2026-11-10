@@ -18,6 +18,7 @@
 #include "core/ggml_graph_cut.h"
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
+#include "core/host_memory.h"
 #include "core/layer_split_partition.h"
 #include "core/probe/conv_direct.h"
 #include "core/probe/flash_attn.h"
@@ -31,6 +32,7 @@
 #include "model_builders.h"
 #include "model_loader.h"
 #include "model_manager.h"
+#include "pipeline/generation.h"
 #include "stable-diffusion.h"
 
 #include "conditioning/conditioner.hpp"
@@ -1899,8 +1901,52 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
 }
 
 SDCondition StableDiffusionGGML::get_learned_condition(const ConditionerParams& params) {
+    if (!conditioning_cache_->contains(params)) {
+        release_host_weights_if_needed({ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::VAE},
+                                       {ModelComponent::Conditioner},
+                                       "text encoding");
+    }
     return conditioning_cache_->get(*cond_stage_model, n_threads, params);
 }
+
+static bool host_weight_release_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SD_TE_RELEASE");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+void StableDiffusionGGML::release_host_weights_if_needed(const std::set<ModelComponent>& release,
+                                                         const std::set<ModelComponent>& next,
+                                                         const char* next_phase) {
+    if (model_manager == nullptr || !host_weight_release_enabled()) {
+        return;
+    }
+    const size_t pending = model_manager->pending_host_params_bytes(next);
+    if (pending == 0) {
+        return;
+    }
+    const int64_t available = sd_available_host_memory_bytes();
+    // Compute buffers come on top of the weights; same reserve as the auto-fit planner.
+    const int64_t need = (int64_t)pending + 2048ll * 1024 * 1024;
+    if (available < 0 || need <= available) {
+        return;
+    }
+    const size_t released = model_manager->release_host_params(release);
+    if (released > 0) {
+        LOG_INFO("released %.2f MB of idle weights from RAM before %s (needs %.2f MB, %.2f MB available; SD_TE_RELEASE=0 keeps them)",
+                 released / (1024.0 * 1024.0), next_phase, need / (1024.0 * 1024.0), available / (1024.0 * 1024.0));
+    }
+}
+
+namespace sd::pipeline {
+    void release_conditioner_host_weights_if_needed(StableDiffusionGGML* sd) {
+        sd->release_host_weights_if_needed({ModelComponent::Conditioner},
+                                           {ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::VAE},
+                                           "denoising");
+    }
+}  // namespace sd::pipeline
 
 void StableDiffusionGGML::reset_generation_extensions() {
     for (auto& extension : generation_extensions) {

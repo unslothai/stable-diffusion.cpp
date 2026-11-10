@@ -82,6 +82,12 @@ public:
         entries_.clear();
     }
 
+    bool contains(const ConditionerParams& params) const {
+        return capacity_ > 0 && std::any_of(entries_.begin(), entries_.end(), [&](const Entry& entry) {
+                   return same_params(entry.params, params);
+               });
+    }
+
     SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& params) {
         if (capacity_ == 0) {
             return conditioner.get_learned_condition(n_threads, params);

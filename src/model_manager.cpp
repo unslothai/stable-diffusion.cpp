@@ -1776,6 +1776,69 @@ void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>&
     }
     release_params_storage_blocks(false, &target_states);
 }
+size_t ModelManager::pending_host_params_bytes(const std::set<ModelComponent>& components) const {
+    size_t bytes = 0;
+    std::unordered_set<const ggml_tensor*> seen;
+    for (const auto& state : tensor_states_) {
+        if (state == nullptr || state->tensor == nullptr || state->tensor->view_src != nullptr ||
+            components.count(state->component) == 0 || state->loaded_to_params_backend ||
+            !seen.insert(state->tensor).second) {
+            continue;
+        }
+        const ggml_backend_t target = state->residency_mode == ResidencyMode::Disk ? state->compute_backend
+                                                                                   : state->params_backend;
+        if (sd_backend_is_cpu(target)) {
+            bytes += ggml_nbytes(state->tensor);
+        }
+    }
+    return bytes;
+}
+
+size_t ModelManager::release_host_params(const std::set<ModelComponent>& components) {
+    // Mapped blocks keep their mapping after release (see ensure_compute_backend_capacity).
+    std::unordered_set<TensorState*> mapped_states;
+    for (const auto& block : params_storage_blocks_) {
+        if (!block->mmap_tensor_stores.empty()) {
+            mapped_states.insert(block->states.begin(), block->states.end());
+        }
+    }
+    std::unordered_set<TensorState*> targets;
+    for (const auto& owned : tensor_states_) {
+        TensorState* state = owned.get();
+        if (state != nullptr && state->tensor != nullptr && state->tensor->view_src == nullptr &&
+            components.count(state->component) != 0 &&
+            state->residency_mode == ResidencyMode::ParamBackend && sd_backend_is_cpu(state->params_backend) &&
+            state->pin_count == 0 && !state->staged_to_compute_backend && state->loaded_to_params_backend &&
+            !state->sources.empty() && state->applied_lora_epoch == UINT64_MAX &&
+            state->split_buffer_type == nullptr && mapped_states.count(state) == 0) {
+            targets.insert(state);
+        }
+    }
+    if (targets.empty()) {
+        return 0;
+    }
+    auto host_bytes = [&]() {
+        size_t total = 0;
+        for (const auto& block : params_storage_blocks_) {
+            if (block->buffer != nullptr) {
+                total += ggml_backend_buffer_get_size(block->buffer);
+            }
+        }
+        return total;
+    };
+    const size_t before = host_bytes();
+    for (TensorState* state : targets) {
+        state->residency_mode = ResidencyMode::Disk;
+    }
+    release_params_storage_blocks(false, &targets);
+    // Unreleased states keep their weights; released ones load lazily on next use, as at startup.
+    for (TensorState* state : targets) {
+        state->residency_mode = ResidencyMode::ParamBackend;
+    }
+    const size_t after = host_bytes();
+    return before > after ? before - after : 0;
+}
+
 WeightResidencyInfo ModelManager::inspect_compute_backend_params(
     const std::vector<ggml_tensor*>& tensors) const {
     WeightResidencyInfo info;

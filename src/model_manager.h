@@ -193,6 +193,10 @@ public:
     bool refresh_files();
     ModelLoader::FileVersions source_versions(const std::set<ModelComponent>& components, const ModelLoader& loader) const;
     size_t registered_params_size(const std::set<ModelComponent>& components) const;
+    // Weights of these components that their next use would load into host RAM.
+    size_t pending_host_params_bytes(const std::set<ModelComponent>& components) const;
+    // Frees idle CPU-resident weights of these components; they reload from their files on next use.
+    size_t release_host_params(const std::set<ModelComponent>& components);
 
     void prepare_file_io() { model_loader_.process_model_files(enable_mmap_, writable_mmap_); }
     bool load_float_tensor(const std::string& name, std::vector<float>& data) {
