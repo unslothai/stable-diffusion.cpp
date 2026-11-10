@@ -40,14 +40,17 @@ namespace sd {
             if (total == 0) {
                 return 0;
             }
-            // What this process allocated since a confirmation came out of the size it confirmed.
-            if (verified_bytes_ > 0 && tracked_bytes > verified_tracked_) {
-                const size_t consumed = tracked_bytes - verified_tracked_;
-                verified_bytes_       = consumed >= verified_bytes_ ? 0 : verified_bytes_ - consumed;
-            }
-            verified_tracked_ = tracked_bytes;
             const size_t used      = total - std::min(reported_free, total);
             const size_t untracked = used > tracked_bytes ? used - tracked_bytes : 0;
+            // Memory taken since a confirmation, by this process (tracked) or anyone else (untracked), comes out of the
+            // size it confirmed; nothing is ever added back.
+            if (verified_bytes_ > 0) {
+                size_t consumed = tracked_bytes > verified_tracked_ ? tracked_bytes - verified_tracked_ : 0;
+                consumed += untracked > verified_untracked_ ? untracked - verified_untracked_ : 0;
+                verified_bytes_ = consumed >= verified_bytes_ ? 0 : verified_bytes_ - consumed;
+            }
+            verified_tracked_   = tracked_bytes;
+            verified_untracked_ = untracked;
             const uint64_t pending = released_ - released_at_anchor_;
             size_t result          = 0;
             if (anchored_ && pending > 0 && window_ms_ > 0 && first_release_ms_ >= 0 &&
@@ -84,6 +87,7 @@ namespace sd {
         int64_t first_release_ms_   = -1;
         size_t verified_bytes_      = 0;
         size_t verified_tracked_    = 0;  // tracked bytes at the last reading
+        size_t verified_untracked_  = 0;  // untracked bytes at the last reading
     };
 }
 
