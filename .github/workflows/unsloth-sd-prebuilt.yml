@@ -530,18 +530,32 @@ jobs:
         id: cckey
         run: echo "archs=$(echo "$CUDA_ARCHS" | tr ';' '-')" >> "$GITHUB_OUTPUT"
 
+      # "depend" in the key names the generation written in depend mode (next step). An older
+      # cache can still map current sources to an object with out-of-date device code, and a
+      # direct hit would keep returning it, so those caches are never restored.
       - name: ccache
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
-          key: sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          key: sd-cuda-depend-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
           restore-keys: |
-            sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}
+            sd-cuda-depend-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}
           append-timestamp: false
           variant: ccache
+          # The action's ccache 4.13 binary: with the 4.5.1 that apt installs on ubuntu-22.04,
+          # depend mode never hits for nvcc.
+          install: binary
           max-size: 2G
           # Saved by the explicit step below instead, so a failed build still
           # keeps what it compiled.
           save: false
+
+      # With several target architectures, `nvcc -E` preprocesses for the first one only. ccache's
+      # preprocessor fallback compares that output, so a change to code that a __CUDA_ARCH__ guard
+      # keeps from the first architecture, and that keeps the line count, gets the old object
+      # back. Depend mode never preprocesses: a result is reused only when the source and every
+      # file the compiler read are unchanged.
+      - name: Configure ccache
+        run: ccache --set-config=depend_mode=true
 
       - name: cuDNN headers (build time only)
         run: |
@@ -686,7 +700,7 @@ jobs:
           path: ${{ github.workspace }}/.ccache
           # Trailing dash keeps this distinct from the key the ccache action
           # restored from, so the save is never a no-op against itself.
-          key: ccache-sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
+          key: ccache-sd-cuda-depend-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   # Windows CUDA, same runtime policy as build-linux-cuda: the ggml*.dll ship beside the executables
   # (Windows searches the executable's own directory first, so llama.cpp's same-named DLLs elsewhere
@@ -778,13 +792,17 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
-          key: sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          key: sd-cuda-depend-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
           restore-keys: |
-            sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}
+            sd-cuda-depend-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}
           append-timestamp: false
           variant: ccache
           max-size: 3G
           save: false
+
+      # Depend mode and the "depend" cache generation: see the Linux CUDA job.
+      - name: Configure ccache
+        run: ccache --set-config=depend_mode=true
 
       - name: Build sd-cli + sd-server (CUDA)
         working-directory: src
@@ -886,7 +904,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
+          key: ccache-sd-cuda-depend-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   build-windows:
     name: ${{ matrix.label }}
