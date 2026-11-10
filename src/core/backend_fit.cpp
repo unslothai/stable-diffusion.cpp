@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <utility>
 #include <vector>
@@ -81,6 +83,22 @@ namespace sd::backend_fit {
         return name;
     }
 
+    // ggml has no unified-memory property; every Metal device on Apple silicon draws from host RAM.
+    static bool device_shares_host_memory(ggml_backend_dev_t dev) {
+        const char* env = std::getenv("SD_AUTOFIT_UMA");
+        if (env != nullptr && std::strcmp(env, "0") == 0) {
+            return false;
+        }
+#if defined(__APPLE__) && defined(__aarch64__)
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char* reg_name   = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+        return std::strcmp(reg_name, "MTL") == 0 || std::strcmp(reg_name, "Metal") == 0;
+#else
+        (void)dev;
+        return false;
+#endif
+    }
+
     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
                                                      bool include_other_devices) {
         std::vector<Device> out;
@@ -95,6 +113,7 @@ namespace sd::backend_fit {
             device.name        = ggml_backend_dev_name(dev);
             device.description = ggml_backend_dev_description(dev);
             device.type        = type;
+            device.shares_host_memory = device_shares_host_memory(dev);
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
             device.free_bytes = (int64_t)free_bytes;
@@ -168,9 +187,10 @@ namespace sd::backend_fit {
         LOG_INFO("auto-fit plan:");
         LOG_INFO("  devices:");
         for (const Device& device : devices) {
-            LOG_INFO("    %-12s %-32s free %6lld MiB, budget %6lld MiB",
+            LOG_INFO("    %-12s %-32s free %6lld MiB, budget %6lld MiB%s",
                      device.name.c_str(), device.description.c_str(),
-                     (long long)(device.free_bytes / MiB), (long long)(device.budget_bytes / MiB));
+                     (long long)(device.free_bytes / MiB), (long long)(device.budget_bytes / MiB),
+                     device.shares_host_memory ? " (shares RAM)" : "");
         }
         if (free_ram < 0) {
             LOG_WARN("auto-fit: available RAM is unknown; skipping CPU parameter residency");

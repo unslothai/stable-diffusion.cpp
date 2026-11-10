@@ -11,6 +11,8 @@
 
 #include "ggml-backend.h"
 
+#define SD_BACKEND_FIT_PLAN_SHARED_MEMORY 1
+
 namespace sd::backend_fit {
 
     static constexpr int64_t MiB = 1024ll * 1024;
@@ -35,6 +37,8 @@ namespace sd::backend_fit {
         int64_t free_bytes              = 0;
         int64_t budget_bytes            = 0;
         enum ggml_backend_dev_type type = GGML_BACKEND_DEVICE_TYPE_GPU;
+        // Unified memory (Apple silicon Metal): its weights also come out of the RAM budget, and RAM weights out of it.
+        bool shares_host_memory = false;
     };
 
     enum class ParamsLocation {
@@ -110,6 +114,20 @@ namespace sd::backend_fit {
         ram_budget_bytes = std::max<int64_t>(ram_budget_bytes, 0);
         plan.decisions.resize(components.size());
 
+        // One physical pool: a placement on either side shrinks the other.
+        auto charge_shared_ram = [&](const std::vector<size_t>& placed, int64_t bytes) {
+            if (std::any_of(placed.begin(), placed.end(), [&](size_t di) { return devices[di].shares_host_memory; })) {
+                ram_budget_bytes = std::max<int64_t>(ram_budget_bytes - bytes, 0);
+            }
+        };
+        auto charge_shared_devices = [&](int64_t bytes) {
+            for (size_t di = 0; di < devices.size(); ++di) {
+                if (devices[di].shares_host_memory) {
+                    remaining[di] = std::max<int64_t>(remaining[di] - bytes, 0);
+                }
+            }
+        };
+
         auto uses_device = [&](size_t ci, size_t di) {
             const auto& runtime_devices = plan.runtimes[ci].devices;
             return std::find(runtime_devices.begin(), runtime_devices.end(), di) != runtime_devices.end();
@@ -151,11 +169,13 @@ namespace sd::backend_fit {
                 for (size_t di : runtime_devices) {
                     remaining[di] -= comp.params_bytes;
                 }
+                charge_shared_ram(runtime_devices, comp.params_bytes);
                 continue;
             }
             if (comp.params_bytes <= ram_budget_bytes) {
                 decision.params_location = ParamsLocation::CPU;
                 ram_budget_bytes -= comp.params_bytes;
+                charge_shared_devices(comp.params_bytes);
                 continue;
             }
             if (runtime_devices.empty()) {
@@ -174,6 +194,7 @@ namespace sd::backend_fit {
                 decision.params_location = ParamsLocation::OTHER_GPU;
                 decision.params_device   = best;
                 remaining[best] -= comp.params_bytes;
+                charge_shared_ram({best}, comp.params_bytes);
             }
         }
         plan.valid = true;
