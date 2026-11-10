@@ -395,6 +395,7 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: CPU variants gate
@@ -645,6 +646,8 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ runner.temp }}/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
+          CUTLASS_LICENSE_FILE: ${{ github.workspace }}/src/thirdparty/cutlass/LICENSE.txt
         run: |
           set -euo pipefail
           # The binaries compile in cudnn-frontend's header-only templates, so its MIT notice ships too.
@@ -854,6 +857,8 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
+          CUTLASS_LICENSE_FILE: ${{ github.workspace }}/src/thirdparty/cutlass/LICENSE.txt
         run: python tooling/scripts/unsloth/package_bundle.py
 
       - name: Verify every PE in the bundle is signed
@@ -1024,6 +1029,7 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
         run: python tooling/scripts/unsloth/package_bundle.py
 
       # The gate, run on the finished zip rather than the build tree: packaging
