@@ -383,6 +383,8 @@ public:
 
     bool apply_loras(const sd_lora_t* loras, uint32_t lora_count);
 
+    std::vector<ModelManager::LoraSpec> conditioning_relevant_loras(const std::vector<ModelManager::LoraSpec>& loras);
+
     SDCondition get_learned_condition(const ConditionerParams& params);
 
     void reset_generation_extensions();
