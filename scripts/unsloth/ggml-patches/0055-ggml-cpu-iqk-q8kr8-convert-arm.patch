@@ -219,7 +219,7 @@ index 6551112..748989b 100644
      if (!iqk_set_kernels(type, funcs)) {
          return false;
 diff --git a/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp b/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
-index 43ba745..2e4cc62 100644
+index 43ba745..ac5105a 100644
 --- a/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
 +++ b/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
 @@ -348,8 +348,122 @@ void mul_mat_iq1_m_q8_K(int n, const void * vx, size_t bx, const DataInfo& info,
@@ -314,7 +314,7 @@ index 43ba745..2e4cc62 100644
 +
 +                    auto aux = vdupq_n_u32(qh[0] | qh[1] << 16);
 +                    uint32x4x2_t delta_mask{ vceqq_u32(vandq_u32(aux, mask.val[0]), mask.val[0]), vceqq_u32(vandq_u32(aux, mask.val[1]), mask.val[1]) };
-+                    uint8x16x2_t delta{ vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[0]))),
++                    int8x16x2_t delta{ vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[0]))),
 +                                        vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[1]))) };
 +                    qx[ib32].val[0] = vsubq_s8(value.val[0], delta.val[0]);
 +                    qx[ib32].val[1] = vsubq_s8(value.val[1], delta.val[1]);
@@ -577,10 +577,10 @@ index f916fee..bdd31ad 100644
      switch (typeA) {
          case GGML_TYPE_IQ2_XXS: IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_K_T, DequantizerIQ2XXS, kernels); break;
 diff --git a/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp b/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp
-index 916de2a..b06b587 100644
+index 916de2a..bae9723 100644
 --- a/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp
 +++ b/src/ggml-cpu/iqk/iqk_gemm_kquants.cpp
-@@ -1142,8 +1142,299 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
+@@ -1142,8 +1142,301 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
  
  };
  
@@ -654,14 +654,14 @@ index 916de2a..b06b587 100644
 +                auto block_max = vdupq_n_f32(0);
 +                for (int i128 = 0; i128 < 2; ++i128) {
 +                    auto bits = vld1q_u8_x2(x8[k][i].qs+32*i128);
-+                    xv[0].val[0] = vandq_u8(bits.val[0], ml);
-+                    xv[0].val[1] = vandq_u8(bits.val[1], ml);
-+                    xv[1].val[0] = vandq_u8(vshrq_n_u8(bits.val[0], 2), ml);
-+                    xv[1].val[1] = vandq_u8(vshrq_n_u8(bits.val[1], 2), ml);
-+                    xv[2].val[0] = vandq_u8(vshrq_n_u8(bits.val[0], 4), ml);
-+                    xv[2].val[1] = vandq_u8(vshrq_n_u8(bits.val[1], 4), ml);
-+                    xv[3].val[0] = vshrq_n_u8(bits.val[0], 6);
-+                    xv[3].val[1] = vshrq_n_u8(bits.val[1], 6);
++                    xv[0].val[0] = vreinterpretq_s8_u8(vandq_u8(bits.val[0], ml));
++                    xv[0].val[1] = vreinterpretq_s8_u8(vandq_u8(bits.val[1], ml));
++                    xv[1].val[0] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[0], 2), ml));
++                    xv[1].val[1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[1], 2), ml));
++                    xv[2].val[0] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[0], 4), ml));
++                    xv[2].val[1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(bits.val[1], 4), ml));
++                    xv[3].val[0] = vreinterpretq_s8_u8(vshrq_n_u8(bits.val[0], 6));
++                    xv[3].val[1] = vreinterpretq_s8_u8(vshrq_n_u8(bits.val[1], 6));
 +                    for (int l = 0; l < 4; ++l) {
 +                        auto d1 = vdupq_n_s8(x8[k][i].scales[8*i128 + 2*l + 0] & 0xf);
 +                        auto d2 = vdupq_n_s8(x8[k][i].scales[8*i128 + 2*l + 1] & 0xf);
@@ -733,6 +733,8 @@ index 916de2a..b06b587 100644
 +
 +    auto ml  = vdupq_n_s8(0x03);
 +    auto mh  = vdupq_n_s8(0x04);
++    auto mlu = vdupq_n_u8(0x03);
++    auto mhu = vdupq_n_u8(0x04);
 +
 +    union { int8x16_t vec; int8_t val[16]; } helper;
 +
@@ -751,17 +753,17 @@ index 916de2a..b06b587 100644
 +                aux32[3] = ((aux1 >> 4) & 0x0f0f0f0f) | ((aux2 >> 2) & 0x30303030);
 +                helper.vec = vaddq_s8(vld1q_s8((const int8_t *)aux32), vdupq_n_s8(-32));
 +                auto hbits = vld1q_u8_x2(x8[k][i].hmask);
-+                auto max_i16 = vdupq_n_u16(0);
++                auto max_i16 = vdupq_n_s16(0);
 +                for (int i128 = 0; i128 < 2; ++i128) {
 +                    auto q2bits = vld1q_u8_x2(x8[k][i].qs + 32*i128);
-+                    xv[4*i128+0].val[0] = vsubq_s8(vorrq_s8(vandq_s8(q2bits.val[0], ml), vandq_s8(vshlq_n_u8(hbits.val[0], 2), mh)), mh);
-+                    xv[4*i128+0].val[1] = vsubq_s8(vorrq_s8(vandq_s8(q2bits.val[1], ml), vandq_s8(vshlq_n_u8(hbits.val[1], 2), mh)), mh);
-+                    xv[4*i128+1].val[0] = vsubq_s8(vorrq_s8(vandq_s8(vshrq_n_u8(q2bits.val[0], 2), ml), vandq_s8(vshlq_n_u8(hbits.val[0], 1), mh)), mh);
-+                    xv[4*i128+1].val[1] = vsubq_s8(vorrq_s8(vandq_s8(vshrq_n_u8(q2bits.val[1], 2), ml), vandq_s8(vshlq_n_u8(hbits.val[1], 1), mh)), mh);
-+                    xv[4*i128+2].val[0] = vsubq_s8(vorrq_s8(vandq_s8(vshrq_n_u8(q2bits.val[0], 4), ml), vandq_s8(hbits.val[0], mh)), mh);
-+                    xv[4*i128+2].val[1] = vsubq_s8(vorrq_s8(vandq_s8(vshrq_n_u8(q2bits.val[1], 4), ml), vandq_s8(hbits.val[1], mh)), mh);
-+                    xv[4*i128+3].val[0] = vsubq_s8(vorrq_s8(vshrq_n_u8(q2bits.val[0], 6), vandq_s8(vshrq_n_u8(hbits.val[0], 1), mh)), mh);
-+                    xv[4*i128+3].val[1] = vsubq_s8(vorrq_s8(vshrq_n_u8(q2bits.val[1], 6), vandq_s8(vshrq_n_u8(hbits.val[1], 1), mh)), mh);
++                    xv[4*i128+0].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q2bits.val[0], mlu), vandq_u8(vshlq_n_u8(hbits.val[0], 2), mhu))), mh);
++                    xv[4*i128+0].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q2bits.val[1], mlu), vandq_u8(vshlq_n_u8(hbits.val[1], 2), mhu))), mh);
++                    xv[4*i128+1].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[0], 2), mlu), vandq_u8(vshlq_n_u8(hbits.val[0], 1), mhu))), mh);
++                    xv[4*i128+1].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[1], 2), mlu), vandq_u8(vshlq_n_u8(hbits.val[1], 1), mhu))), mh);
++                    xv[4*i128+2].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[0], 4), mlu), vandq_u8(hbits.val[0], mhu))), mh);
++                    xv[4*i128+2].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(vshrq_n_u8(q2bits.val[1], 4), mlu), vandq_u8(hbits.val[1], mhu))), mh);
++                    xv[4*i128+3].val[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q2bits.val[0], 6), vandq_u8(vshrq_n_u8(hbits.val[0], 1), mhu))), mh);
++                    xv[4*i128+3].val[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q2bits.val[1], 6), vandq_u8(vshrq_n_u8(hbits.val[1], 1), mhu))), mh);
 +                    hbits.val[0] = vshrq_n_u8(hbits.val[0], 4);
 +                    hbits.val[1] = vshrq_n_u8(hbits.val[1], 4);
 +
