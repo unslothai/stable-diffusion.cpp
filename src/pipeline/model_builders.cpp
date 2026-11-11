@@ -164,11 +164,14 @@ namespace sd::model_builders {
                                                      version,
                                                      weight_manager);
             } else if (find_model_traits(vae_version)->vae_kind == ModelVAEKind::MINIMAX_H3) {
-                if (version == VERSION_P_H3_IMAGE) {
+                if (sd_version_is_h3_image(version)) {
                     // The video VAE also loads successfully, but uses different temporal decoding and posterior sampling.
                     auto proj = tensor_storage_map.find("first_stage_model.decoder.proj_out.weight");
-                    if (proj == tensor_storage_map.end() || proj->second.ne[1] != 768) {
-                        throw std::runtime_error("P-H3-Image requires its single-frame VAE; pass --vae p-h3-image_vae_bf16.safetensors");
+                    if (proj == tensor_storage_map.end() || proj->second.ne[1] != 768 ||
+                        (version == VERSION_MINIMAX_H3_IMAGE && proj->second.ne[0] != 1024)) {
+                        throw std::runtime_error(version == VERSION_P_H3_IMAGE
+                                                     ? "P-H3-Image requires its single-frame VAE; pass --vae p-h3-image_vae_bf16.safetensors"
+                                                     : "MiniMax-H3-Image requires its image VAE; pass --vae minimax_h3_image_vae.safetensors");
                     }
                 }
                 return std::make_shared<MiniMaxH3VAE::MiniMaxH3VideoVAERunner>(ctx.backends.runtime_backend(SDBackendModule::VAE),

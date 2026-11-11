@@ -1526,7 +1526,7 @@ bool StableDiffusionGGML::build_denoiser() {
         }
         case H3_AV_FLOW_PRED: {
             LOG_INFO("running in MiniMax H3 AV FLOW mode");
-            denoiser = std::make_shared<H3AVFlowDenoiser>(default_flow_shift, version == VERSION_P_H3_IMAGE ? 1.f : 3.f, get_latent_channel());
+            denoiser = std::make_shared<H3AVFlowDenoiser>(default_flow_shift, sd_version_is_h3_image(version) ? 1.f : 3.f, get_latent_channel());
             break;
         }
         case MING_IMAGE_FLOW_PRED: {
@@ -2757,9 +2757,9 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     condition.c_position_ids.empty() ? nullptr : &condition.c_position_ids,
                     condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios,
                     condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
-                    version == VERSION_P_H3_IMAGE ? 2 : audio_length,
+                    version == VERSION_P_H3_IMAGE ? 2 : (version == VERSION_MINIMAX_H3_IMAGE ? 0 : audio_length),
                     std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
-                    version == VERSION_P_H3_IMAGE ? 1.f : 3.f};
+                    sd_version_is_h3_image(version) ? 1.f : 3.f};
             } else if (sd_version_is_ltxav(version)) {
                 diffusion_params.extra = LTXAVDiffusionExtra{
                     nullptr,
@@ -3256,7 +3256,7 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
     if (sd_version_is_pid(version) || sd_version_is_minit2i(version) || version == VERSION_IRIS) {
         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
     }
-    auto image_latents                = version == VERSION_P_H3_IMAGE && x.dim() == 5
+    auto image_latents                = sd_version_is_h3_image(version) && x.dim() == 5
                                             ? sd::ops::slice(x, 3, 0, get_latent_channel())
                                             : x;
     auto latents                      = first_stage_model->diffusion_to_vae_latents(image_latents);
@@ -3273,7 +3273,7 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
         }
         auto decoded = first_stage_model->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
         const bool temporal_before = tiling_params.temporal_tiling;
-        if (version == VERSION_P_H3_IMAGE && !decoded.empty() && decoded.dim() == 5) {
+        if (sd_version_is_h3_image(version) && !decoded.empty() && decoded.dim() == 5) {
             decoded = decoded.squeeze(2);
         }
         if (!decoded.empty() ||

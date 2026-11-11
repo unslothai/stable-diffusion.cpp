@@ -45,6 +45,10 @@ namespace MiniMaxH3 {
         float norm_eps                   = 1e-5f;
         float qk_norm_eps                = 1e-5f;
         float final_norm_eps             = 1e-5f;
+        bool audio_enabled = true;
+        // Distilled per-step output heads stacked in final_layer.video_out (head 0 whole, heads 1.. stored as
+        // offsets from head 0), one per step of a fixed sigma grid.
+        int64_t pdd_heads = 1;
 
         bool uses_adaln_curves() const {
             return adaln_curve_grid > 0;
@@ -80,6 +84,21 @@ namespace MiniMaxH3 {
             }
             if (const auto* weight = find("audio_patch_proj.weight")) {
                 config.audio_latent_channels = weight->logical_ne0();
+            } else if (find("video_patch_proj.weight") != nullptr) {
+                config.audio_enabled = false;
+            }
+            // Only the image model's 6-head bank is known; a video bank (32 heads blended per step) keeps failing
+            // the shape check instead of rendering with the wrong heads.
+            const auto* stacked_heads = config.audio_enabled ? nullptr : find("final_layer.video_out.weight");
+            if (const auto* weight = stacked_heads) {
+                const int64_t video_dim = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
+                if (video_dim > 0 && weight->ne[1] > video_dim && weight->ne[1] % video_dim == 0) {
+                    config.pdd_heads = weight->ne[1] / video_dim;
+                    if (config.pdd_heads != 6) {
+                        LOG_WARN("minimax_h3: %" PRId64 " stacked output heads; only the 6-step MiniMax-H3-Image grid is known",
+                                 config.pdd_heads);
+                    }
+                }
             }
             config.num_layers               = count_blocks(tensors, prefix + ".blocks.");
             config.token_refiner_num_layers = count_blocks(tensors, prefix + ".token_refiner.blocks.");
@@ -112,13 +131,15 @@ namespace MiniMaxH3 {
             }
 
             LOG_VERBOSE("minimax_h3: layers=%" PRId64 ", hidden=%" PRId64 ", heads=%" PRId64
-                        ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64,
+                        ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64 ", audio=%d, pdd_heads=%" PRId64,
                         config.num_layers,
                         config.hidden_size,
                         config.num_attention_heads,
                         config.attention_head_dim,
                         config.ffn_hidden_size,
-                        config.adaln_curve_grid);
+                        config.adaln_curve_grid,
+                        config.audio_enabled ? 1 : 0,
+                        config.pdd_heads);
             return config;
         }
     };
@@ -815,19 +836,54 @@ namespace MiniMaxH3 {
                                                                             1,
                                                                             !config.uses_adaln_curves(),
                                                                             config.uses_adaln_curves());
-            blocks["video_out"]  = std::make_shared<Linear>(config.hidden_size, video_dim, true, true);
-            blocks["audio_out"]  = std::make_shared<Linear>(config.hidden_size, config.audio_latent_channels, true, true);
+            if (config.pdd_heads == 1) {
+                blocks["video_out"] = std::make_shared<Linear>(config.hidden_size, video_dim, true, true);
+            }
+            if (config.audio_enabled) {
+                blocks["audio_out"] = std::make_shared<Linear>(config.hidden_size, config.audio_latent_channels, true, true);
+            }
+        }
+
+        void init_params(ggml_context* ctx,
+                         const String2TensorStorage& tensor_storage_map = {},
+                         const std::string prefix                       = "") override {
+            if (config.pdd_heads > 1) {
+                const int64_t video_dim = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
+                ggml_type wtype         = get_type(prefix + "video_out.weight", tensor_storage_map, GGML_TYPE_F32);
+                if (config.hidden_size % ggml_blck_size(wtype) != 0) {
+                    wtype = GGML_TYPE_F32;
+                }
+                params["video_out.weight"] = ggml_new_tensor_2d(ctx, wtype, config.hidden_size, video_dim * config.pdd_heads);
+                params["video_out.bias"]   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, video_dim * config.pdd_heads);
+            }
+        }
+
+        // Head 0 plus the offset of head `index` (index 0 is head 0 alone).
+        ggml_tensor* pdd_video_out(GGMLRunnerContext* ctx, ggml_tensor* x, int index) {
+            const int64_t video_dim = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
+            GGML_ASSERT(index >= 0 && index < config.pdd_heads);
+            auto weight = params["video_out.weight"];
+            auto bias   = params["video_out.bias"];
+            auto head   = [&](int i) {
+                auto w = ggml_view_2d(ctx->ggml_ctx, weight, weight->ne[0], video_dim, weight->nb[1], i * video_dim * weight->nb[1]);
+                auto b = ggml_view_1d(ctx->ggml_ctx, bias, video_dim, i * video_dim * ggml_element_size(bias));
+                return ggml_add(ctx->ggml_ctx, ggml_mul_mat(ctx->ggml_ctx, w, x), b);
+            };
+            auto out = head(0);
+            if (index > 0) {
+                out = ggml_add(ctx->ggml_ctx, out, head(index));
+            }
+            return out;
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
                                                       ggml_tensor* x,
                                                       ggml_tensor* t_emb,
                                                       const TokenModulationSpan& video,
-                                                      const TokenModulationSpan& audio) {
+                                                      const TokenModulationSpan& audio,
+                                                      int pdd_head = 0) {
             auto norm      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm"]);
             auto adaln     = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
-            auto video_out = std::dynamic_pointer_cast<Linear>(blocks["video_out"]);
-            auto audio_out = std::dynamic_pointer_cast<Linear>(blocks["audio_out"]);
             auto mods      = adaln->forward(ctx, t_emb);
             auto apply     = [&](const TokenModulationSpan& segment) {
                 auto row   = modulation_row(ctx->ggml_ctx, mods, config.hidden_size, 2, 1, segment.modulation_row);
@@ -836,8 +892,17 @@ namespace MiniMaxH3 {
                                 ggml_add(ctx->ggml_ctx, value, ggml_mul(ctx->ggml_ctx, value, row[1])),
                                 row[0]);
             };
-            return {video_out->forward(ctx, apply(video)),
-                    audio_out->forward(ctx, apply(audio))};
+            ggml_tensor* video_value = nullptr;
+            if (config.pdd_heads > 1) {
+                video_value = pdd_video_out(ctx, apply(video), pdd_head);
+            } else {
+                video_value = std::dynamic_pointer_cast<Linear>(blocks["video_out"])->forward(ctx, apply(video));
+            }
+            if (!config.audio_enabled) {
+                return {video_value, nullptr};
+            }
+            return {video_value,
+                    std::dynamic_pointer_cast<Linear>(blocks["audio_out"])->forward(ctx, apply(audio))};
         }
     };
 
@@ -848,7 +913,9 @@ namespace MiniMaxH3 {
             : config(config) {
             int64_t video_dim          = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
             blocks["video_patch_proj"] = std::make_shared<Linear>(video_dim, config.hidden_size, true, true);
-            blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
+            if (config.audio_enabled) {
+                blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
+            }
             blocks["condition_proj"]   = std::make_shared<Linear>(config.text_dim, config.hidden_size, true);
             if (!config.uses_adaln_curves()) {
                 blocks["time_embedder"] = std::make_shared<TimeEmbedder>(config.timestep_input_dim,
@@ -947,9 +1014,9 @@ namespace MiniMaxH3 {
                                                       const std::vector<TokenModulationSpan>& segments,
                                                       const std::vector<SequenceSegment>& sequence_segments,
                                                       const TokenModulationSpan& video_segment,
-                                                      const TokenModulationSpan& audio_segment) {
+                                                      const TokenModulationSpan& audio_segment,
+                                                      int pdd_head = 0) {
             auto video_proj = std::dynamic_pointer_cast<Linear>(blocks["video_patch_proj"]);
-            auto audio_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patch_proj"]);
 
             std::vector<std::pair<int64_t, int64_t>> condition_video_ranges;
             ggml_tensor* video_rows = nullptr;
@@ -987,18 +1054,25 @@ namespace MiniMaxH3 {
                                        value->ne[3]);
             };
             std::vector<std::pair<int64_t, int64_t>> condition_audio_ranges;
-            ggml_tensor* audio_rows = nullptr;
-            int64_t audio_offset    = 0;
-            for (auto condition : condition_audios) {
-                auto rows = pack_audio_rows(condition);
-                condition_audio_ranges.push_back({audio_offset, audio_offset + rows->ne[1]});
-                audio_offset += rows->ne[1];
-                audio_rows = audio_rows == nullptr ? rows : ggml_concat(ctx->ggml_ctx, audio_rows, rows, 1);
+            std::pair<int64_t, int64_t> target_audio_range = {0, 0};
+            ggml_tensor* audio_embeds                      = nullptr;
+            if (config.audio_enabled) {
+                auto audio_proj         = std::dynamic_pointer_cast<Linear>(blocks["audio_patch_proj"]);
+                ggml_tensor* audio_rows = nullptr;
+                int64_t audio_offset    = 0;
+                for (auto condition : condition_audios) {
+                    auto rows = pack_audio_rows(condition);
+                    condition_audio_ranges.push_back({audio_offset, audio_offset + rows->ne[1]});
+                    audio_offset += rows->ne[1];
+                    audio_rows = audio_rows == nullptr ? rows : ggml_concat(ctx->ggml_ctx, audio_rows, rows, 1);
+                }
+                audio              = pack_audio_rows(audio);
+                target_audio_range = {audio_offset, audio_offset + audio->ne[1]};
+                audio_rows         = audio_rows == nullptr ? audio : ggml_concat(ctx->ggml_ctx, audio_rows, audio, 1);
+                audio_embeds       = audio_proj->forward(ctx, audio_rows);
+            } else {
+                GGML_ASSERT(condition_audios.empty());
             }
-            audio                                          = pack_audio_rows(audio);
-            std::pair<int64_t, int64_t> target_audio_range = {audio_offset, audio_offset + audio->ne[1]};
-            audio_rows                                     = audio_rows == nullptr ? audio : ggml_concat(ctx->ggml_ctx, audio_rows, audio, 1);
-            auto audio_embeds                              = audio_proj->forward(ctx, audio_rows);
             context                                        = refine_context(ctx, context);
 
             ggml_tensor* h = nullptr;
@@ -1014,11 +1088,15 @@ namespace MiniMaxH3 {
                     auto range = condition_video_ranges[static_cast<size_t>(sequence.source_index)];
                     append(ggml_ext_slice(ctx->ggml_ctx, video_embeds, 1, range.first, range.second));
                 } else if (sequence.kind == SequenceKind::CONDITION_AUDIO) {
+                    GGML_ASSERT(audio_embeds != nullptr);
                     GGML_ASSERT(sequence.source_index >= 0 &&
                                 sequence.source_index < static_cast<int32_t>(condition_audio_ranges.size()));
                     auto range = condition_audio_ranges[static_cast<size_t>(sequence.source_index)];
                     append(ggml_ext_slice(ctx->ggml_ctx, audio_embeds, 1, range.first, range.second));
                 } else if (sequence.kind == SequenceKind::TARGET_AUDIO) {
+                    if (audio_embeds == nullptr) {
+                        continue;
+                    }
                     append(ggml_ext_slice(ctx->ggml_ctx,
                                           audio_embeds,
                                           1,
@@ -1049,7 +1127,7 @@ namespace MiniMaxH3 {
             }
 
             auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
-            auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment);
+            auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment, pdd_head);
             auto video_out   = DiT::unpatchify_3d(ctx->ggml_ctx,
                                                   output.first,
                                                   video->ne[2] / config.patch_t,
@@ -1059,6 +1137,10 @@ namespace MiniMaxH3 {
                                                   config.patch_h,
                                                   config.patch_w,
                                                   true);
+            video_out        = ggml_ext_scale(ctx->ggml_ctx, video_out, -1.f);
+            if (!config.audio_enabled) {
+                return {video_out, nullptr};
+            }
             auto audio_out   = ggml_reshape_4d(ctx->ggml_ctx,
                                                output.second,
                                                config.audio_latent_channels,
@@ -1066,7 +1148,6 @@ namespace MiniMaxH3 {
                                                2,
                                                audio->ne[2]);
             audio_out        = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, audio_out, 1, 2, 0, 3));
-            video_out        = ggml_ext_scale(ctx->ggml_ctx, video_out, -1.f);
             audio_out        = ggml_ext_scale(ctx->ggml_ctx, audio_out, -1.f);
             return {video_out, audio_out};
         }
@@ -1136,12 +1217,16 @@ namespace MiniMaxH3 {
         }
         layout.sequence_segments.push_back({0, text_len, SequenceKind::TEXT});
 
+        const bool with_audio        = audio_t > 0 || !condition_audios.empty();
         int video_time_row           = find_or_add_timestep(&layout.timesteps, video_t);
-        int audio_time_row           = find_or_add_timestep(&layout.timesteps, audio_timestep);
-        int condition_time_row       = find_or_add_timestep(&layout.timesteps,
-                                                            std::max(video_t, VISUAL_COND_TIMESTEP));
-        int audio_condition_time_row = find_or_add_timestep(&layout.timesteps,
-                                                            std::max(audio_timestep, 1.f));
+        int audio_time_row           = with_audio ? find_or_add_timestep(&layout.timesteps, audio_timestep) : video_time_row;
+        int condition_time_row       = (!condition_videos.empty() || with_audio)
+                                           ? find_or_add_timestep(&layout.timesteps,
+                                                                  std::max(video_t, VISUAL_COND_TIMESTEP))
+                                           : video_time_row;
+        int audio_condition_time_row = with_audio ? find_or_add_timestep(&layout.timesteps,
+                                                                         std::max(audio_timestep, 1.f))
+                                                  : video_time_row;
 
         int64_t run_start = 0;
         int current_tag   = text_tags.empty() ? 1 : text_tags[0];
@@ -1273,15 +1358,17 @@ namespace MiniMaxH3 {
         }
 
         int64_t audio_start = row;
-        append_audio_positions(audio_t, cursor, w_axis.front(), w_axis.back());
         layout.audio_segment = {audio_start, row + audio_t * 2, audio_time_row};
-        layout.sequence_segments.push_back({audio_start,
-                                            row + audio_t * 2,
-                                            SequenceKind::TARGET_AUDIO});
-        layout.segments.push_back({audio_start,
-                                   row + audio_t * 2,
-                                   audio_time_row * 3 + 2});
-        row += audio_t * 2;
+        if (audio_t > 0) {
+            append_audio_positions(audio_t, cursor, w_axis.front(), w_axis.back());
+            layout.sequence_segments.push_back({audio_start,
+                                                row + audio_t * 2,
+                                                SequenceKind::TARGET_AUDIO});
+            layout.segments.push_back({audio_start,
+                                       row + audio_t * 2,
+                                       audio_time_row * 3 + 2});
+            row += audio_t * 2;
+        }
 
         int64_t video_start = row;
         for (int64_t t = 0; t < latent_t; ++t) {
@@ -1350,6 +1437,23 @@ namespace MiniMaxH3 {
             return ggml_concat(ctx, video, audio, 3);
         }
 
+        // The stacked heads were distilled one per step of this grid (pdd_config.json of MiniMax-H3-Image); a
+        // step takes the head of the nearest grid sigma, so other samplers or step counts still pick a head.
+        int pdd_head_for_sigma(float sigma) const {
+            if (config.pdd_heads <= 1) {
+                return 0;
+            }
+            static const float grid[] = {1.0f, 0.9675236940383911f, 0.8875485062599182f, 0.75f, 0.5327739119529724f, 0.23200887441635132f};
+            const int count           = std::min<int>(static_cast<int>(config.pdd_heads), static_cast<int>(sizeof(grid) / sizeof(grid[0])));
+            int best                  = 0;
+            for (int i = 1; i < count; ++i) {
+                if (std::fabs(grid[i] - sigma) < std::fabs(grid[best] - sigma)) {
+                    best = i;
+                }
+            }
+            return best;
+        }
+
         ggml_cgraph* build_graph(const sd::Tensor<float>& packed,
                                  const sd::Tensor<float>& timestep,
                                  const sd::Tensor<float>& context_tensor,
@@ -1362,7 +1466,7 @@ namespace MiniMaxH3 {
                                  float video_shift,
                                  float audio_shift) {
             GGML_ASSERT(packed.dim() == 4 || packed.dim() == 5);
-            GGML_ASSERT(audio_length > 0);
+            GGML_ASSERT(config.audio_enabled ? audio_length > 0 : audio_length == 0);
             GGML_ASSERT(!context_tensor.empty());
             const int64_t spatial      = packed.shape()[0] * packed.shape()[1] * packed.shape()[2];
             const int64_t video_values = spatial * config.video_latent_channels;
@@ -1375,12 +1479,15 @@ namespace MiniMaxH3 {
                                               packed.shape()[0] * sizeof(float),
                                               packed.shape()[0] * packed.shape()[1] * sizeof(float),
                                               spatial * sizeof(float), 0);
-            auto audio_carrier = ggml_view_4d(compute_ctx, packed_input,
-                                              audio_length, 2, config.audio_latent_channels, 1,
-                                              audio_length * sizeof(float),
-                                              int64_t(audio_length) * 2 * sizeof(float),
-                                              audio_values * sizeof(float),
-                                              video_values * sizeof(float));
+            ggml_tensor* audio_carrier = nullptr;
+            if (config.audio_enabled) {
+                audio_carrier = ggml_view_4d(compute_ctx, packed_input,
+                                             audio_length, 2, config.audio_latent_channels, 1,
+                                             audio_length * sizeof(float),
+                                             int64_t(audio_length) * 2 * sizeof(float),
+                                             audio_values * sizeof(float),
+                                             video_values * sizeof(float));
+            }
             auto context       = make_input(context_tensor);
             std::vector<ggml_tensor*> condition_inputs;
             condition_inputs.reserve(condition_videos.size());
@@ -1400,7 +1507,7 @@ namespace MiniMaxH3 {
             float t_a         = 1.f - sigma_a;
             // The sampler carries c_a = (sigma_v / sigma_a) * x_a so the packed
             // latent follows one sigma schedule. Restore x_a for the H3 network.
-            auto audio  = ggml_ext_scale(compute_ctx, audio_carrier, sigma_a / sigma_v);
+            auto audio  = audio_carrier == nullptr ? nullptr : ggml_ext_scale(compute_ctx, audio_carrier, sigma_a / sigma_v);
             auto layout = build_layout(context_tensor.shape()[1],
                                        packed.shape()[2],
                                        packed.shape()[1],
@@ -1473,7 +1580,13 @@ namespace MiniMaxH3 {
                                             layout.segments,
                                             layout.sequence_segments,
                                             layout.video_segment,
-                                            layout.audio_segment);
+                                            layout.audio_segment,
+                                            pdd_head_for_sigma(sigma_v));
+            if (!config.audio_enabled) {
+                auto graph = new_graph_custom(H3_GRAPH_SIZE);
+                ggml_build_forward_expand(graph, output.first);
+                return graph;
+            }
             // Convert the model's audio velocity to d(c_a) / d(sigma_v).
             output.second = ggml_add(compute_ctx,
                                      ggml_ext_scale(compute_ctx, audio, 1.f - audio_scale),

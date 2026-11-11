@@ -454,6 +454,17 @@ namespace sd::pipeline {
                     LOG_WARN("total_steps != custom_sigmas_count - 1, set high_noise_sample_steps to %d", high_noise_sample_steps);
                 }
             }
+        } else if (sd->version == VERSION_MINIMAX_H3_IMAGE && high_noise_sample_steps <= 0) {
+            // Distilled to one output head per step of this grid (pdd_config.json); timesteps are float32 1 - sigma.
+            static const float grid[] = {1.0f, 0.9675236940383911f, 0.8875485062599182f, 0.75f, 0.5327739119529724f, 0.23200887441635132f, 0.0f};
+            if (sample_steps != 6) {
+                LOG_WARN("MiniMax-H3-Image samples its fixed 6-step schedule; ignoring %d steps", sample_steps);
+            }
+            sample_steps = total_steps = 6;
+            sigmas.clear();
+            for (float sigma : grid) {
+                sigmas.push_back(1.f - (1.f - sigma));
+            }
         } else {
             scheduler          = resolve_scheduler(sd,
                                                    sample_params->scheduler,
