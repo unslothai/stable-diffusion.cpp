@@ -1,0 +1,106 @@
+diff --git a/src/ggml-blas/ggml-blas.cpp b/src/ggml-blas/ggml-blas.cpp
+index 6feb370..c90b44e 100644
+--- a/src/ggml-blas/ggml-blas.cpp
++++ b/src/ggml-blas/ggml-blas.cpp
+@@ -6,6 +6,10 @@
+ #include <future>
+ #include <vector>
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
++#include <cctype>
++#include <string>
+ 
+ #if defined(GGML_BLAS_USE_ACCELERATE)
+ #   include <Accelerate/Accelerate.h>
+@@ -393,6 +397,81 @@ static ggml_backend_buffer_t ggml_backend_blas_device_buffer_from_host_ptr(ggml_
+     GGML_UNUSED(max_tensor_size);
+ }
+ 
++// Weight types whose matmuls BLAS takes. BLAS dequantizes a quantized weight to F32 in full on every call, so by
++// default the legacy, K and I quants stay on the CPU backend's integer kernels (repack, iqk Q8_K_R8 conversion,
++// legacy Q8_0 conversion) and BLAS keeps F32 / F16 / BF16 and the remaining types. GGML_BLAS_TYPES=all restores
++// "any type with to_float"; a comma list (f16,q5_0,...) picks the set (F32 always stays).
++// GGML_CPU_IQK_DEBUG=1 prints the set once.
++static bool ggml_backend_blas_weight_type_ok(enum ggml_type type) {
++    static const std::vector<bool> mask = [] {
++        std::vector<bool> m(GGML_TYPE_COUNT, false);
++        auto same_name = [](const char * a, const std::string & b) {
++            size_t i = 0;
++            for (; a[i] != '\0' && i < b.size(); ++i) {
++                if (tolower((unsigned char) a[i]) != tolower((unsigned char) b[i])) {
++                    return false;
++                }
++            }
++            return a[i] == '\0' && i == b.size();
++        };
++        const char * env = getenv("GGML_BLAS_TYPES");
++        if (env != nullptr && strcmp(env, "all") == 0) {
++            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++                const auto * tt = ggml_get_type_traits((enum ggml_type) t);
++                m[t] = t == GGML_TYPE_F32 || (tt != nullptr && tt->to_float != nullptr);
++            }
++        } else if (env != nullptr) {
++            m[GGML_TYPE_F32] = true;
++            std::string list(env);
++            size_t p = 0;
++            while (p <= list.size()) {
++                size_t q = list.find(',', p);
++                if (q == std::string::npos) {
++                    q = list.size();
++                }
++                std::string name = list.substr(p, q - p);
++                for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++                    const char * tn = ggml_type_name((enum ggml_type) t);
++                    if (tn != nullptr && same_name(tn, name)) {
++                        const auto * tt = ggml_get_type_traits((enum ggml_type) t);
++                        m[t] = t == GGML_TYPE_F32 || (tt != nullptr && tt->to_float != nullptr);
++                    }
++                }
++                p = q + 1;
++            }
++        } else {
++            // default: everything BLAS can dequantize except the types the CPU backend has an integer GEMM for
++            // at large batches (repack / legacy Q8_0 conversion / Q8_K_R8 conversion)
++            static const enum ggml_type cpu_gemm_types[] = {
++                GGML_TYPE_Q4_0,    GGML_TYPE_Q4_1,   GGML_TYPE_Q5_0,  GGML_TYPE_Q5_1,    GGML_TYPE_Q8_0,
++                GGML_TYPE_Q2_K,    GGML_TYPE_Q3_K,   GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,    GGML_TYPE_Q6_K,
++                GGML_TYPE_IQ1_S,   GGML_TYPE_IQ1_M,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
++                GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,  GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
++            };
++            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++                const auto * tt = ggml_get_type_traits((enum ggml_type) t);
++                m[t] = t == GGML_TYPE_F32 || (tt != nullptr && tt->to_float != nullptr);
++            }
++            for (enum ggml_type t : cpu_gemm_types) {
++                m[t] = false;
++            }
++        }
++        const char * dbg = getenv("GGML_CPU_IQK_DEBUG");
++        if (dbg != nullptr && dbg[0] == '1') {
++            std::string names;
++            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++                if (m[t]) {
++                    names += " ";
++                    names += ggml_type_name((enum ggml_type) t);
++                }
++            }
++            fprintf(stderr, "ggml-blas: weight types on BLAS:%s (%s)\n", names.c_str(), env != nullptr ? env : "default");
++        }
++        return m;
++    }();
++    return type >= 0 && type < GGML_TYPE_COUNT && mask[type];
++}
++
+ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     const struct ggml_tensor * src0 = op->src[0];
+     const struct ggml_tensor * src1 = op->src[1];
+@@ -429,7 +508,7 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
+                    ggml_is_contiguous(src1) &&
+                    src1->type == GGML_TYPE_F32 &&
+                    (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
+-                   (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
++                   ggml_backend_blas_weight_type_ok(src0->type);
+         }
+ 
+         case GGML_OP_OUT_PROD:
