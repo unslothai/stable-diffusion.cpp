@@ -53,9 +53,13 @@ Add `--ref-image` (or `-r`) for reference-image editing:
 as `<Picture 1>`, `<Picture 2>`, and so on, with up to 16 references supported
 by the model. Prompts are passed through without an automatic editing prefix.
 
-Reference images keep their aspect ratio. The text encoder sees a 1024-pixel
-short edge, while VAE inputs use a short edge between 1024 and 2048 pixels.
-Small references are enlarged and dimensions are rounded to multiples of 32.
+Reference images keep their aspect ratio. As in the release, each consumer
+sizes a reference on its own: the VAE keeps the original pixels while the short
+edge is between 1024 and 2048 pixels (otherwise a Lanczos resize puts it on the
+nearer bound, both sides rounded to 32), then crops at the top left to whole
+16-pixel VAE cells and the latent to whole 2x2 patches; the text encoder sees
+the reference with a 1024-pixel short edge. The reference latent is the VAE
+posterior sample rounded to float16, noised to t = 0.999.
 
 ## Shape and runtime notes
 
@@ -63,3 +67,14 @@ Small references are enlarged and dimensions are rounded to multiples of 32.
 - Start at 1024 × 1024. Larger canvases and more references increase memory use.
 - Use quantized weights, `--offload-to-cpu`, and `--vae-tiling` to reduce GPU
   memory requirements.
+- The image VAE always decodes and encodes in the release tile layout (256-pixel
+  tiles, overlaps of at least 64 pixels, linear blends), with or without
+  `--vae-tiling`: the decoder attends over a whole tile, so an untiled decode
+  gives a different image. `SD_H3_IMAGE_VAE_TILES=0` uses the generic path.
+- The release generates anything under 4 MP on a larger canvas of the same
+  aspect ratio and resizes the result back down. sd.cpp renders at the
+  requested size; request 2048 × 2048 (or another 4 MP size) for the release
+  behaviour.
+- To convert the checkpoint to GGUF, keep the patch embedding in F32 as for
+  MiniMax-H3 (the output heads keep their source type by name):
+  `sd-cli -M convert -m minimax_h3_image_pruned_bf16.safetensors -o minimax_h3_image_pruned-Q4_K.gguf --type q4_K --tensor-type-rules "(^|\.)video_patch_proj\.weight$=f32,(^|\.)adaln_t_table$=f32"`
