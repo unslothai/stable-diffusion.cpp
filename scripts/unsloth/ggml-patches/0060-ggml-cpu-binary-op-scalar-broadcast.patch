@@ -1,0 +1,42 @@
+CPU binary ops (ADD / SUB / MUL / DIV): when src1 holds one value per row (ne10 == 1, a per-channel bias or scale
+broadcast over [W, H, C] activations, as in every VAE conv bias add and group-norm affine), apply it to the whole row
+in one loop. The contiguous-rows path split such a row into ne00 / ne10 = W calls of vec_binary_op_contiguous with
+n = 1 (vDSP with length 1 under Accelerate), one call per element. Same op on the same operands per element, so the
+result is bit-identical.
+
+diff --git a/src/ggml-cpu/binary-ops.cpp b/src/ggml-cpu/binary-ops.cpp
+index 75e3829..aa9e91a 100644
+--- a/src/ggml-cpu/binary-ops.cpp
++++ b/src/ggml-cpu/binary-ops.cpp
+@@ -33,6 +33,20 @@ static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const sr
+     }
+ }
+ 
++// src1 is one value per row (ne10 == 1, e.g. a per-channel bias or scale over [W, H, C] activations): the same op on
++// every element, in one loop instead of one vec_binary_op_contiguous call per element.
++template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
++static inline void vec_binary_op_scalar(const int64_t n, dst_t * z, const src0_t * x, const src1_t * y) {
++    constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
++    constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
++    constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
++
++    const float v = src1_to_f32(*y);
++    for (int64_t i = 0; i < n; i++) {
++        z[i] = f32_to_dst(op(src0_to_f32(x[i]), v));
++    }
++}
++
+ template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
+ static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t ne10, const int64_t nb10, dst_t * z, const src0_t * x, const src1_t * y) {
+     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
+@@ -90,7 +104,9 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
+         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+ 
+-        if (is_src1_contiguous_rows) {
++        if (is_src1_contiguous_rows && ne10 == 1 && ne00 > 1) {
++            vec_binary_op_scalar<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
++        } else if (is_src1_contiguous_rows) {
+             // src1 is broadcastable across src0 and dst in i1, i2, i3
+             const int64_t nr0 = ne00 / ne10;
+ 
