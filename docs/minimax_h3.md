@@ -182,6 +182,24 @@ The C API exposes the same inputs through `ref_images`, `ref_videos`, and
 `ref_audios` in `sd_vid_gen_params_t`. Each `sd_ref_video_t` supplies its own
 frame rate and optional soundtrack; non-24-fps inputs are resampled internally.
 
+## Sol-H3-VAE decoding
+
+Pass a [Sol-H3-VAE checkpoint](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae)
+with `--vae` to use the distilled video decoder. The ComfyUI FP16 and INT8
+ConvRot checkpoints include the MiniMax-H3 encoder for image and video inputs.
+Supply `--audio-vae` as usual to decode the soundtrack.
+
+Sol decodes the whole clip by default. Use `--vae-tiling` for spatial tiling or
+`--temporal-tiling` for temporal tiling. Either can reduce memory use but may
+affect output quality because the decoder has less context at tile boundaries.
+
+Temporal tiles default to 10 latent frames with 5 latent frames of overlap.
+Set `temporal_tile_frames` and `temporal_tile_overlap` in
+`--extra-tiling-args` to override them. Both must be multiples of 5 latent
+frames, and overlap must be smaller than the tile. The last tile may be shorter.
+Circular decoding requires spatial tiling on each circular axis, with a tile
+size smaller than the input on that axis.
+
 ## Latent hires second pass (two-stage sampling)
 
 MiniMax-H3 supports `--hires` with two interchangeable second-stage upscalers:
@@ -238,5 +256,32 @@ Notes for this mode:
 - Width and height are aligned upward to a multiple of 32.
 - Frame count is aligned upward to the `17k + 5` grid, with a minimum of 5.
 - MiniMax-H3 runs at 24 fps; another requested value is overridden.
+- Attention head grouping is controlled by
+  `--model-args minimax_h3_attn_chunk_budget=2`, in GiB (default: `2`).
+  The budget estimates the size of a single FP32 Q/K tensor per group:
+  `head_dim * tokens * batch * 4 bytes * heads_per_group`. The group size adapts
+  to the sequence length, with a minimum of one head; inputs that fit use all
+  heads together. Set `0` to disable grouping, or a smaller budget such as
+  `0.25` to reduce peak activation memory for long sequences at the cost of
+  extra launches and concatenation. Each head still attends to the full sequence.
+  This is a grouping target, not a cap on total attention memory or VRAM usage;
+  other intermediates, backend workspace, and weights require additional memory.
+  `--max-vram` and `--offload-to-cpu` control weight residency, but the active
+  block's working memory must also fit within the VRAM budget.
 - The default video flow shift is 12. The audio stream is mapped internally to
   its shift of 3, so the regular samplers can operate on the packed AV latent.
+
+## HyperFlow H3 Flash
+
+[HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash)
+uses the shared components and input options described in this guide. Replace
+`--diffusion-model` with the matching HyperFlow FL2VA or Ref2VA checkpoint and
+use these sampling options:
+
+```sh
+--sampling-method euler --cfg-scale 1 --sigmas hyperflow-h3-flash-6
+```
+
+Use `hyperflow-h3-flash-4` or `hyperflow-h3-flash-8` for 4 or 8 steps. These
+presets also work with `--hires-sigmas`; their length determines the step count.
+They already include video flow shift 12, so keep the default flow shift.
