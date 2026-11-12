@@ -477,7 +477,7 @@ ggml_tensor* ggml_ext_conv_2d(GGMLRunnerContext* runner_ctx,
                                            ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
                                            ggml_reshape_2d(ctx, w, (w->ne[0] * w->ne[1] * w->ne[2]), w->ne[3]));
         out                 = ggml_reshape_4d(ctx, out, im2col->ne[1], im2col->ne[2], im2col->ne[3], w->ne[3]);  // [OC, N, OH, OW]
-        x                   = ggml_ext_cont(runner_ctx, ggml_permute(ctx, out, 0, 1, 3, 2));                // [N, OC, OH, OW]
+        x                   = ggml_ext_cont(runner_ctx, ggml_permute(ctx, out, 0, 1, 3, 2));                     // [N, OC, OH, OW]
     }
     if (scale != 1.f) {
         x = ggml_ext_scale(runner_ctx, x, 1.f / scale);

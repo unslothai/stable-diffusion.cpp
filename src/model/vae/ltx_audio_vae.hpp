@@ -394,8 +394,8 @@ namespace LTXV {
         if (f->type != GGML_TYPE_F32) {
             f = ggml_cast(ctx, f, GGML_TYPE_F32);
         }
-        auto kernel = ggml_ext_repeat_4d(runner_ctx, f, f->ne[0], 1, 1, channels);  // [K, 1, 1, C]
-        auto input  = ggml_reshape_4d(ctx, ggml_ext_cont(runner_ctx, x), time, 1, channels, 1);                        // [W, H=1, C, N=1]
+        auto kernel = ggml_ext_repeat_4d(runner_ctx, f, f->ne[0], 1, 1, channels);               // [K, 1, 1, C]
+        auto input  = ggml_reshape_4d(ctx, ggml_ext_cont(runner_ctx, x), time, 1, channels, 1);  // [W, H=1, C, N=1]
         auto out    = ggml_conv_2d_dw_direct(ctx, kernel, input, stride, 1, padding, 0, 1, 1);
         if (!ggml_backend_supports_op(runner_ctx->backend, out)) {
             return nullptr;
