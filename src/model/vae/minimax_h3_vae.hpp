@@ -1023,6 +1023,12 @@ namespace MiniMaxH3VAE {
                 for (int64_t i = 0; i < mean.numel(); ++i) {
                     mean[i] += std::exp(0.5f * std::clamp(logvar[i], -30.f, 20.f)) * noise[i];
                 }
+                if (config.vit_decoder_2d) {
+                    // MiniMax-H3-Image conditions an edit on the posterior sample rounded to float16.
+                    for (int64_t i = 0; i < mean.numel(); ++i) {
+                        mean[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(mean[i]));
+                    }
+                }
                 return mean;
             }
             return vae_output;
