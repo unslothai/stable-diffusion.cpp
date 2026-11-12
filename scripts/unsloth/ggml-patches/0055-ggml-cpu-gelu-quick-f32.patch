@@ -1,0 +1,425 @@
+Upstream ggml-org/llama.cpp 479a52779 (#30737, "ggml-cpu : compute f32 gelu_quick and geglu_quick without the fp16 table"), MIT.
+F32 gelu_quick / geglu_quick (the CLIP text encoders: SD1.x, SDXL, FLUX.1 CLIP-L) went through a 64K-entry
+fp16 lookup table, rounding the input to fp16 first. They now compute x / (1 + exp(-1.702 x)) in f32 with the
+existing SIMD expf (AVX512 / AVX2 / SSE2 / SVE / NEON / RVV); the fp16 and bf16 paths are unchanged.
+Not bit-identical to the table (more accurate). The VXE branch is dropped (this ggml has no VXE expf).
+Includes the upstream test-gelu-quick (F32 kernels vs a double-precision reference) and test-backend-ops cases.
+
+diff --git a/src/ggml-cpu/vec.cpp b/src/ggml-cpu/vec.cpp
+index 3918a6f..6b0bd56 100644
+--- a/src/ggml-cpu/vec.cpp
++++ b/src/ggml-cpu/vec.cpp
+@@ -452,6 +452,84 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float *
+     }
+ }
+ 
++#ifndef GGML_GELU_QUICK_FP16
++// computed in f32 without the fp16 table, which loses precision on f32 input
++void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
++    int i = 0;
++#if defined(__AVX512F__) && defined(__AVX512DQ__)
++    for (; i + 15 < n; i += 16) {
++        _mm512_storeu_ps(y + i, ggml_v_gelu_quick(_mm512_loadu_ps(x + i)));
++    }
++#elif defined(__AVX2__) && defined(__FMA__)
++    for (; i + 7 < n; i += 8) {
++        _mm256_storeu_ps(y + i, ggml_v_gelu_quick(_mm256_loadu_ps(x + i)));
++    }
++#elif defined(__SSE2__)
++    for (; i + 3 < n; i += 4) {
++        _mm_storeu_ps(y + i, ggml_v_gelu_quick(_mm_loadu_ps(x + i)));
++    }
++#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
++    const int vlen = svcntw();
++    for (; i < n; i += vlen) {
++        const svbool_t pg = svwhilelt_b32_s32(i, n);
++        svst1_f32(pg, y + i, ggml_v_gelu_quick(pg, svld1_f32(pg, x + i)));
++    }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    for (; i + 3 < n; i += 4) {
++        vst1q_f32(y + i, ggml_v_gelu_quick(vld1q_f32(x + i)));
++    }
++#elif defined(__riscv_v_intrinsic)
++    for (int vl; i < n; i += vl) {
++        vl = __riscv_vsetvl_e32m2(n - i);
++        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
++        vfloat32m2_t vy = ggml_v_gelu_quick_m2(vx, vl);
++        __riscv_vse32_v_f32m2(&y[i], vy, vl);
++    }
++#endif
++    for (; i < n; ++i) {
++        y[i] = ggml_gelu_quick_f32(x[i]);
++    }
++}
++
++void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
++    int i = 0;
++#if defined(__AVX512F__) && defined(__AVX512DQ__)
++    for (; i + 15 < n; i += 16) {
++        _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_gelu_quick(_mm512_loadu_ps(x + i)), _mm512_loadu_ps(g + i)));
++    }
++#elif defined(__AVX2__) && defined(__FMA__)
++    for (; i + 7 < n; i += 8) {
++        _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_gelu_quick(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
++    }
++#elif defined(__SSE2__)
++    for (; i + 3 < n; i += 4) {
++        _mm_storeu_ps(y + i, _mm_mul_ps(ggml_v_gelu_quick(_mm_loadu_ps(x + i)), _mm_loadu_ps(g + i)));
++    }
++#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
++    const int vlen = svcntw();
++    for (; i < n; i += vlen) {
++        const svbool_t pg = svwhilelt_b32_s32(i, n);
++        svst1_f32(pg, y + i, svmul_f32_x(pg, ggml_v_gelu_quick(pg, svld1_f32(pg, x + i)), svld1_f32(pg, g + i)));
++    }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    for (; i + 3 < n; i += 4) {
++        vst1q_f32(y + i, vmulq_f32(ggml_v_gelu_quick(vld1q_f32(x + i)), vld1q_f32(g + i)));
++    }
++#elif defined(__riscv_v_intrinsic)
++    for (int vl; i < n; i += vl) {
++        vl = __riscv_vsetvl_e32m2(n - i);
++        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
++        vfloat32m2_t vg = __riscv_vle32_v_f32m2(&g[i], vl);
++        vfloat32m2_t vy = __riscv_vfmul_vv_f32m2(ggml_v_gelu_quick_m2(vx, vl), vg, vl);
++        __riscv_vse32_v_f32m2(&y[i], vy, vl);
++    }
++#endif
++    for (; i < n; ++i) {
++        y[i] = ggml_gelu_quick_f32(x[i]) * g[i];
++    }
++}
++#endif
++
+ ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {
+     int i = 0;
+     ggml_float sum = 0;
+diff --git a/src/ggml-cpu/vec.h b/src/ggml-cpu/vec.h
+index 0bf68d5..06f8696 100644
+--- a/src/ggml-cpu/vec.h
++++ b/src/ggml-cpu/vec.h
+@@ -44,7 +44,6 @@ inline static ggml_float ggml_sve_sum_f32x2(svfloat32_t sum_lo, svfloat32_t sum_
+ #endif
+ 
+ #define GGML_GELU_FP16
+-#define GGML_GELU_QUICK_FP16
+ 
+ #define GGML_SOFT_MAX_UNROLL 4
+ #define GGML_VEC_DOT_UNROLL  2
+@@ -1054,11 +1053,7 @@ inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float *
+     }
+ }
+ #else
+-inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
+-    for (int i = 0; i < n; ++i) {
+-        y[i] = ggml_gelu_quick_f32(x[i]);
+-    }
+-}
++void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x);
+ #endif
+ 
+ // Sigmoid Linear Unit (SiLU) function
+@@ -1143,6 +1138,13 @@ inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
+     return svdiv_f32_x(pg, x, one_plus_exp_neg_x);
+ }
+ 
++// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
++inline static svfloat32_t ggml_v_gelu_quick(svbool_t pg, svfloat32_t x) {
++    const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
++    const svfloat32_t exp_cx = ggml_v_expf(pg, svmul_n_f32_x(pg, x, GELU_QUICK_COEF));
++    return svdiv_f32_x(pg, x, svadd_f32_x(pg, one, exp_cx));
++}
++
+ #elif defined(__ARM_NEON) && defined(__aarch64__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1182,6 +1184,13 @@ inline static float32x4_t ggml_v_silu(float32x4_t x) {
+     return vdivq_f32(x, one_plus_exp_neg_x);
+ }
+ 
++// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
++inline static float32x4_t ggml_v_gelu_quick(float32x4_t x) {
++    const float32x4_t one = vdupq_n_f32(1.0f);
++    const float32x4_t exp_cx = ggml_v_expf(vmulq_n_f32(x, GELU_QUICK_COEF));
++    return vdivq_f32(x, vaddq_f32(one, exp_cx));
++}
++
+ #elif defined(__AVX512F__) && defined(__AVX512DQ__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1225,6 +1234,13 @@ inline static __m512 ggml_v_silu(__m512 x) {
+     return _mm512_div_ps(x, one_plus_exp_neg_x);
+ }
+ 
++// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
++inline static __m512 ggml_v_gelu_quick(__m512 x) {
++    const __m512 one = _mm512_set1_ps(1);
++    const __m512 exp_cx = ggml_v_expf(_mm512_mul_ps(x, _mm512_set1_ps(GELU_QUICK_COEF)));
++    return _mm512_div_ps(x, _mm512_add_ps(one, exp_cx));
++}
++
+ #elif defined(__AVX2__) && defined(__FMA__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1280,6 +1296,13 @@ inline static __m256 ggml_v_silu(__m256 x) {
+     return _mm256_div_ps(x, one_plus_exp_neg_x);
+ }
+ 
++// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
++inline static __m256 ggml_v_gelu_quick(__m256 x) {
++    const __m256 one = _mm256_set1_ps(1);
++    const __m256 exp_cx = ggml_v_expf(_mm256_mul_ps(x, _mm256_set1_ps(GELU_QUICK_COEF)));
++    return _mm256_div_ps(x, _mm256_add_ps(one, exp_cx));
++}
++
+ #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
+ 
+ #if defined(__FMA__)
+@@ -1334,6 +1357,13 @@ inline static __m128 ggml_v_silu(__m128 x) {
+     return _mm_div_ps(x, one_plus_exp_neg_x);
+ }
+ 
++// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
++inline static __m128 ggml_v_gelu_quick(__m128 x) {
++    const __m128 one = _mm_set1_ps(1);
++    const __m128 exp_cx = ggml_v_expf(_mm_mul_ps(x, _mm_set1_ps(GELU_QUICK_COEF)));
++    return _mm_div_ps(x, _mm_add_ps(one, exp_cx));
++}
++
+ #elif defined(__riscv_v_intrinsic)
+ 
+ // adapted from arm limited optimized routine
+@@ -1386,6 +1416,12 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
+     return __riscv_vfdiv_vv_f32m2(x, one_plus_exp_neg_x, vl);
+ }
+ 
++// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
++inline static vfloat32m2_t ggml_v_gelu_quick_m2(vfloat32m2_t x, int vl) {
++    const vfloat32m2_t exp_cx = ggml_v_expf_m2(__riscv_vfmul_vf_f32m2(x, GELU_QUICK_COEF, vl), vl);
++    return __riscv_vfdiv_vv_f32m2(x, __riscv_vfadd_vf_f32m2(exp_cx, 1.0f, vl), vl);
++}
++
+ #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
+ 
+ inline static void ggml_vec_silu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+@@ -1531,11 +1567,7 @@ inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float
+     }
+ }
+ #else
+-inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
+-    for (int i = 0; i < n; ++i) {
+-        y[i] = ggml_gelu_quick_f32(x[i]) * g[i];
+-    }
+-}
++void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g);
+ #endif
+ 
+ inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 33c570f..285aad4 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -187,6 +187,14 @@ if (NOT GGML_BACKEND_DL)
+     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+ 
++    #
++    # test-gelu-quick
++
++    set(TEST_TARGET test-gelu-quick)
++    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
++    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
++    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
++
+     #
+     # test-opt
+     set(TEST_TARGET test-opt)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 86929e0..ce7446d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2069,6 +2069,15 @@ struct test_unary : public test_case {
+         return VARS_TO_STR3(type, ne_a, v);
+     }
+ 
++    double max_nmse_err(ggml_backend_t backend) override {
++        // Metal computes f32 gelu_quick in f32, so an fp16 table in the CPU reference (NMSE about 5e-8) fails this
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        if (op == GGML_UNARY_OP_GELU_QUICK && type == GGML_TYPE_F32 && strcmp(ggml_backend_reg_name(reg), "MTL") == 0) {
++            return 1e-10;
++        }
++        return test_case::max_nmse_err(backend);
++    }
++
+     test_unary(ggml_unary_op op,
+             ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
+@@ -2157,6 +2166,15 @@ struct test_glu : public test_case {
+         return VARS_TO_STR4(type, ne_a, v, swapped);
+     }
+ 
++    double max_nmse_err(ggml_backend_t backend) override {
++        // Metal computes f32 geglu_quick in f32, so an fp16 table in the CPU reference (NMSE about 5e-8) fails this
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        if (op == GGML_GLU_OP_GEGLU_QUICK && type == GGML_TYPE_F32 && strcmp(ggml_backend_reg_name(reg), "MTL") == 0) {
++            return 1e-10;
++        }
++        return test_case::max_nmse_err(backend);
++    }
++
+     test_glu(ggml_glu_op op,
+             ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
+@@ -2316,6 +2334,15 @@ struct test_glu_split : public test_case {
+         return VARS_TO_STR3(type, ne_a, v) + ",split";
+     }
+ 
++    double max_nmse_err(ggml_backend_t backend) override {
++        // Metal computes f32 geglu_quick in f32, so an fp16 table in the CPU reference (NMSE about 5e-8) fails this
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        if (op == GGML_GLU_OP_GEGLU_QUICK && type == GGML_TYPE_F32 && strcmp(ggml_backend_reg_name(reg), "MTL") == 0) {
++            return 1e-10;
++        }
++        return test_case::max_nmse_err(backend);
++    }
++
+     test_glu_split(ggml_glu_op op,
+             ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
+diff --git a/tests/test-gelu-quick.cpp b/tests/test-gelu-quick.cpp
+new file mode 100644
+index 0000000..29cbbc8
+--- /dev/null
++++ b/tests/test-gelu-quick.cpp
+@@ -0,0 +1,131 @@
++// test-gelu-quick.cpp: validate the F32 gelu_quick and geglu_quick CPU kernels against the exact formula.
++//
++// test-backend-ops uses the CPU backend as its reference, so it cannot see an error in the CPU kernels
++// themselves. This test computes gelu_quick(x) = x / (1 + exp(-1.702 x)) in double precision and compares
++// every F32 output of the CPU backend with it: dense ranges, values outside the F16 range, values near
++// the float limits, and lengths that leave a tail after the vector loop.
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <cfloat>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++// Same coefficient as the CPU kernels
++static const double GELU_QUICK_COEF_REF = (double) 1.702f;
++
++static double gelu_quick_ref(double x) {
++    return x / (1.0 + std::exp(-GELU_QUICK_COEF_REF * x));
++}
++
++// Deterministic LCG mapped to [-1, 1]
++static uint64_t g_rng = 0x12345678ULL;
++static float frand(void) {
++    g_rng = g_rng * 6364136223846793005ULL + 1442695040888963407ULL;
++    return (float)((g_rng >> 33) & 0xffffff) / (float)0x800000 - 1.0f;
++}
++
++static std::vector<float> make_inputs(void) {
++    std::vector<float> x;
++    for (int i = 0; i <= 200000; i++) {
++        x.push_back(-10.0f + 20.0f * (float) i / 200000.0f);
++    }
++    for (int i = 0; i <= 2000; i++) {
++        x.push_back(-150.0f + 300.0f * (float) i / 2000.0f);
++    }
++    // outside the F16 range, near the float limits, and subnormal; both signs
++    const float edge[] = { 65504.0f, 65520.0f, 1e5f, 1e10f, 1e30f, FLT_MAX, 1e-30f, FLT_MIN, FLT_MIN / 16, 0.0f };
++    for (float v : edge) {
++        x.push_back(v);
++        x.push_back(-v);
++    }
++    return x;
++}
++
++static bool matches(float y, double ref) {
++    if (std::isnan(ref)) {
++        return std::isnan(y);
++    }
++    if (std::isinf(ref)) {
++        return (double) y == ref;
++    }
++    return std::fabs((double) y - ref) <= 1e-6 + 1e-6 * std::fabs(ref);
++}
++
++// Runs gelu_quick and geglu_quick on x[0, n) and returns the number of outputs that differ from the reference
++static int check(const float * x, const float * g, int64_t n) {
++    struct ggml_init_params params = {
++        /* .mem_size   = */ (size_t) 64 << 20,
++        /* .mem_base   = */ NULL,
++        /* .no_alloc   = */ false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    memcpy(a->data, x, n * sizeof(float));
++    memcpy(b->data, g, n * sizeof(float));
++
++    struct ggml_tensor * y_gelu  = ggml_gelu_quick(ctx, a);
++    struct ggml_tensor * y_geglu = ggml_geglu_quick_split(ctx, a, b);
++
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, y_gelu);
++    ggml_build_forward_expand(gf, y_geglu);
++    ggml_graph_compute_with_ctx(ctx, gf, 1);
++
++    int    bad     = 0;
++    double max_err = 0.0;
++    for (int64_t i = 0; i < n; i++) {
++        const double r0 = gelu_quick_ref(x[i]);
++        const double r1 = r0 * g[i];
++        const float  y0 = ((const float *) y_gelu->data)[i];
++        const float  y1 = ((const float *) y_geglu->data)[i];
++        if (std::isfinite(r0) && std::isfinite(y0)) {
++            max_err = std::fmax(max_err, std::fabs((double) y0 - r0) / (1.0 + std::fabs(r0)));
++        }
++        if (!matches(y0, r0)) {
++            if (bad < 3) {
++                printf("  gelu_quick(%g) = %g, expected %g\n", x[i], y0, r0);
++            }
++            bad++;
++        }
++        if (!matches(y1, r1)) {
++            if (bad < 3) {
++                printf("  geglu_quick(%g, %g) = %g, expected %g\n", x[i], g[i], y1, r1);
++            }
++            bad++;
++        }
++    }
++    printf("gelu_quick n=%6d: max err %.2e, %d mismatches %s\n", (int) n, max_err, bad, bad == 0 ? "OK" : "FAIL");
++
++    ggml_free(ctx);
++    return bad;
++}
++
++int main(void) {
++    const std::vector<float> x = make_inputs();
++    std::vector<float> g(x.size());
++    for (float & v : g) {
++        v = frand();
++    }
++
++    int fails = 0;
++
++    // every input in one call
++    fails += check(x.data(), g.data(), (int64_t) x.size()) != 0;
++
++    // short lengths end on the edge values and leave a tail after the vector loop
++    const int64_t lengths[] = { 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 23, 31, 33 };
++    for (int64_t n : lengths) {
++        const int64_t off = (int64_t) x.size() - n;
++        fails += check(x.data() + off, g.data() + off, n) != 0;
++    }
++
++    printf(fails == 0 ? "all gelu_quick checks passed\n" : "%d gelu_quick checks FAILED\n", fails);
++    return fails == 0 ? 0 : 1;
++}
