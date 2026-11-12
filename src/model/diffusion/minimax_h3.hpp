@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <tuple>
@@ -986,19 +987,42 @@ namespace MiniMaxH3 {
                                 ggml_add(ctx->ggml_ctx, value, ggml_mul(ctx->ggml_ctx, value, row[1])),
                                 row[0]);
             };
-            auto prediction = video_out->forward(ctx, apply(video));
+            ggml_tensor* prediction = nullptr;
             if (config.pdd_num_inference_steps > 1) {
                 GGML_ASSERT(std::isfinite(sigma_next));
-                auto weights      = pdd_head_weights(sigma, sigma_next);
-                const int64_t dim = prediction->ne[0] / config.pdd_num_inference_steps;
-                auto blended      = ggml_ext_scale(ctx, ggml_ext_slice(ctx, prediction, 0, 0, dim), weights[0]);
+                auto weights = pdd_head_weights(sigma, sigma_next);
+                auto x       = apply(video);
+                // Only the heads with a non-zero blend weight are computed (two per step on the 6-step grid), each as
+                // its own row block of the stacked bank, as the release applies one head per step. Quantized or
+                // adapted banks keep the full projection.
+                std::map<std::string, ggml_tensor*> bank;
+                video_out->get_param_tensors(bank);
+                ggml_tensor* weight = bank.count("weight") ? bank["weight"] : nullptr;
+                ggml_tensor* bias   = bank.count("bias") ? bank["bias"] : nullptr;
+                const bool by_rows  = weight != nullptr && bias != nullptr && bank.size() == 2 && ctx->weight_adapter == nullptr &&
+                                     (weight->type == GGML_TYPE_F32 || weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_BF16);
+                ggml_tensor* full   = by_rows ? nullptr : video_out->forward(ctx, x);
+                const int64_t dim   = (by_rows ? weight->ne[1] : full->ne[0]) / config.pdd_num_inference_steps;
+                auto head           = [&](int64_t i) {
+                    if (!by_rows) {
+                        return ggml_ext_slice(ctx, full, 0, i * dim, (i + 1) * dim);
+                    }
+                    auto w = ggml_view_2d(ctx->ggml_ctx, weight, weight->ne[0], dim, weight->nb[1], i * dim * weight->nb[1]);
+                    auto b = ggml_view_1d(ctx->ggml_ctx, bias, dim, i * dim * ggml_element_size(bias));
+                    return ggml_add(ctx->ggml_ctx, ggml_mul_mat(ctx->ggml_ctx, w, x), b);
+                };
+                auto weighted = [&](int64_t i) {
+                    auto value = head(i);
+                    return weights[i] == 1.f ? value : ggml_ext_scale(ctx, value, weights[i]);
+                };
+                prediction = weighted(0);
                 for (int64_t i = 1; i < config.pdd_num_inference_steps; ++i) {
                     if (weights[i] != 0.f) {
-                        auto offset = ggml_ext_slice(ctx, prediction, 0, i * dim, (i + 1) * dim);
-                        blended     = ggml_add(ctx->ggml_ctx, blended, ggml_ext_scale(ctx, offset, weights[i]));
+                        prediction = ggml_add(ctx->ggml_ctx, prediction, weighted(i));
                     }
                 }
-                prediction = blended;
+            } else {
+                prediction = video_out->forward(ctx, apply(video));
             }
             ggml_tensor* audio_prediction = nullptr;
             if (config.audio_latent_channels > 0) {
