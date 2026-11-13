@@ -83,6 +83,7 @@ namespace sd {
 
         std::map<uintptr_t, std::unique_ptr<ExecutionSession>> sessions_;
         DeviceResidencyManager* manager_;
+        bool warned_probe_allocation_ = false;
 
         void sync_residency(ExecutionSession& session);
 

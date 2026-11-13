@@ -1271,6 +1271,7 @@ void ModelManager::free_compute_staging_block(ComputeStagingBlock& block) {
     }
 
     if (block.buffer != nullptr) {
+        note_device_release(block.buffer);
         ggml_backend_buffer_free(block.buffer);
         block.buffer = nullptr;
     }
@@ -1331,6 +1332,7 @@ void ModelManager::release_compute_staging_blocks(bool force,
 
 void ModelManager::free_params_storage_block(ParamsStorageBlock& block) {
     if (block.buffer != nullptr) {
+        note_device_release(block.buffer);
         ggml_backend_buffer_free(block.buffer);
         block.buffer = nullptr;
     }
@@ -1413,6 +1415,11 @@ void ModelManager::erase_params_storage_block(ParamsStorageBlock* block) {
 
 void ModelManager::release_all() {
     clear_all_prefetched_params();
+    for (const auto& entry : runtime_residencies_) {
+        if (entry.second.compute_backend != nullptr) {
+            note_device_release(ggml_backend_get_device(entry.second.compute_backend), entry.second.resident_bytes);
+        }
+    }
     runtime_residencies_.clear();
     runtime_owners_.clear();
     for (auto& state : tensor_states_) {
@@ -1644,6 +1651,11 @@ void ModelManager::update_runtime_residency(uintptr_t owner_id,
                                             size_t resident_bytes) {
     if (owner_id == 0) {
         return;
+    }
+    auto previous = runtime_residencies_.find({owner_id, compute_backend});
+    if (previous != runtime_residencies_.end() && compute_backend != nullptr &&
+        previous->second.resident_bytes > resident_bytes) {
+        note_device_release(ggml_backend_get_device(compute_backend), previous->second.resident_bytes - resident_bytes);
     }
     if (compute_backend == nullptr || resident_bytes == 0) {
         runtime_residencies_.erase({owner_id, compute_backend});
@@ -1922,11 +1934,132 @@ void ModelManager::remove_runtime_owner(uintptr_t owner_id) {
     }
     for (auto it = runtime_residencies_.begin(); it != runtime_residencies_.end();) {
         if (it->first.first == owner_id) {
+            if (it->second.compute_backend != nullptr) {
+                note_device_release(ggml_backend_get_device(it->second.compute_backend), it->second.resident_bytes);
+            }
             it = runtime_residencies_.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+static int64_t release_credit_window_ms() {
+    // SD_VRAM_RELEASE_CREDIT_MS=0 turns the release credit off.
+    static const int64_t window_ms = []() -> int64_t {
+        const char* value = std::getenv("SD_VRAM_RELEASE_CREDIT_MS");
+        if (value == nullptr || *value == '\0') {
+            return 10000;
+        }
+        return std::max<int64_t>(0, std::atoll(value));
+    }();
+    return window_ms;
+}
+
+sd::DeviceReleaseCredit& ModelManager::release_credit(ggml_backend_dev_t device) const {
+    auto it = release_credits_.find(device);
+    if (it == release_credits_.end()) {
+        it = release_credits_.emplace(device, sd::DeviceReleaseCredit(release_credit_window_ms())).first;
+    }
+    return it->second;
+}
+
+void ModelManager::note_device_release(ggml_backend_dev_t device, size_t bytes) const {
+    if (device != nullptr && bytes > 0 && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        release_credit(device).note_release(bytes, ggml_time_ms());
+    }
+}
+
+void ModelManager::note_device_release(ggml_backend_buffer_t buffer) const {
+    if (buffer == nullptr || ggml_backend_buffer_is_host(buffer)) {
+        return;
+    }
+    const size_t bytes = ggml_backend_buffer_get_size(buffer);
+    auto buffer_type   = ggml_backend_buffer_get_type(buffer);
+    auto split_devices = split_buffer_devices_.find(buffer_type);
+    if (split_devices != split_buffer_devices_.end()) {
+        // Residency charges a split buffer's full size on every participant; release it the same way.
+        for (const auto& entry : split_devices->second) {
+            note_device_release(ggml_backend_get_device(entry.first), bytes);
+        }
+        return;
+    }
+    note_device_release(buffer_type != nullptr ? ggml_backend_buft_get_device(buffer_type) : nullptr, bytes);
+}
+
+size_t ModelManager::credited_free_bytes(ggml_backend_t backend, size_t free_bytes, size_t total_bytes, bool fresh) const {
+    auto device = ggml_backend_get_device(backend);
+    if (device == nullptr || total_bytes == 0 || release_credit_window_ms() == 0) {
+        return free_bytes;
+    }
+    const size_t weights = compute_backend_resident_bytes(backend);
+    const size_t runtime = other_runtime_resident_bytes(0, backend);
+    const size_t tracked = runtime > SIZE_MAX - weights ? SIZE_MAX : weights + runtime;
+    const size_t credit  = release_credit(device).credit(free_bytes, total_bytes, tracked, ggml_time_ms(), fresh);
+    if (credit == 0) {
+        return free_bytes;
+    }
+    const size_t credited = credit > total_bytes - std::min(free_bytes, total_bytes) ? total_bytes : free_bytes + credit;
+    if (!logged_release_credit_) {
+        logged_release_credit_ = true;
+        LOG_INFO("model manager memory on %s: reported free %.2f MB does not show %.2f MB this process just released; counting it as free (SD_VRAM_RELEASE_CREDIT_MS=0 disables)",
+                 ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), credit / (1024.0 * 1024.0));
+    } else {
+        LOG_DEBUG("model manager memory on %s: reported free %.2f MB, crediting %.2f MB released, not yet reported",
+                  ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), credit / (1024.0 * 1024.0));
+    }
+    return credited;
+}
+
+bool ModelManager::probe_device_allocation(ggml_backend_t backend, size_t bytes) const {
+    // SD_VRAM_PROBE_ALLOC=0 keeps a short reading final.
+    static const bool enabled = []() {
+        const char* value = std::getenv("SD_VRAM_PROBE_ALLOC");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled && try_device_allocation(backend, bytes);
+}
+
+bool ModelManager::release_credit_holds(ggml_backend_t backend, const CapacityCheck& capacity) const {
+    if (capacity.release_credit_bytes == 0 ||
+        capacity.available_device_bytes - capacity.release_credit_bytes >= capacity.required_device_bytes) {
+        return true;
+    }
+    // The credit decides this check: confirm it once with a real allocation of what is needed.
+    auto& credit = release_credit(ggml_backend_get_device(backend));
+    if (credit.verified(capacity.required_device_bytes)) {
+        return true;
+    }
+    if (try_device_allocation(backend, capacity.required_device_bytes)) {
+        credit.set_verified(capacity.required_device_bytes);
+        return true;
+    }
+    LOG_WARN("model manager: %s could not allocate %.2f MB; not counting %.2f MB of released memory as free",
+             ggml_backend_name(backend), capacity.required_device_bytes / (1024.0 * 1024.0),
+             capacity.release_credit_bytes / (1024.0 * 1024.0));
+    credit.reject();
+    return false;
+}
+
+bool ModelManager::try_device_allocation(ggml_backend_t backend, size_t bytes) const {
+    if (backend == nullptr || bytes == 0 || bytes == SIZE_MAX) {
+        return false;
+    }
+    auto buffer_type = ggml_backend_get_default_buffer_type(backend);
+    if (buffer_type == nullptr || ggml_backend_buft_is_host(buffer_type)) {
+        return false;
+    }
+    const size_t max_size = ggml_backend_buft_get_max_size(buffer_type);
+    if (max_size != 0 && bytes > max_size) {
+        return false;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buffer_type, bytes);
+    if (buffer == nullptr) {
+        return false;
+    }
+    note_device_release(buffer);
+    ggml_backend_buffer_free(buffer);
+    return true;
 }
 
 ModelManager::CapacityCheck ModelManager::check_capacity(
@@ -1949,7 +2082,22 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
 #endif
     result.required_device_bytes = add(add(request.pending_allocation_bytes, missing), safety_margin);
     result.required_budget_bytes = add(request.runtime_peak_bytes(), missing);
-    auto available_device_bytes  = [&](ggml_backend_t backend) {
+    std::map<ggml_backend_t, size_t> split_devices;
+    for (auto state : states) {
+        auto placement = split_buffer_devices_.find(split_buffer_type_for(*state));
+        if (placement != split_buffer_devices_.end()) {
+            for (const auto& entry : placement->second) {
+                auto inserted = split_devices.emplace(entry);
+                if (!inserted.second && entry.second > 0) {
+                    auto& limit = inserted.first->second;
+                    limit       = limit == 0 ? entry.second : std::min(limit, entry.second);
+                }
+            }
+        }
+    }
+    // Split buffers are charged on every participant; a release credit there is not verifiable per device.
+    result.split_placement      = !split_devices.empty();
+    auto available_device_bytes = [&](ggml_backend_t backend) {
         auto device = ggml_backend_get_device(backend);
         if (device == nullptr) {
             return SIZE_MAX;
@@ -1959,24 +2107,32 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         const bool reusable  = request.reuse_device_query && request.pending_allocation_bytes == 0 && missing == 0;
         const auto cache_key = std::make_pair(request.owner_id, device);
         auto cached          = device_query_cache_.find(cache_key);
+        bool fresh           = false;
         if (reusable && cached != device_query_cache_.end()) {
             free_bytes  = cached->second.first;
             total_bytes = cached->second.second;
         } else {
             ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+            fresh = true;
             if (reusable) {
                 device_query_cache_[cache_key] = {free_bytes, total_bytes};
             } else if (cached != device_query_cache_.end()) {
                 device_query_cache_.erase(cached);
             }
         }
+        const size_t reported_free = free_bytes;
+        if (!result.split_placement) {
+            free_bytes = credited_free_bytes(backend, free_bytes, total_bytes, fresh);
+        }
+        const size_t credit           = free_bytes - reported_free;
         const size_t weights_resident = compute_backend_resident_bytes(backend);
         const size_t other_runtime    = other_runtime_resident_bytes(request.owner_id, backend);
         const size_t resident         = add(weights_resident, add(other_runtime, request.runtime_resident_bytes));
         if (log_details) {
-            LOG_WARN("model manager memory on %s: reported free %.2f MB / total %.2f MB, tracked weights %.2f MB / other runtime %.2f MB / current runtime %.2f MB",
+            LOG_WARN("model manager memory on %s: reported free %.2f MB (+%.2f MB released, not yet reported) / total %.2f MB, tracked weights %.2f MB / other runtime %.2f MB / current runtime %.2f MB",
                      ggml_backend_name(backend),
-                     free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
+                     reported_free / (1024.0 * 1024.0), (free_bytes - reported_free) / (1024.0 * 1024.0),
+                     total_bytes / (1024.0 * 1024.0),
                      weights_resident / (1024.0 * 1024.0), other_runtime / (1024.0 * 1024.0),
                      request.runtime_resident_bytes / (1024.0 * 1024.0));
         }
@@ -1994,8 +2150,13 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             free_bytes                   = total_bytes;
             result.wrapped_device_report = true;
         }
+        size_t uncredited = free_bytes > credit ? free_bytes - credit : 0;
         if (total_bytes > 0) {
             free_bytes = std::min(free_bytes, resident < total_bytes ? total_bytes - resident : 0);
+            uncredited = std::min(uncredited, free_bytes);
+        }
+        if (backend == request.compute_backend) {
+            result.release_credit_bytes = free_bytes - uncredited;
         }
         return free_bytes;
     };
@@ -2020,19 +2181,6 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         result.available_budget_bytes = resident < request.max_backend_bytes
                                             ? request.max_backend_bytes - resident
                                             : 0;
-    }
-    std::map<ggml_backend_t, size_t> split_devices;
-    for (auto state : states) {
-        auto placement = split_buffer_devices_.find(split_buffer_type_for(*state));
-        if (placement != split_buffer_devices_.end()) {
-            for (const auto& entry : placement->second) {
-                auto inserted = split_devices.emplace(entry);
-                if (!inserted.second && entry.second > 0) {
-                    auto& limit = inserted.first->second;
-                    limit       = limit == 0 ? entry.second : std::min(limit, entry.second);
-                }
-            }
-        }
     }
     // GGML exposes only a split buffer's total size, not per-device allocations.
     // Charge that upper bound on every participant instead of undercounting a shard.
@@ -2190,7 +2338,10 @@ bool ModelManager::fits_compute_backend_capacity(
         return false;
     }
     const auto capacity = check_capacity(request, states);
-    return !capacity.requires_reclamation && capacity.fits();
+    if (!capacity.fits()) {
+        return false;
+    }
+    return request.compute_backend == nullptr || release_credit_holds(request.compute_backend, capacity);
 }
 
 bool ModelManager::ensure_compute_backend_capacity(

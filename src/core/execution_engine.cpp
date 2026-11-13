@@ -852,19 +852,22 @@ namespace sd {
         const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
         const std::vector<ggml_tensor*>& protected_params) {
         GGML_ASSERT(&manager == manager_);
-        auto capacity      = [&]() { return manager.inspect_compute_backend_capacity(request, required_params); };
+        auto capacity = [&]() { return manager.inspect_compute_backend_capacity(request, required_params); };
+        auto accept   = [&](const DeviceMemoryCapacity& available, bool after_reclamation) {
+            return available.fits(after_reclamation) && manager.release_credit_holds(request.compute_backend, available);
+        };
         const auto initial = capacity();
         if (!initial.valid) {
             return false;
         }
-        if (initial.fits()) {
+        if (accept(initial, false)) {
             return true;
         }
         for (auto& entry : sessions_) {
             auto& session = *entry.second;
             if (session.owner_id() != request.owner_id && session.workspace_.release()) {
                 sync_residency(session);
-                if (capacity().fits(true)) {
+                if (accept(capacity(), true)) {
                     return true;
                 }
             }
@@ -907,12 +910,12 @@ namespace sd {
             return lhs.last_use_epoch < rhs.last_use_epoch;
         });
         for (const auto& block : candidates) {
-            if (manager.evict_compute_backend_block(block) && capacity().fits(true)) {
+            if (manager.evict_compute_backend_block(block) && accept(capacity(), true)) {
                 return true;
             }
         }
         auto available = capacity();
-        if (available.fits(true)) {
+        if (accept(available, true)) {
             return true;
         }
         if (sd_backend_is(request.compute_backend, "Vulkan") &&
@@ -922,7 +925,7 @@ namespace sd {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
             do {
                 available = capacity();
-                if (available.fits(true)) {
+                if (accept(available, true)) {
                     return true;
                 }
                 if (available.required_budget_bytes > available.available_budget_bytes) {
@@ -930,6 +933,22 @@ namespace sd {
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             } while (std::chrono::steady_clock::now() < deadline);
+        }
+        if (available.valid && !available.requires_reclamation && !available.split_placement &&
+            available.required_budget_bytes <= available.available_budget_bytes &&
+            manager.probe_device_allocation(request.compute_backend, available.required_device_bytes)) {
+            // The allocation, not the reading, decides: a driver can report freed memory late.
+            if (!warned_probe_allocation_) {
+                warned_probe_allocation_ = true;
+                LOG_WARN("execution engine: %s reports %.2f MB free but %.2f MB is needed; a test allocation of that size succeeded, so continuing (free memory reported late)",
+                         ggml_backend_name(request.compute_backend),
+                         available.available_device_bytes / (1024.0 * 1024.0),
+                         available.required_device_bytes / (1024.0 * 1024.0));
+            } else {
+                LOG_DEBUG("execution engine: %s test allocation of %.2f MB succeeded under a short reading",
+                          ggml_backend_name(request.compute_backend), available.required_device_bytes / (1024.0 * 1024.0));
+            }
+            return true;
         }
         available               = manager.inspect_compute_backend_capacity(request, required_params, true);
         const auto device_bytes = available.available_device_bytes == SIZE_MAX

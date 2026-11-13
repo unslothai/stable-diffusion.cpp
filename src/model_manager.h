@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/device_release_credit.h"
 #include "device_residency_manager.h"
 #include "model_component.h"
 #include "model_loader.h"
@@ -98,6 +99,8 @@ private:
     std::map<const ggml_tensor*, TensorState*> tensor_states_by_tensor_;
     mutable std::list<ResolvedTensorStates> resolved_tensor_states_;
     mutable std::map<std::pair<uintptr_t, ggml_backend_dev_t>, std::pair<size_t, size_t>> device_query_cache_;
+    mutable std::map<ggml_backend_dev_t, sd::DeviceReleaseCredit> release_credits_;
+    mutable bool logged_release_credit_ = false;
     std::vector<std::unique_ptr<ParamsStorageBlock>> params_storage_blocks_;
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
@@ -174,6 +177,11 @@ private:
     bool unregister_tensor_states(const std::unordered_set<TensorState*>& states, size_t* size);
     size_t other_runtime_resident_bytes(uintptr_t owner_id,
                                         ggml_backend_t compute_backend) const;
+    sd::DeviceReleaseCredit& release_credit(ggml_backend_dev_t device) const;
+    void note_device_release(ggml_backend_dev_t device, size_t bytes) const;
+    void note_device_release(ggml_backend_buffer_t buffer) const;
+    size_t credited_free_bytes(ggml_backend_t backend, size_t free_bytes, size_t total_bytes, bool fresh) const;
+    bool try_device_allocation(ggml_backend_t backend, size_t bytes) const;
 
 public:
     ~ModelManager() override;
@@ -305,6 +313,8 @@ public:
         ggml_backend_t backend,
         const std::vector<ggml_tensor*>& protected_params) const override;
     bool evict_compute_backend_block(const WeightResidencyBlock& block) override;
+    bool release_credit_holds(ggml_backend_t backend, const DeviceMemoryCapacity& capacity) const override;
+    bool probe_device_allocation(ggml_backend_t backend, size_t bytes) const override;
     WeightPrefetchResult prefetch_params(
         uintptr_t owner_id,
         const std::vector<ggml_tensor*>& tensors) override;

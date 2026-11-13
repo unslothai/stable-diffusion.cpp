@@ -51,6 +51,9 @@ struct DeviceMemoryCapacity {
     bool requires_reclamation     = false;
     bool valid                    = true;
     bool wrapped_device_report    = false;
+    // Split buffers are charged on every participant; a release credit there is not verifiable per device.
+    bool split_placement        = false;
+    size_t release_credit_bytes = 0;  // part of available_device_bytes released, not yet reported as free
 
     bool fits(bool after_reclamation = false) const {
         return valid && !requires_reclamation &&
@@ -113,6 +116,10 @@ public:
         ggml_backend_t backend,
         const std::vector<ggml_tensor*>& protected_params) const { return {}; }
     virtual bool evict_compute_backend_block(const WeightResidencyBlock& block) { return false; }
+    // A check that fits only through released-but-unreported memory is confirmed with a real allocation.
+    virtual bool release_credit_holds(ggml_backend_t backend, const DeviceMemoryCapacity& capacity) const { return true; }
+    // Last resort under a short free-memory reading: a test allocation of the needed size decides.
+    virtual bool probe_device_allocation(ggml_backend_t backend, size_t bytes) const { return false; }
     virtual WeightPrefetchResult prefetch_params(
         uintptr_t owner_id,
         const std::vector<ggml_tensor*>& tensors) = 0;
