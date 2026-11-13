@@ -106,10 +106,12 @@ tile size. These runtime adjustments do not change the caller's parameters.
 Execution failures are not retried. Encoding retries the same way, without the
 temporal step.
 
-`--temporal-tiling` remains independent of spatial tiling. MiniMax H3 always uses
-spatial tiling (256x256 pixels and 25% overlap by default) and its own temporal
-windows. With `--vae-tiling`, its overlap follows `--vae-tile-overlap`; explicit
-spatial sizes are honored.
+`--temporal-tiling` remains independent of spatial tiling. The original MiniMax-H3
+video VAE uses spatial tiling (256x256 pixels and 25% overlap by default) and its own
+temporal windows. With `--vae-tiling`, its overlap follows `--vae-tile-overlap` and
+explicit spatial sizes are honored. [Sol-H3-VAE](minimax_h3.md#sol-h3-vae-decoding)
+decodes the whole clip by default and supports opt-in spatial and block-aligned
+temporal tiling. Tiling may affect output quality.
 
 ## Offload weights to the CPU to save VRAM without reducing generation speed.
 
