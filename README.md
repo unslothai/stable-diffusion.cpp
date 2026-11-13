@@ -15,6 +15,7 @@ API and command-line option may change frequently.***
 
 ## 🔥Important News
 
+* **2026/11/11** 🚀 stable-diffusion.cpp adds **Day-0 support for MiniMax-H3-Image**
 * **2026/10/16** 🚀 stable-diffusion.cpp adds **Day-0 support for MOSS-Image-Base / MOSS-Image-SFT**
 * **2026/10/16** 🚀 stable-diffusion.cpp adds **Day-0 support for FLUX.3 Image Klein / Klein Base**
 * **2026/09/20** 🚀 stable-diffusion.cpp adds **Day-0 support for Qwen-Image-2.1**
@@ -60,6 +61,7 @@ API and command-line option may change frequently.***
     - [Z-Image L2P](./docs/z_image_l2p.md)
     - [MiniT2I](./docs/minit2i.md)
     - [P-H3-Image](./docs/p_h3_image.md)
+    - [MiniMax-H3-Image](./docs/minimax_h3_image.md)
     - [SenseNova U1.5](./docs/sensenova_u1.md)
     - [Ovis-Image](./docs/ovis_image.md)
     - [Anima](./docs/anima.md)
@@ -89,6 +91,9 @@ API and command-line option may change frequently.***
     - [HunyuanVideo 1.5](./docs/hunyuan_video.md)
     - [LingBot-Video](./docs/lingbot_video.md)
     - [Cosmos3-Nano-Sim-Transfer](./docs/cosmos3.md) (video-to-video from edge control)
+  - Video Upscale Models
+    - [RelayVSR](./docs/relay_vsr.md)
+    - [SeedVR2](./docs/seedvr2.md)
   - [PhotoMaker](./docs/photo_maker.md) support.
   - [IP-Adapter](./docs/ip_adapter.md) support (SD 1.5 and SDXL, including Plus)
   - Control Net support with SD 1.5
@@ -97,7 +102,6 @@ API and command-line option may change frequently.***
   - Latent Consistency Models support (LCM/LCM-LoRA)
   - Faster and memory efficient latent decoding with [TAESD](./docs/taesd.md)
   - Upscale images generated with [ESRGAN](./docs/esrgan.md)
-  - Upscale videos with [RelayVSR](./docs/relay_vsr.md) (experimental, 2x and 4x)
 - Supported backends
   - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
   - CUDA
@@ -200,6 +204,9 @@ These projects use `stable-diffusion.cpp` as a backend for their image generatio
 - [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
 - [KoboldCpp](https://github.com/LostRuins/koboldcpp)
 - [Kokon](https://github.com/GabrieleLozupone/kokon)
+- [NodeTool](https://github.com/nodetool-ai/nodetool)
+- [Quo](https://github.com/quo-ai/quo)
+- [Prisme](https://github.com/d3Ita/prisme)
 
 ## Contributors
 
