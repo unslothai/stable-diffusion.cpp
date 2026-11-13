@@ -1,8 +1,8 @@
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 551d62b0..1aa237bc 100644
+index d668af2c..923c0699 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -4383,13 +4383,13 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+@@ -4379,13 +4379,13 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
  
      auto pipeline = ggml_metal_library_get_pipeline_group_norm(lib, op);
  
@@ -22,37 +22,14 @@ index 551d62b0..1aa237bc 100644
  
      const size_t smem = pipeline.smem;
  
-@@ -4400,7 +4400,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
- 
-     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
- 
--    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp, 1, 1, nth, 1, 1);
-+    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp*ne03, 1, 1, nth, 1, 1);
- 
-     return 1;
- }
 diff --git a/src/ggml-metal/kernels/norm.metal b/src/ggml-metal/kernels/norm.metal
-index c76d0c7f..a301bbf0 100644
+index 47b566c2..a87f7d1b 100644
 --- a/src/ggml-metal/kernels/norm.metal
 +++ b/src/ggml-metal/kernels/norm.metal
-@@ -249,7 +249,12 @@ kernel void kernel_group_norm_f32(
-     const int64_t ne = args.ne00*args.ne01*args.ne02;
-     const int64_t gs = args.ne00*args.ne01*((args.ne02 + args.ngrp - 1) / args.ngrp);
- 
--    int start = tgpig * gs;
-+    // src0 is contiguous
-+    const int64_t i03 = tgpig / args.ngrp;
-+    src0 += i03*ne;
-+    dst  += i03*ne;
-+
-+    int start = (tgpig % args.ngrp) * gs;
-     int end   = start + gs;
- 
-     start += tpitg;
-@@ -294,6 +299,9 @@ kernel void kernel_group_norm_f32(
+@@ -297,6 +297,9 @@ kernel void kernel_group_norm_f32(
  
      tmp = simd_sum(tmp);
-     if (ntg > N_SIMDWIDTH) {
+     if (ntg.x > N_SIMDWIDTH) {
 +        // every simdgroup must have read the mean reduction from buf before it is reused
 +        threadgroup_barrier(mem_flags::mem_threadgroup);
 +

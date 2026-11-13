@@ -167,8 +167,7 @@ namespace Cosmos3 {
             auto gctx = ctx->ggml_ctx;
             // attention_ext takes v as [d, kv_heads, Lk] and permutes it back: a view, no copy.
             auto v    = ggml_permute(gctx, v_store, 0, 2, 1, 3);
-            auto out  = ggml_ext_attention_ext(gctx,
-                                               ctx->backend,
+            auto out  = ggml_ext_attention_ext(ctx,
                                                q,
                                                k_store,
                                                v,
@@ -221,7 +220,7 @@ namespace Cosmos3 {
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* timesteps) {
-            auto x = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, static_cast<int>(frequency_embedding_size), 10000, 1.f);
+            auto x = ggml_ext_timestep_embedding(ctx, timesteps, static_cast<int>(frequency_embedding_size), 10000, 1.f);
             x      = std::dynamic_pointer_cast<Linear>(blocks["linear_1"])->forward(ctx, x);
             x      = ggml_silu_inplace(ctx->ggml_ctx, x);
             return std::dynamic_pointer_cast<Linear>(blocks["linear_2"])->forward(ctx, x);

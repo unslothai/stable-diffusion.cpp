@@ -89,8 +89,13 @@ again after reordering.
 
 External inputs stay allocated through the final node. Native graph optimization
 and execution operate on the remaining contiguous ranges, so native fusion cannot
-consume nodes selected by an extension. Intermediate allocations are retained
-in this initial implementation; only their computation is removed.
+consume nodes selected by an extension. Fused intermediates are excluded from
+allocation through the backend's `skip_alloc` callback and
+`ggml_gallocr_set_skipped_tensors`. Their metadata and graph edges remain available,
+but execution must not access their data or buffers. Storage backing the final
+output is retained, including an internal owner used by an in-place final write.
+The skipped set is replaced for each allocation graph; changing which tensors are skipped
+invalidates cached allocation assignments even when tensor shapes are unchanged.
 
 Automatic extension fusion is enabled in scheduler execution with one pipeline
 copy and without evaluation callbacks. Multiple pipeline copies and evaluation
@@ -105,7 +110,7 @@ and backend `graph_plan_*` interfaces do not dispatch these extensions.
 ## Backend services
 
 Packed ComfyUI INT4 linear layers use `sd.linear_w4_convrot.v1`, built by
-`ggml_mul_mat_w4_convrot`. The operator consumes byte-packed I8 weights and the
+`ggml_ext_mul_mat_w4_convrot`. The operator consumes byte-packed I8 weights and the
 explicit output of `sd.quantize_i8_convrot.v1`; F32 callers get a quantization
 node during graph construction. Logical output dimensions are stored in the
 operator attributes, so backend copies of the packed activation do not need to
@@ -125,6 +130,9 @@ Services are discovered through `ggml_backend_reg_get_proc_address`:
 | `ggml_ext_gpu_device_v1` | Query CUDA/HIP/MUSA runtime kind, physical ordinal, shared-memory limit, warp size, and INT8 BLAS capability. |
 | `ggml_ext_gpu_context_v1` | Borrow the matching runtime's device and execution stream. |
 | `ggml_ext_gpu_blas_v1` | Borrow the matching cuBLAS, hipBLAS, or muBLAS handle on that stream. |
+| `ggml_ext_metal_device_v1` | Borrow the Metal device for application pipeline compilation. |
+| `ggml_ext_metal_buffer_v1` | Resolve a backend buffer range to its Metal buffer and offset, including private storage and split allocations. |
+| `ggml_ext_metal_submit_v1` | Encode application commands on a backend-owned command buffer, ordered with native Metal work and tracked by backend synchronization. |
 
 The borrowed cuBLAS handle remains owned by the backend. Extensions must not retain
 or destroy it, or change its stream, pointer mode, math mode, or workspace. This
@@ -137,13 +145,47 @@ Workspace is a backend buffer. Its base is a CUDA device pointer on CUDA; caller
 must use the representation appropriate to their backend. Vulkan extensions use
 the command recording services described below.
 
+CUDA INT8 Linear, RoPE, ConvRot, RMS affine and INT8 gated residual kernels omit output
+scratch when allocation guarantees that a fresh owning output cannot overlap
+live inputs. Existing outputs and views retain overlap protection. Internal
+GEMM and quantization workspace is still reserved when required; kernels also
+handle a null workspace when the entire step needs no scratch.
+
+Compute workspace measurement preserves the storage identities and offsets of
+external tensors, including views. Separate allocations must not share a synthetic
+buffer identity: that can invent overlap, overestimate scratch, and repeatedly
+rebuild a workspace whose actual allocation is smaller than the estimate.
+
 ## sd.cpp integration
 
 `src/core/ggml_extensions.cpp` and `.h` contain the shared operator schemas,
-validation, graph construction helpers, and backend registration entry point.
+validation, and backend registration entry point. Graph construction helpers live
+in `src/core/ggml_extend.cpp` and `.h`; they take `GGMLRunnerContext*` so backend
+selection, compatibility workarounds, and shared ConvRot nodes use the same
+context as the calling model. Per-call precision, scaling, attention, and padding
+options remain explicit. Model blocks retain weight loading and adapter
+orchestration, while the shared helpers own FP8 fallback, embedding lookup,
+full/partial RoPE, grouped convolution, and backend-dependent repeat handling.
+LoRA/LoKr construction, n-mode products, and Kronecker products stay in
+`src/model/adapter/lora_ops.cpp` and `.h`, with the same runner-context interface.
 CPU kernels and fusion rules live in `src/core/cpu/`, with registration collected
 in `cpu/registration.cpp`. CUDA-style and Vulkan implementations live in their
 respective backend directories.
+
+`src/core/metal/int8.mm` registers Metal INT8 linear and ConvRot kernels. Their
+Metal source is embedded at build time and compiled for the selected device
+during registration. The public `ggml-ext-metal.h` services expose borrowed
+objects without private backend headers. The submit callback only encodes work;
+GGML owns submission, cancellation checks, command-buffer lifetime, and
+asynchronous error tracking. Rotation scratch and any overlapping output use
+the scheduler workspace. No full floating-point weight copy is allocated.
+When runtime compilation supports Metal 4 TensorOps, INT8 multiplication uses
+`matmul2d` with INT32 cooperative results and fused scale/bias restoration.
+The SIMD-group implementation remains the fallback for older systems and
+devices where the TensorOps pipeline is unavailable.
+TensorOps multiplies at most 1024 pairs per partial result and combines those
+results with wrapping integer addition. This preserves exact INT32 semantics
+even when TensorOps uses floating-point arithmetic internally.
 
 `ggml_ext_modulate(ctx, x, shift, scale)` emits `sd.modulate.v1` for F32 inputs
 when the runner context uses CPU, CUDA/HIP/MUSA, or Vulkan.
@@ -173,11 +215,13 @@ HIP, MUSA, and Vulkan. Other backends can use the scheduler's CPU fallback.
 The former `ggml_rope_apply` API, builtin opcode, and CPU implementation have
 been removed from ggml.
 
-`src/core/cuda/rope.cu` supplies standalone CUDA RoPE
-and `RMSNorm -> Mul -> RoPE [-> Scale -> FP16 Copy]` fusion. CuTe attention shares
+`src/core/cuda/rope.cu` supplies standalone CUDA RoPE,
+`RMSNorm -> RoPE` fusion for non-affine normalization, and
+`RMSNorm -> Mul -> RoPE [-> Scale -> FP16 Copy]` fusion. CuTe attention shares
 its RMSNorm/RoPE kernel. Partial rotation and arbitrary float-aligned input and
 position-encoding strides are supported by the standalone kernel; RMSNorm fusion
-requires contiguous position encoding and weights. Copy fusion uses workspace
+requires contiguous position encoding and, when present, weights. The non-affine
+fusion uses 64-channel F32 inputs and split-half RoPE. Copy fusion uses workspace
 when the destination overlaps an input. These registrations do not require
 CUTLASS. The old CUDA/HIP/MUSA RoPE dispatch is removed.
 
@@ -202,6 +246,10 @@ ConvRot output fusion. These kernels use only the public extension API, borrowed
 CUDA stream, and scheduler-owned workspace; they do not use ggml's CUDA pool or
 private conversion helpers. The existing CUDA fusion and CuTe disable environment
 variables are honored.
+Aligned contiguous FP16 K/V inputs are read directly without reserving conversion
+buffers. Fresh F32 outputs are written by the attention epilogue, retaining the
+original FP16 rounding before output scaling. Packed ConvRot and preallocated or
+view outputs retain the intermediate half buffer.
 
 `src/core/cuda/i8_projection.cu` supplies the INT8 GEMM projection epilogues:
 `GEMM -> Reshape -> RMSNorm -> Mul -> RoPE`, optional scaling and FP16 copy,
@@ -223,13 +271,13 @@ implementations. The CPU kernels use the
 configured thread pool and scheduler workspace; the old CPU INT8 GEMM and ConvRot
 implementations have been removed from ggml.
 Model code keeps calling `ggml_ext_linear_i8_tensorwise`,
-`ggml_mul_mat_i8_tensorwise`, and `ggml_quantize_i8_convrot`. The latter two
+`ggml_ext_mul_mat_i8_tensorwise`, and `ggml_ext_quantize_i8_convrot`. The latter two
 constructors are declared and implemented in sd.cpp and create custom nodes.
 Their former ggml declarations, implementations, ConvRot opcode, and native
 backend paths have been removed. CPU, CUDA/HIP/MUSA, and Vulkan register kernels
 and fusion rules through the extension interfaces.
 
-For already quantized activations, `ggml_mul_mat_i8_tensorwise` accepts ordinary
+For already quantized activations, `ggml_ext_mul_mat_i8_tensorwise` accepts ordinary
 I8 weight and activation tensors. Its optional final `input_scale` parameter is a
 separate F32 tensor with one value per activation row. Weight scales have one
 value per output channel; weight scales and bias can be null. Existing calls
@@ -238,8 +286,8 @@ order. All scales are explicit graph dependencies; there is no quantized-tensor
 wrapper. Shapes use ggml's low-to-high dimension order. Call
 `sd_ggml_register_extensions` before scheduling these custom nodes.
 
-`ggml_mul_mat_i8_tensorwise` also accepts F32 activations (quantized into temporary
-workspace) or the output of `ggml_quantize_i8_convrot`. ConvRot keeps the existing
+`ggml_ext_mul_mat_i8_tensorwise` also accepts F32 activations (quantized into temporary
+workspace) or the output of `ggml_ext_quantize_i8_convrot`. ConvRot keeps the existing
 packed I8 activation rows, padded to a multiple of four rows, followed by F32 row
 scales. Weight scales remain separate. CPU ConvRot groups are 1, 4, 16, 64, or 256.
 Unsupported layouts and malformed scale shapes are rejected. Separate CPU quantize
@@ -262,12 +310,21 @@ small-row policy, Stream-K scheduling, Ada column bands, and separate scaling
 order. The same extension matches `GEMM -> SwiGLU [-> ConvRot]` and row
 concatenation for custom GEMM nodes. Weight scales remain explicit
 inputs, including the gate/up scale permutation recorded on every SwiGLU launch.
+Two independent INT8 GEMMs sharing a quantized input can also fuse with split
+SwiGLU. A paired-column iterator reads the separate gate/up weight allocations,
+and the GEMM epilogue writes only the activated output. Both intermediate
+activations are omitted through the generic fusion allocation interface; weights
+are neither copied nor concatenated. This path requires bias-free branches,
+compatible layouts and alignments, and no external intermediate consumers.
+Only interleaved weight scales and any Stream-K workspace remain temporary.
 Plans reserve bounded Stream-K workspace, cache occupancy on first execution,
 and initialize barriers on every launch, so CUDA Graph replay observes updated
 inputs and scales. External consumers retain ordinary execution; overlapping
-outputs use workspace. The CUTLASS SwiGLU/ConvRot chain can write its packed
-output directly after GEMM, because quantization reads only its workspace
-intermediate. Shapes or alignments unsuitable for CUTLASS use cuBLAS.
+outputs use workspace. For fresh outputs, the CUTLASS SwiGLU epilogue writes
+an allocator-managed tensor that the subsequent ConvRot launch consumes. This
+keeps the same GPU launches while allowing its storage to be reused by other
+operations. The combined SwiGLU/ConvRot path retains its workspace intermediate
+for other cases. Shapes or alignments unsuitable for CUTLASS use cuBLAS.
 Custom I8 nodes also retain cuBLAS when the reduction could overflow I32, to
 preserve their previous accumulation behavior. Fusion disable and force-cuBLAS
 settings are honored. No CUTLASS headers are needed for the cuBLAS path.
@@ -443,8 +500,8 @@ weight scales; unsupported custom nodes fall back to CPU.
 
 ## SageAttention
 
-The existing `ggml_sage_attn` entry point is declared and implemented in sd.cpp's
-common extension files. It constructs `sd.sage_attn.v1` with explicit Q/K/V inputs
+The `ggml_ext_sage_attn` entry point is declared and implemented in sd.cpp's
+graph construction helpers. It constructs `sd.sage_attn.v1` with explicit Q/K/V inputs
 and scale/mode attributes. ggml has no Sage-specific opcode, allocation rule, or
 backend dispatch branch.
 
@@ -462,7 +519,7 @@ layers; a custom Sage node itself does not silently change algorithms.
 
 ## Sol-Attn
 
-The existing `ggml_sol_attn` entry point now lives in the common sd.cpp extension
+The `ggml_ext_sol_attn` entry point lives in the common sd.cpp graph construction
 files and constructs `sd.sol_attn.v1`. It accepts contiguous F32 Q/K/V tensors
 with shape `[128, tokens, heads, batch]`, a positive finite scale, and finite tau.
 The output remains F32 `[128, heads, tokens, batch]`. No current sd.cpp model or

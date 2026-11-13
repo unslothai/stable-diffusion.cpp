@@ -93,13 +93,14 @@ private:
     };
 
     ModelLoader model_loader_;
+    // Auxiliary models retain their own catalogs and conversion settings.
+    std::map<ModelLoader::FileId, ModelLoader> model_sources_;
     std::vector<std::unique_ptr<TensorState>> tensor_states_;
     std::map<const ggml_tensor*, TensorState*> tensor_states_by_tensor_;
     mutable std::list<ResolvedTensorStates> resolved_tensor_states_;
     mutable std::map<std::pair<uintptr_t, ggml_backend_dev_t>, std::pair<size_t, size_t>> device_query_cache_;
     mutable std::map<ggml_backend_dev_t, sd::DeviceReleaseCredit> release_credits_;
-    mutable bool warned_probe_allocation_ = false;
-    mutable bool logged_release_credit_   = false;
+    mutable bool logged_release_credit_ = false;
     std::vector<std::unique_ptr<ParamsStorageBlock>> params_storage_blocks_;
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
@@ -107,7 +108,7 @@ private:
     std::map<uintptr_t, std::unique_ptr<PrefetchBlock>> prefetch_blocks_;
     std::map<ggml_backend_t, ggml_backend_t> prefetch_backends_;
     std::map<std::pair<uintptr_t, ggml_backend_t>, RuntimeResidency> runtime_residencies_;
-    std::map<uintptr_t, std::function<bool()>> workspace_reclaimers_;
+    std::unordered_set<uintptr_t> runtime_owners_;
     bool warned_split_lora_skip_ = false;
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
@@ -138,6 +139,7 @@ private:
                                         std::vector<TensorState*>& required_states,
                                         ggml_backend_t compute_backend = nullptr) const;
     bool should_ignore(const TensorState& state) const;
+    const ModelLoader& source_loader(ModelLoader::FileId file) const;
     bool is_optional_missing_tensor(const std::string& name) const;
     bool validate_tensor(const TensorState& state) const;
 
@@ -157,19 +159,7 @@ private:
     size_t compute_backend_alloc_size(const std::vector<TensorState*>& states,
                                       bool missing_only) const;
     size_t compute_backend_resident_bytes(ggml_backend_t compute_backend) const;
-    struct CapacityCheck {
-        size_t required_device_bytes  = 0;
-        size_t required_budget_bytes  = 0;
-        size_t available_device_bytes = SIZE_MAX;
-        size_t available_budget_bytes = SIZE_MAX;
-        bool requires_reclamation     = false;
-        bool split_placement          = false;
-        size_t release_credit_bytes   = 0;  // released, not yet reported as free
-        bool fits() const {
-            return required_device_bytes <= available_device_bytes &&
-                   required_budget_bytes <= available_budget_bytes;
-        }
-    };
+    using CapacityCheck = DeviceMemoryCapacity;
     CapacityCheck check_capacity(const DeviceMemoryRequest& request,
                                  const std::vector<TensorState*>& states,
                                  bool log_details = false) const;
@@ -192,8 +182,6 @@ private:
     void note_device_release(ggml_backend_buffer_t buffer) const;
     size_t credited_free_bytes(ggml_backend_t backend, size_t free_bytes, size_t total_bytes, bool fresh) const;
     bool try_device_allocation(ggml_backend_t backend, size_t bytes) const;
-    bool probe_device_allocation(ggml_backend_t backend, size_t bytes) const;
-    bool release_credit_holds(ggml_backend_t backend, const CapacityCheck& capacity) const;
 
 public:
     ~ModelManager() override;
@@ -204,6 +192,8 @@ public:
     bool add_file(const std::string& path, const std::string& prefix = "", ModelLoader::FileId* id = nullptr, bool force = false);
     bool del_file(ModelLoader::FileId id);
     bool refresh_files();
+    ModelLoader::FileId register_model_source(ModelLoader loader);
+    bool unregister_model_source(ModelLoader::FileId file);
     ModelLoader::FileVersions source_versions(const std::set<ModelComponent>& components, const ModelLoader& loader) const;
     size_t registered_params_size(const std::set<ModelComponent>& components) const;
     // Weights of these components that their next use would load into host RAM.
@@ -291,12 +281,13 @@ public:
     }
 
     bool validate_registered_tensors();
+    bool validate_param_tensors(const std::vector<ggml_tensor*>& tensors);
     bool load_all_params_eagerly();
 
     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                 ggml_backend_t compute_backend) override;
     bool prepare_params(const std::vector<ggml_tensor*>& tensors) override;
-    void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) override;
+    void register_runtime_owner(uintptr_t owner_id) override;
     void remove_runtime_owner(uintptr_t owner_id) override;
     bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                        const std::vector<ggml_tensor*>& required_params) const override;
@@ -314,6 +305,16 @@ public:
         const std::vector<ggml_tensor*>& required_params,
         const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
         const std::vector<ggml_tensor*>& protected_params) override;
+    DeviceMemoryCapacity inspect_compute_backend_capacity(
+        const DeviceMemoryRequest& request,
+        const std::vector<ggml_tensor*>& params,
+        bool log_details = false) const override;
+    std::vector<WeightResidencyBlock> evictable_compute_backend_blocks(
+        ggml_backend_t backend,
+        const std::vector<ggml_tensor*>& protected_params) const override;
+    bool evict_compute_backend_block(const WeightResidencyBlock& block) override;
+    bool release_credit_holds(ggml_backend_t backend, const DeviceMemoryCapacity& capacity) const override;
+    bool probe_device_allocation(ggml_backend_t backend, size_t bytes) const override;
     WeightPrefetchResult prefetch_params(
         uintptr_t owner_id,
         const std::vector<ggml_tensor*>& tensors) override;
