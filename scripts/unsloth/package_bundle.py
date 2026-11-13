@@ -16,10 +16,13 @@ script serves every OS matrix leg:
     COMMIT    source commit SHA (provenance)
     SOURCE_REPO   e.g. leejet/stable-diffusion.cpp
     LICENSE_FILE  path to the LICENSE to include (optional)
+    GGML_LICENSE_FILE     ggml's LICENSE, shipped as ggml.txt (optional)
+    CUTLASS_LICENSE_FILE  CUTLASS's LICENSE.txt, shipped as cutlass.txt (optional, CUDA builds)
 
 The zip unpacks into a single named dir ``sd-<TAG>-bin-<LABEL>/`` containing the
-binaries, their sibling runtime libs, LICENSE, and an UNSLOTH_BUILD.txt provenance
-file (also the fingerprint the assemble step greps for). The Studio finder rglobs
+binaries, their sibling runtime libs, LICENSE, the ggml.txt / cutlass.txt notices upstream's
+own packages carry, and an UNSLOTH_BUILD.txt provenance file (also the fingerprint the
+assemble step greps for). The Studio finder rglobs
 for sd-cli / sd-server, so the internal layout is not load-bearing.
 """
 
@@ -82,6 +85,19 @@ def _collect(bin_dir: Path) -> list[tuple[str, Path]]:
     return sorted(found.items())
 
 
+def _optional_license(name: str) -> Path | None:
+    """A license path from the optional env ``name``. Unset means skip. Set but missing is
+    fatal: a notice that silently drops out of a bundle is not something to ship."""
+    val = os.environ.get(name, "").strip()
+    if not val:
+        return None
+    path = Path(val)
+    if not path.is_file():
+        print(f"package_bundle: {name}={val} is not a file", file = sys.stderr)
+        raise SystemExit(2)
+    return path
+
+
 def main() -> int:
     bin_dir = Path(_env("BIN_DIR"))
     out_dir = Path(_env("OUT_DIR"))
@@ -89,7 +105,11 @@ def main() -> int:
     label = _env("LABEL")
     commit = os.environ.get("COMMIT", "").strip() or "unknown"
     source_repo = os.environ.get("SOURCE_REPO", "").strip() or "leejet/stable-diffusion.cpp"
-    license_file = os.environ.get("LICENSE_FILE", "").strip()
+    license_file = _optional_license("LICENSE_FILE")
+    # ggml is compiled into every bundle and CUTLASS into the CUDA ones; upstream's build.yml
+    # ships both notices under these names.
+    extra_notices = (("ggml.txt", _optional_license("GGML_LICENSE_FILE")),
+                     ("cutlass.txt", _optional_license("CUTLASS_LICENSE_FILE")))
 
     if not bin_dir.is_dir():
         print(f"package_bundle: BIN_DIR {bin_dir} is not a directory", file = sys.stderr)
@@ -126,8 +146,11 @@ def main() -> int:
             # sd-<tag>-bin-<label>/<name> regardless of build layout.
             zf.write(f, arcname = f"{stem}/{name}")
         zf.writestr(f"{stem}/UNSLOTH_BUILD.txt", provenance)
-        if license_file and Path(license_file).is_file():
+        if license_file:
             zf.write(license_file, arcname = f"{stem}/LICENSE")
+        for arcname, notice in extra_notices:
+            if notice:
+                zf.write(notice, arcname = f"{stem}/{arcname}")
 
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(

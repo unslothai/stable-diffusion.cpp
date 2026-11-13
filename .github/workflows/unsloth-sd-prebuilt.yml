@@ -279,7 +279,9 @@ jobs:
             runner: macos-15-intel
             arch: x86_64
             # BLAS off: its matmul path was only measured on Apple Silicon.
-            defines: "-DSD_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+            # GGML_METAL=OFF is what turns Metal off: SD_METAL only ever turns it on, and ggml
+            # defaults it on for Apple, so SD_METAL=OFF alone still built and shipped libggml-metal.
+            defines: "-DSD_METAL=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
             gate: "true"
             cpu_floor: x64
           - label: Linux-Ubuntu-22.04-x86_64
@@ -352,12 +354,18 @@ jobs:
           if [ -n "${{ matrix.cpu_floor }}" ]; then
             CPU_VARIANTS="$CPU_VARIANTS -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
           fi
+          # The source tarball has no .git, so `git describe` in CMakeLists.txt yields nothing and the
+          # binaries report "version unknown, commit unknown". An empty GIT_EXE skips that block and
+          # lets the values below through.
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DSD_BUILD_EXAMPLES=ON \
             -DSD_SERVER_BUILD_FRONTEND=OFF \
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
+            -DGIT_EXE= \
+            -DSDCPP_BUILD_VERSION='${{ needs.resolve.outputs.tag }}' \
+            -DSDCPP_BUILD_COMMIT='${{ needs.resolve.outputs.commit }}' \
             $CPU_VARIANTS \
             ${{ matrix.defines }}
           if [ "$(uname -s)" = "Darwin" ]; then J="$(sysctl -n hw.logicalcpu)"; else J="$(nproc)"; fi
@@ -387,6 +395,7 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
         run: python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: CPU variants gate
@@ -521,18 +530,32 @@ jobs:
         id: cckey
         run: echo "archs=$(echo "$CUDA_ARCHS" | tr ';' '-')" >> "$GITHUB_OUTPUT"
 
+      # "depend" in the key names the generation written in depend mode (next step). An older
+      # cache can still map current sources to an object with out-of-date device code, and a
+      # direct hit would keep returning it, so those caches are never restored.
       - name: ccache
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
-          key: sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          key: sd-cuda-depend-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
           restore-keys: |
-            sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}
+            sd-cuda-depend-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}
           append-timestamp: false
           variant: ccache
+          # The action's ccache 4.13 binary: with the 4.5.1 that apt installs on ubuntu-22.04,
+          # depend mode never hits for nvcc.
+          install: binary
           max-size: 2G
           # Saved by the explicit step below instead, so a failed build still
           # keeps what it compiled.
           save: false
+
+      # With several target architectures, `nvcc -E` preprocesses for the first one only. ccache's
+      # preprocessor fallback compares that output, so a change to code that a __CUDA_ARCH__ guard
+      # keeps from the first architecture, and that keeps the line count, gets the old object
+      # back. Depend mode never preprocesses: a result is reused only when the source and every
+      # file the compiler read are unchanged.
+      - name: Configure ccache
+        run: ccache --set-config=depend_mode=true
 
       - name: cuDNN headers (build time only)
         run: |
@@ -574,6 +597,9 @@ jobs:
             -DSD_SERVER_BUILD_FRONTEND=OFF \
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
+            -DGIT_EXE= \
+            -DSDCPP_BUILD_VERSION='${{ needs.resolve.outputs.tag }}' \
+            -DSDCPP_BUILD_COMMIT='${{ needs.resolve.outputs.commit }}' \
             -DSD_CUDA=ON \
             -DSD_BUILD_SHARED_LIBS=ON \
             -DSD_BUILD_SHARED_GGML_LIB=ON \
@@ -634,6 +660,8 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ runner.temp }}/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
+          CUTLASS_LICENSE_FILE: ${{ github.workspace }}/src/thirdparty/cutlass/LICENSE.txt
         run: |
           set -euo pipefail
           # The binaries compile in cudnn-frontend's header-only templates, so its MIT notice ships too.
@@ -672,7 +700,7 @@ jobs:
           path: ${{ github.workspace }}/.ccache
           # Trailing dash keeps this distinct from the key the ccache action
           # restored from, so the save is never a no-op against itself.
-          key: ccache-sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
+          key: ccache-sd-cuda-depend-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   # Windows CUDA, same runtime policy as build-linux-cuda: the ggml*.dll ship beside the executables
   # (Windows searches the executable's own directory first, so llama.cpp's same-named DLLs elsewhere
@@ -764,13 +792,17 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
         with:
-          key: sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
+          key: sd-cuda-depend-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}
           restore-keys: |
-            sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}
+            sd-cuda-depend-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}
           append-timestamp: false
           variant: ccache
           max-size: 3G
           save: false
+
+      # Depend mode and the "depend" cache generation: see the Linux CUDA job.
+      - name: Configure ccache
+        run: ccache --set-config=depend_mode=true
 
       - name: Build sd-cli + sd-server (CUDA)
         working-directory: src
@@ -783,6 +815,9 @@ jobs:
             -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
             -DGGML_NATIVE=OFF `
+            "-DGIT_EXE=" `
+            "-DSDCPP_BUILD_VERSION=${{ needs.resolve.outputs.tag }}" `
+            "-DSDCPP_BUILD_COMMIT=${{ needs.resolve.outputs.commit }}" `
             -DSD_CUDA=ON `
             -DSD_BUILD_SHARED_LIBS=ON `
             -DSD_BUILD_SHARED_GGML_LIB=ON `
@@ -840,6 +875,8 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
+          CUTLASS_LICENSE_FILE: ${{ github.workspace }}/src/thirdparty/cutlass/LICENSE.txt
         run: python tooling/scripts/unsloth/package_bundle.py
 
       - name: Verify every PE in the bundle is signed
@@ -867,7 +904,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-sd-cuda-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
+          key: ccache-sd-cuda-depend-${{ matrix.cuda }}-windows-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   build-windows:
     name: ${{ matrix.label }}
@@ -978,6 +1015,9 @@ jobs:
             -DSD_VULKAN=${{ matrix.vulkan }} `
             -DSD_BUILD_SHARED_LIBS=ON `
             -DGGML_NATIVE=OFF `
+            "-DGIT_EXE=" `
+            "-DSDCPP_BUILD_VERSION=${{ needs.resolve.outputs.tag }}" `
+            "-DSDCPP_BUILD_COMMIT=${{ needs.resolve.outputs.commit }}" `
             @cpuVariants
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release -j 3 --target sd-cli sd-server
@@ -1007,6 +1047,7 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+          GGML_LICENSE_FILE: ${{ github.workspace }}/src/ggml/LICENSE
         run: python tooling/scripts/unsloth/package_bundle.py
 
       # The gate, run on the finished zip rather than the build tree: packaging
