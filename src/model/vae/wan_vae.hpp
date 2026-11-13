@@ -86,7 +86,39 @@ namespace WAN {
                 lp2 -= (int)cache_x->ne[2];
             }
 
+            // One frame whose causal left pad is all zeros (no cache) meets only the last temporal tap: the
+            // other taps multiply the zero frames. That is a 2D conv with w[:, :, kd - 1], kd times fewer
+            // FLOPs (first frame of every video chunk 0, every image decode / encode). Backends without
+            // im2col_3d (Metal) otherwise fall back to a much slower direct conv_3d.
+            // SD_VAE_FRAME_COLLAPSE=0 keeps the full conv_3d for kernels deeper than one frame.
+            static const bool collapse_off = [] {
+                const char* env = getenv("SD_VAE_FRAME_COLLAPSE");
+                return env != nullptr && std::string(env) == "0";
+            }();
+            const int64_t kd    = w->ne[2];
+            const bool collapse = (kd == 1 || !collapse_off) && x->ne[2] == 1 && x->ne[3] == in_channels &&
+                                  rp2 == 0 && lp2 == (kd - 1) * std::get<0>(dilation);
+            if (collapse) {
+                lp2 = 0;
+            }
             x = ggml_ext_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            if (collapse) {
+                if (!ggml_is_contiguous(x)) {
+                    x = ggml_cont(ctx->ggml_ctx, x);
+                }
+                ggml_tensor* wt = w;
+                if (kd > 1) {
+                    wt = ggml_cont(ctx->ggml_ctx, ggml_view_4d(ctx->ggml_ctx, w, w->ne[0], w->ne[1], 1, w->ne[3],
+                                                               w->nb[1], w->nb[2], w->nb[3], (size_t)(kd - 1) * w->nb[2]));
+                }
+                ggml_tensor* x2 = ggml_reshape_4d(ctx->ggml_ctx, x, x->ne[0], x->ne[1], in_channels, 1);
+                ggml_tensor* w2 = ggml_reshape_4d(ctx->ggml_ctx, wt, wt->ne[0], wt->ne[1], in_channels, out_channels);
+                x2              = ggml_ext_conv_2d(ctx, x2, w2, b,
+                                                   std::get<2>(stride), std::get<1>(stride), 0, 0,
+                                                   std::get<2>(dilation), std::get<1>(dilation),
+                                                   ctx->conv2d_direct_enabled, false, false, scale);
+                return ggml_reshape_4d(ctx->ggml_ctx, x2, x2->ne[0], x2->ne[1], 1, out_channels);
+            }
             return ggml_ext_conv_3d(ctx, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
