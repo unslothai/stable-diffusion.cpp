@@ -1565,6 +1565,40 @@ struct T5CLIPEmbedder : public Conditioner {
         // LOG_VERBOSE("PAD: %d", num_pad);
     }
 
+    // Tokens the T5 has to encode for one chunk: all of them, unless the mask is on, masked outputs are zeroed, every
+    // token weight is 1 (a weighted prompt rescales by the mean over all positions) and the masked tokens form one
+    // trailing run; then the prefix before that run, rounded up. SD_T5_ENCODE_PADDING=1 restores the full chunk.
+    size_t t5_encoded_length(const std::vector<float>& mask, const std::vector<float>& weights, bool zero_out_masked) const {
+        static const bool encode_padding = [] {
+            const char* value = getenv("SD_T5_ENCODE_PADDING");
+            return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+        }();
+        if (!use_mask || !zero_out_masked || encode_padding || mask.size() != weights.size()) {
+            return mask.size();
+        }
+        for (float weight : weights) {
+            if (weight != 1.0f) {
+                return mask.size();
+            }
+        }
+        size_t prefix = 0;
+        while (prefix < mask.size() && mask[prefix] == 0.0f) {
+            ++prefix;
+        }
+        for (size_t i = prefix; i < mask.size(); ++i) {
+            if (!(mask[i] < 0.0f)) {
+                return mask.size();
+            }
+        }
+        if (prefix == 0) {
+            return mask.size();
+        }
+        // Keep a multiple of 64 tokens (still masked, still zeroed): the attention sums then run over the same SIMD
+        // lanes and blocks as for the full chunk, which only adds exact zeros, so the kept outputs are bit-identical.
+        constexpr size_t granule = 64;
+        return std::min(mask.size(), (prefix + granule - 1) / granule * granule);
+    }
+
     SDCondition get_learned_condition_common(int n_threads,
                                              std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> token_and_weights,
                                              int clip_skip,
@@ -1594,6 +1628,13 @@ struct T5CLIPEmbedder : public Conditioner {
             std::vector<float> chunk_mask(t5_attn_mask_vec.begin() + chunk_idx * chunk_len,
                                           t5_attn_mask_vec.begin() + (chunk_idx + 1) * chunk_len);
 
+            // With the attention mask on and masked outputs zeroed, the trailing pad tokens neither reach a kept token
+            // (their keys are masked) nor survive themselves, so encode only the unpadded prefix and append zeros.
+            const size_t encoded_len = t5_encoded_length(chunk_mask, chunk_weights, zero_out_masked);
+            const size_t padded_len  = chunk_tokens.size();
+            chunk_tokens.resize(encoded_len);
+            chunk_mask.resize(encoded_len);
+
             sd::Tensor<int32_t> input_ids({static_cast<int64_t>(chunk_tokens.size())}, chunk_tokens);
             sd::Tensor<float> t5_attn_mask_chunk;
             if (use_mask) {
@@ -1605,6 +1646,17 @@ struct T5CLIPEmbedder : public Conditioner {
                                                    t5_attn_mask_chunk,
                                                    false);
             GGML_ASSERT(!chunk_hidden_states.empty());
+            if (encoded_len < padded_len) {
+                LOG_DEBUG("t5: encoded %zu of %zu tokens, the rest are masked padding", encoded_len, padded_len);
+                if (chunk_hidden_states.dim() == 1) {
+                    chunk_hidden_states.unsqueeze_(1);
+                }
+                auto zeros_shape = chunk_hidden_states.shape();
+                zeros_shape[1]   = static_cast<int64_t>(padded_len - encoded_len);
+                auto zeros       = sd::Tensor<float>::zeros(zeros_shape);
+                chunk_hidden_states = sd::ops::concat(chunk_hidden_states, zeros, 1);
+                chunk_mask.resize(padded_len, -HUGE_VALF);
+            }
             chunk_hidden_states = apply_token_weights(std::move(chunk_hidden_states), chunk_weights);
 
             if (zero_out_masked) {
