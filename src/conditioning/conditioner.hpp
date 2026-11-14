@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include "core/ggml_tensor_utils.h"
 
+#include "conditioning/text_segments.h"
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
 #include "model/diffusion/model.hpp"
@@ -2268,7 +2269,8 @@ struct LLMEmbedder : public Conditioner {
                                                                                   size_t max_length                                                  = 100000000,
                                                                                   bool spell_quotes                                                  = false,
                                                                                   const std::string& suffix                                          = "",
-                                                                                  const std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds = {}) {
+                                                                                  const std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds = {},
+                                                                                  const std::vector<size_t>& segment_starts                          = {}) {
         std::vector<std::pair<std::string, float>> parsed_attention;
         if (attn_range.first >= 0 && attn_range.second > 0) {
             if (attn_range.first > 0) {
@@ -2285,6 +2287,10 @@ struct LLMEmbedder : public Conditioner {
             }
             if (attn_range.second < text.size()) {
                 parsed_attention.emplace_back(text.substr(attn_range.second), 1.f);
+            }
+        } else if (!segment_starts.empty()) {
+            for (auto& piece : split_text_segments(text, segment_starts)) {
+                parsed_attention.emplace_back(std::move(piece), 1.f);
             }
         } else {
             parsed_attention.emplace_back(text, 1.f);
@@ -2378,8 +2384,9 @@ struct LLMEmbedder : public Conditioner {
                                     const LLM::DeepStackImageEmbeds& deepstack_image_embeds = {},
                                     const std::vector<LLM::ImageGrid>& image_grids          = {},
                                     const std::string& prompt_suffix                        = "",
-                                    sd::Tensor<float>* output_mask                          = nullptr) {
-        auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, spell_quotes, prompt_suffix, image_embeds);
+                                    sd::Tensor<float>* output_mask                          = nullptr,
+                                    const std::vector<size_t>& segment_starts               = {}) {
+        auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, spell_quotes, prompt_suffix, image_embeds, segment_starts);
         auto& tokens             = std::get<0>(tokens_weights_mask);
         auto& weights            = std::get<1>(tokens_weights_mask);
         auto& mask               = std::get<2>(tokens_weights_mask);
@@ -2523,7 +2530,8 @@ struct LLMEmbedder : public Conditioner {
                               std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds,
                               LLM::DeepStackImageEmbeds& deepstack_image_embeds,
                               std::vector<LLM::ImageGrid>& image_grids,
-                              int max_length = std::numeric_limits<int>::max()) {
+                              int max_length                            = std::numeric_limits<int>::max(),
+                              const std::vector<size_t>& segment_starts = {}) {
         if (outputs.empty()) {
             return false;
         }
@@ -2534,8 +2542,13 @@ struct LLMEmbedder : public Conditioner {
             return false;
         }
         std::vector<int> prefix_tokens;
-        if (!tokenizer->encode(prompt.substr(0, position), prefix_tokens, nullptr)) {
-            return false;
+        for (const auto& piece : split_text_segments(prompt.substr(0, position),
+                                                     text_segment_starts_before(segment_starts, position))) {
+            std::vector<int> piece_tokens;
+            if (!tokenizer->encode(piece, piece_tokens, nullptr)) {
+                return false;
+            }
+            prefix_tokens.insert(prefix_tokens.end(), piece_tokens.begin(), piece_tokens.end());
         }
         int index = static_cast<int>(prefix_tokens.size());
         for (const auto& image_embed : image_embeds) {
@@ -2576,6 +2589,8 @@ struct LLMEmbedder : public Conditioner {
         std::set<int> out_layers;
         std::string prompt_suffix;
         sd::Tensor<float> text_mask;
+        // Byte offsets where a separately tokenized piece of `prompt` starts (MiniMax-H3 labels and text).
+        std::vector<size_t> segment_starts;
 
         int64_t t0                     = ggml_time_ms();
         RefImageResizeMode resize_mode = conditioner_params.ref_image_params.vlm_resize_mode;
@@ -2593,8 +2608,9 @@ struct LLMEmbedder : public Conditioner {
                 auto resize_for_vision = [&](const sd::Tensor<float>& image) {
                     int height = static_cast<int>(image.shape()[1]);
                     int width  = static_cast<int>(image.shape()[0]);
-                    int h_bar  = std::max(factor, static_cast<int>(std::round(static_cast<double>(height) / factor)) * factor);
-                    int w_bar  = std::max(factor, static_cast<int>(std::round(static_cast<double>(width) / factor)) * factor);
+                    // Round half to even (the default FP rounding mode), as the reference's round() does.
+                    int h_bar = std::max(factor, static_cast<int>(std::nearbyint(static_cast<double>(height) / factor)) * factor);
+                    int w_bar = std::max(factor, static_cast<int>(std::nearbyint(static_cast<double>(width) / factor)) * factor);
                     resize_image_dims(height,
                                       width,
                                       h_bar,
@@ -2603,9 +2619,11 @@ struct LLMEmbedder : public Conditioner {
                                       3136,
                                       12845056,
                                       RefImageResizeMode::AREA);
+                    // Bilinear without antialiasing when a resize is needed, as the reference vision preprocessing does.
                     auto resized = sd::ops::interpolate(
                         image,
-                        std::vector<int64_t>{w_bar, h_bar, image.shape()[2], image.shape()[3]});
+                        std::vector<int64_t>{w_bar, h_bar, image.shape()[2], image.shape()[3]},
+                        sd::ops::InterpolateMode::Bilinear);
                     for (int64_t i = 0; i < resized.numel(); ++i) {
                         resized[i] = std::clamp(resized[i], 0.f, 1.f) * 2.f - 1.f;
                     }
@@ -2616,11 +2634,18 @@ struct LLMEmbedder : public Conditioner {
                                               int grid_h,
                                               int grid_w) {
                     GGML_ASSERT(image_outputs.size() == 4);
+                    segment_starts.push_back(prompt.size());
                     prompt += "<|vision_start|>";
                     size_t marker_start = prompt.size();
                     prompt += "<|image_pad|><|vision_end|>";
                     return expand_vision_marker(prompt, marker_start, std::move(image_outputs), grid_h, grid_w,
-                                                image_embeds, deepstack_image_embeds, image_grids);
+                                                image_embeds, deepstack_image_embeds, image_grids,
+                                                std::numeric_limits<int>::max(), segment_starts);
+                };
+                // Every label, timestamp and the prompt is tokenized on its own, as the reference does.
+                auto add_text = [&](const std::string& piece) {
+                    segment_starts.push_back(prompt.size());
+                    prompt += piece;
                 };
 
                 const auto* references = conditioner_params.minimax_h3_references;
@@ -2630,13 +2655,13 @@ struct LLMEmbedder : public Conditioner {
                     int audio_index   = 0;
                     for (const auto& item : *references) {
                         if (item.kind == MiniMaxH3PresentationKind::AUDIO) {
-                            prompt += "<Audio " + std::to_string(++audio_index) + ">: ";
+                            add_text("<Audio " + std::to_string(++audio_index) + ">: ");
                             continue;
                         }
                         if (item.kind == MiniMaxH3PresentationKind::IMAGE) {
                             GGML_ASSERT(item.frames.size() == 1);
                             auto resized = resize_for_vision(item.frames[0]);
-                            prompt += "<Picture " + std::to_string(++picture_index) + ">: ";
+                            add_text("<Picture " + std::to_string(++picture_index) + ">: ");
                             if (!add_vision_outputs(llm->encode_image_outputs(n_threads,
                                                                               resized,
                                                                               false),
@@ -2648,14 +2673,14 @@ struct LLMEmbedder : public Conditioner {
                         }
 
                         GGML_ASSERT(!item.frames.empty());
-                        prompt += "<Video " + std::to_string(++video_index) + ">: ";
+                        add_text("<Video " + std::to_string(++video_index) + ">: ");
                         for (size_t frame = 0; frame < item.frames.size(); frame += 2) {
                             size_t next = std::min(frame + 1, item.frames.size() - 1);
                             float t0    = frame < item.timestamps.size() ? item.timestamps[frame] : frame / 2.f;
                             float t1    = next < item.timestamps.size() ? item.timestamps[next] : next / 2.f;
                             std::ostringstream timestamp;
                             timestamp << '<' << std::fixed << std::setprecision(1) << (t0 + t1) * 0.5f << " seconds>";
-                            prompt += timestamp.str();
+                            add_text(timestamp.str());
 
                             auto first  = resize_for_vision(item.frames[frame]);
                             auto second = resize_for_vision(item.frames[next]);
@@ -2664,7 +2689,8 @@ struct LLMEmbedder : public Conditioner {
                                                               std::vector<int64_t>{first.shape()[0],
                                                                                    first.shape()[1],
                                                                                    second.shape()[2],
-                                                                                   second.shape()[3]});
+                                                                                   second.shape()[3]},
+                                                              sd::ops::InterpolateMode::Bilinear);
                             }
                             auto pair = sd::ops::concat(first.unsqueeze(2), second.unsqueeze(2), 2);
                             if (!add_vision_outputs(llm->encode_video_block_outputs(n_threads,
@@ -2679,9 +2705,9 @@ struct LLMEmbedder : public Conditioner {
                 } else if (conditioner_params.ref_images != nullptr) {
                     for (size_t i = 0; i < conditioner_params.ref_images->size(); ++i) {
                         auto resized = resize_for_vision((*conditioner_params.ref_images)[i]);
-                        prompt += version == VERSION_MINIMAX_H3_IMAGE
-                                      ? "Picture " + std::to_string(i + 1) + ": "
-                                      : "<Picture " + std::to_string(i + 1) + ">: ";
+                        add_text(version == VERSION_MINIMAX_H3_IMAGE
+                                     ? "Picture " + std::to_string(i + 1) + ": "
+                                     : "<Picture " + std::to_string(i + 1) + ">: ");
                         if (!add_vision_outputs(llm->encode_image_outputs(n_threads,
                                                                           resized,
                                                                           false),
@@ -2702,6 +2728,7 @@ struct LLMEmbedder : public Conditioner {
                     text = trim(text);
                 }
             }
+            segment_starts.push_back(prompt.size());
             prompt += text;
         } else if (sd_version_is_hunyuan_video(version)) {
             prompt_template_encode_start_idx = 98;
@@ -3361,7 +3388,8 @@ struct LLMEmbedder : public Conditioner {
                                            deepstack_image_embeds,
                                            image_grids,
                                            prompt_suffix,
-                                           version == VERSION_IRIS ? &text_mask : nullptr);
+                                           version == VERSION_IRIS ? &text_mask : nullptr,
+                                           segment_starts);
         if (hidden_states.empty()) {
             return {};
         }
