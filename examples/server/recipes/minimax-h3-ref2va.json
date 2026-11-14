@@ -53,6 +53,7 @@
   },
   "features": [
     "flow_shift",
+    "audio_flow_shift",
     "ref_images",
     "ref_videos",
     "ref_audios",

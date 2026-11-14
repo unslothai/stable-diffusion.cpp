@@ -1902,6 +1902,7 @@ namespace sd::pipeline {
         sd->rng->manual_seed(request.seed);
         sd->sampler_rng->manual_seed(request.seed);
         sd->set_flow_shift(sd_vid_gen_params->sample_params.flow_shift);
+        sd->set_audio_flow_shift(sd_vid_gen_params->sample_params.audio_flow_shift);
         if (!sd->apply_loras(sd_vid_gen_params->loras, sd_vid_gen_params->lora_count))
             return false;
         sd->reset_generation_extensions();

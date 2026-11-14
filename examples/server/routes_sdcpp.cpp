@@ -109,6 +109,7 @@ static json make_sample_params_json(const sd_sample_params_t& sample_params, con
         {"eta", finite_number_or_null(sample_params.eta)},
         {"shifted_timestep", sample_params.shifted_timestep},
         {"flow_shift", finite_number_or_null(sample_params.flow_shift)},
+        {"audio_flow_shift", finite_number_or_null(sample_params.audio_flow_shift)},
         {"guidance",
          {
              {"txt_cfg", guidance.txt_cfg},

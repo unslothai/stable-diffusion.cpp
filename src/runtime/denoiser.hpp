@@ -1450,6 +1450,11 @@ struct H3AVFlowDenoiser : public DiscreteFlowDenoiser {
         GGML_ASSERT(shift > 0.f && audio_shift > 0.f && video_channels > 0);
     }
 
+    void set_audio_shift(float value) {
+        GGML_ASSERT(value > 0.f);
+        audio_shift = value;
+    }
+
     sd::Tensor<float> process_latent_in(const sd::Tensor<float>& latent) override {
         return scale_audio(latent, shift / audio_shift);
     }

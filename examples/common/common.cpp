@@ -1321,6 +1321,10 @@ ArgOptions SDGenerationParams::get_options() {
          "shift value for Flow models like SD3.x or WAN (default: auto)",
          &sample_params.flow_shift},
         {"",
+         "--audio-flow-shift",
+         "MiniMax-H3 video: shift of the audio noise schedule (default: 3)",
+         &sample_params.audio_flow_shift},
+        {"",
          "--high-noise-cfg-scale",
          "(high noise) unconditional guidance scale: (default: 7.0)",
          &high_noise_sample_params.guidance.txt_cfg},
@@ -2347,6 +2351,13 @@ bool SDGenerationParams::from_json_str(
         if (sample_json.contains("flow_shift") && sample_json["flow_shift"].is_number()) {
             target_params.flow_shift = sample_json["flow_shift"];
         }
+        if (sample_json.contains("audio_flow_shift")) {
+            if (sample_json["audio_flow_shift"].is_number()) {
+                target_params.audio_flow_shift = sample_json["audio_flow_shift"];
+            } else if (sample_json["audio_flow_shift"].is_null()) {
+                target_params.audio_flow_shift = INFINITY;
+            }
+        }
         if (sample_json.contains("extra_sample_args") && sample_json["extra_sample_args"].is_string()) {
             target_extra_sample_args = sample_json["extra_sample_args"].get<std::string>();
         }
@@ -2807,6 +2818,12 @@ bool SDGenerationParams::validate(SDMode mode) {
     if (mode != VID_GEN && (!ref_video_paths.empty() || !ref_video_audio_paths.empty() || !ref_audio_paths.empty() ||
                             !ref_videos.empty() || !ref_video_audios.empty() || !ref_audios.empty())) {
         LOG_ERROR("error: reference video and audio inputs require vid_gen mode");
+        return false;
+    }
+
+    if (std::isfinite(sample_params.audio_flow_shift) &&
+        (sample_params.audio_flow_shift <= 0.f || sample_params.audio_flow_shift > 1000.f)) {
+        LOG_ERROR("error: audio_flow_shift must be in range (0, 1000]");
         return false;
     }
 

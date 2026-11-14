@@ -66,6 +66,7 @@
   "features": [
     "end_image",
     "flow_shift",
+    "audio_flow_shift",
     "init_image"
   ],
   "disabled_features": [

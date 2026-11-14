@@ -176,6 +176,7 @@ Default-enabled features are `img2img`, `mask_image`, `lora`, `vae_tiling`,
 | Feature | Controls |
 | --- | --- |
 | `flow_shift` | Flow shift, where used by the selected scheduler |
+| `audio_flow_shift` | MiniMax-H3 video audio schedule shift (`sample_params.audio_flow_shift`) |
 | `distilled_guidance` | Distilled guidance embedding |
 | `shifted_timestep` | SDXL timestep shifting |
 | `img_cfg` | Image CFG |
@@ -953,6 +954,7 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `sample_params.eta` | `number \| null` |
 | `sample_params.shifted_timestep` | `integer` |
 | `sample_params.flow_shift` | `number \| null` |
+| `sample_params.audio_flow_shift` | `number \| null` |
 | `sample_params.guidance.txt_cfg` | `number` |
 | `sample_params.guidance.img_cfg` | `number \| null` |
 | `sample_params.guidance.distilled_guidance` | `number` |
@@ -1691,6 +1693,7 @@ Sampling fields:
 | `sample_params.shifted_timestep` | `integer` |
 | `sample_params.custom_sigmas` | `array<number>` |
 | `sample_params.flow_shift` | `number` |
+| `sample_params.audio_flow_shift` | `number` |
 | `sample_params.guidance.txt_cfg` | `number` |
 | `sample_params.guidance.img_cfg` | `number` |
 | `sample_params.guidance.distilled_guidance` | `number` |
@@ -1788,6 +1791,7 @@ When omitted, backend defaults apply to these fields:
 - `sample_params.sample_method`
 - `sample_params.eta`
 - `sample_params.flow_shift`
+- `sample_params.audio_flow_shift` (MiniMax-H3 video only; default 3, must be in (0, 1000])
 - `sample_params.guidance.img_cfg`
 - `high_noise_sample_params.scheduler`
 - `high_noise_sample_params.sample_method`

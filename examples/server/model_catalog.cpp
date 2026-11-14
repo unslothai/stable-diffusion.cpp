@@ -309,6 +309,7 @@ static const std::map<std::string, bool> k_recipe_features = {
     {"cache_dit", true},
     {"preview", true},
     {"flow_shift", false},
+    {"audio_flow_shift", false},
     {"distilled_guidance", false},
     {"shifted_timestep", false},
     {"img_cfg", false},

@@ -1534,7 +1534,9 @@ bool StableDiffusionGGML::build_denoiser() {
                 break;
             }
             LOG_INFO("running in MiniMax H3 AV FLOW mode");
-            denoiser = std::make_shared<H3AVFlowDenoiser>(default_flow_shift, version == VERSION_P_H3_IMAGE ? 1.f : 3.f, get_latent_channel());
+            default_audio_flow_shift = version == VERSION_P_H3_IMAGE ? 1.f : 3.f;
+            active_audio_flow_shift  = default_audio_flow_shift;
+            denoiser                 = std::make_shared<H3AVFlowDenoiser>(default_flow_shift, default_audio_flow_shift, get_latent_channel());
             break;
         }
         case MING_IMAGE_FLOW_PRED: {
@@ -2782,7 +2784,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
                     version == VERSION_MINIMAX_H3_IMAGE ? 0 : (version == VERSION_P_H3_IMAGE ? 2 : audio_length),
                     std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
-                    version == VERSION_P_H3_IMAGE ? 1.f : 3.f,
+                    active_audio_flow_shift,
                     target_index > 0 && target_index < sigmas.size() ? sigmas[target_index] : NAN};
             } else if (sd_version_is_ltxav(version)) {
                 diffusion_params.extra = LTXAVDiffusionExtra{
@@ -3355,6 +3357,30 @@ void StableDiffusionGGML::set_flow_shift(float flow_shift) {
         flow_denoiser->set_shift(flow_shift);
         active_flow_shift = flow_shift;
     }
+}
+
+void StableDiffusionGGML::set_audio_flow_shift(float audio_flow_shift) {
+    auto h3_denoiser = std::dynamic_pointer_cast<H3AVFlowDenoiser>(denoiser);
+    if (!h3_denoiser) {
+        if (std::isfinite(audio_flow_shift)) {
+            LOG_WARN("audio_flow_shift only applies to MiniMax-H3 video models; ignoring %.3f", audio_flow_shift);
+        }
+        return;
+    }
+    if (!std::isfinite(audio_flow_shift) || version != VERSION_MINIMAX_H3) {
+        if (std::isfinite(audio_flow_shift)) {
+            LOG_WARN("audio_flow_shift only applies to MiniMax-H3 video models; ignoring %.3f", audio_flow_shift);
+        }
+        audio_flow_shift = default_audio_flow_shift;
+    } else if (!(audio_flow_shift > 0.f)) {
+        // Zero is what a zero-initialised struct carries: treat it as unset.
+        if (audio_flow_shift != 0.f) {
+            LOG_WARN("audio_flow_shift must be positive; using the default %.3f", default_audio_flow_shift);
+        }
+        audio_flow_shift = default_audio_flow_shift;
+    }
+    h3_denoiser->set_audio_shift(audio_flow_shift);
+    active_audio_flow_shift = audio_flow_shift;
 }
 
 bool StableDiffusionGGML::is_flow_denoiser() {

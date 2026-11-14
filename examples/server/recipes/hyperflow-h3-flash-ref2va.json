@@ -65,6 +65,7 @@
   },
   "features": [
     "flow_shift",
+    "audio_flow_shift",
     "ref_images"
   ],
   "disabled_features": [

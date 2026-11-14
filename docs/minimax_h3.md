@@ -276,6 +276,9 @@ Notes for this mode:
   block's working memory must also fit within the VRAM budget.
 - The default video flow shift is 12. The audio stream is mapped internally to
   its shift of 3, so the regular samplers can operate on the packed AV latent.
+  `--audio-flow-shift X` (server: `sample_params.audio_flow_shift`) changes the
+  audio shift; the carried audio scale and the transformer both use the new
+  value.
 
 ## HyperFlow H3 Flash
 
