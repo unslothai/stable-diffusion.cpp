@@ -1304,19 +1304,21 @@ namespace MiniMaxH3 {
         std::vector<float> endpoints;
     };
 
-    static float video_span(int64_t frame) {
+    // RoPE positions are accumulated in double and rounded to float once per entry, as the reference
+    // builds its float64 grid before casting; float cursors drift by ~1e-3 after tens of thousands of rows.
+    static double video_span(int64_t frame) {
         static const int spans[5] = {1, 4, 4, 4, 4};
-        return FRAME_RESCALE * spans[frame % 5];
+        return (5.0 / 3.0) * spans[frame % 5];
     }
 
-    static std::vector<float> spatial_axis(int64_t dim,
-                                           float sqrt_area) {
+    static std::vector<double> spatial_axis(int64_t dim,
+                                            double sqrt_area) {
         int64_t count = dim / 2;
-        float ratio   = static_cast<float>(dim) / sqrt_area;
-        std::vector<float> result(static_cast<size_t>(count));
+        double ratio  = static_cast<double>(dim) / sqrt_area;
+        std::vector<double> result(static_cast<size_t>(count));
         for (int64_t i = 0; i < count; ++i) {
             result[static_cast<size_t>(i)] =
-                (static_cast<float>(i) * (ratio / count) + (1.f - ratio) * 0.5f) * 32.f;
+                (static_cast<double>(i) * (ratio / count) + (1.0 - ratio) / 2.0) * 32.0;
         }
         return result;
     }
@@ -1347,19 +1349,19 @@ namespace MiniMaxH3 {
                                              float video_r,
                                              float audio_r) {
         PackedSequenceLayout layout;
-        float sqrt_area    = std::sqrt(static_cast<float>(latent_h * latent_w));
+        double sqrt_area   = std::sqrt(static_cast<double>(latent_h * latent_w));
         auto h_axis        = spatial_axis(latent_h, sqrt_area);
         auto w_axis        = spatial_axis(latent_w, sqrt_area);
         int64_t frame_rows = static_cast<int64_t>(h_axis.size() * w_axis.size());
         int64_t row        = 0;
 
-        auto append_position = [&](float t, float h, float w) {
-            layout.positions.push_back(t);
-            layout.positions.push_back(h);
-            layout.positions.push_back(w);
+        auto append_position = [&](double t, double h, double w) {
+            layout.positions.push_back(static_cast<float>(t));
+            layout.positions.push_back(static_cast<float>(h));
+            layout.positions.push_back(static_cast<float>(w));
         };
         for (int64_t i = 0; i < text_len; ++i) {
-            append_position(static_cast<float>(i), 0.f, 0.f);
+            append_position(static_cast<double>(i), 0.0, 0.0);
         }
         layout.sequence_segments.push_back({0, text_len, SequenceKind::TEXT});
 
@@ -1386,16 +1388,16 @@ namespace MiniMaxH3 {
         row = text_len;
 
         auto condition_spatial_axes = [&](const sd::Tensor<float>& condition) {
-            float area = std::sqrt(static_cast<float>(condition.shape()[0] * condition.shape()[1]));
+            double area = std::sqrt(static_cast<double>(condition.shape()[0] * condition.shape()[1]));
             return std::make_pair(spatial_axis(condition.shape()[1], area),
                                   spatial_axis(condition.shape()[0], area));
         };
         auto append_video_positions = [&](const sd::Tensor<float>& condition,
-                                          float cursor) {
+                                          double cursor) {
             auto axes = condition_spatial_axes(condition);
             for (int64_t t = 0; t < condition.shape()[2]; ++t) {
-                for (float h : axes.first) {
-                    for (float w : axes.second) {
+                for (double h : axes.first) {
+                    for (double w : axes.second) {
                         append_position(cursor, h, w);
                     }
                 }
@@ -1404,20 +1406,20 @@ namespace MiniMaxH3 {
             return cursor;
         };
         auto append_audio_positions = [&](int64_t length,
-                                          float cursor,
-                                          float w_low,
-                                          float w_high) {
+                                          double cursor,
+                                          double w_low,
+                                          double w_high) {
             for (int channel = 0; channel < 2; ++channel) {
-                float w = channel == 0 ? w_low : w_high;
+                double w = channel == 0 ? w_low : w_high;
                 for (int64_t t = 0; t < length; ++t) {
-                    append_position(cursor + static_cast<float>(t), 0.f, w);
+                    append_position(cursor + static_cast<double>(t), 0.0, w);
                 }
             }
         };
 
-        float cursor = static_cast<float>(text_len);
+        double cursor = static_cast<double>(text_len);
         if (reference_blocks.empty()) {
-            float video_duration = 0.f;
+            double video_duration = 0.0;
             for (int64_t t = 0; t < latent_t; ++t) {
                 video_duration += video_span(t);
             }
@@ -1427,11 +1429,11 @@ namespace MiniMaxH3 {
                 int64_t count         = condition.shape()[2] *
                                         static_cast<int64_t>(axes.first.size() * axes.second.size());
                 bool is_first         = keyframe_indices.empty() || keyframe_indices[static_cast<int64_t>(index)] == 0;
-                float keyframe_t      = is_first ? static_cast<float>(text_len)
-                                                 : static_cast<float>(text_len) + video_duration - FRAME_RESCALE;
+                double keyframe_t     = is_first ? static_cast<double>(text_len)
+                                                 : static_cast<double>(text_len) + video_duration - 5.0 / 3.0;
                 for (int64_t t = 0; t < condition.shape()[2]; ++t) {
-                    for (float h : axes.first) {
-                        for (float w : axes.second) {
+                    for (double h : axes.first) {
+                        for (double w : axes.second) {
                             append_position(keyframe_t, h, w);
                         }
                     }
@@ -1456,12 +1458,12 @@ namespace MiniMaxH3 {
                     ref_audio = &condition_audios[static_cast<size_t>(block.audio_index)];
                 }
 
-                float block_end = cursor;
+                double block_end = cursor;
                 if (block.kind == MiniMaxH3ReferenceKind::AUDIO ||
                     block.kind == MiniMaxH3ReferenceKind::VIDEO_AUDIO) {
                     GGML_ASSERT(ref_audio != nullptr);
-                    float w_low  = w_axis.front();
-                    float w_high = w_axis.back();
+                    double w_low  = w_axis.front();
+                    double w_high = w_axis.back();
                     if (ref_video != nullptr) {
                         auto axes = condition_spatial_axes(*ref_video);
                         w_low     = axes.second.front();
@@ -1477,7 +1479,7 @@ namespace MiniMaxH3 {
                                                row + count,
                                                audio_condition_time_row * 3 + 2});
                     row += count;
-                    block_end = std::max(block_end, cursor + static_cast<float>(ref_audio->shape()[0]));
+                    block_end = std::max(block_end, cursor + static_cast<double>(ref_audio->shape()[0]));
                 }
 
                 if (block.kind != MiniMaxH3ReferenceKind::AUDIO) {
@@ -1485,7 +1487,7 @@ namespace MiniMaxH3 {
                     auto axes       = condition_spatial_axes(*ref_video);
                     int64_t count   = ref_video->shape()[2] *
                                       static_cast<int64_t>(axes.first.size() * axes.second.size());
-                    float video_end = append_video_positions(*ref_video, cursor);
+                    double video_end = append_video_positions(*ref_video, cursor);
                     layout.sequence_segments.push_back({row,
                                                         row + count,
                                                         SequenceKind::CONDITION_VIDEO,
@@ -1493,7 +1495,7 @@ namespace MiniMaxH3 {
                     layout.segments.push_back({row, row + count, condition_time_row * 3});
                     row += count;
                     block_end = block.kind == MiniMaxH3ReferenceKind::IMAGE
-                                    ? std::max(block_end, cursor + 1.f)
+                                    ? std::max(block_end, cursor + 1.0)
                                     : std::max(block_end, video_end);
                 }
                 cursor = block_end;
@@ -1515,8 +1517,8 @@ namespace MiniMaxH3 {
 
         int64_t video_start = row;
         for (int64_t t = 0; t < latent_t; ++t) {
-            for (float h : h_axis) {
-                for (float w : w_axis) {
+            for (double h : h_axis) {
+                for (double w : w_axis) {
                     append_position(cursor, h, w);
                 }
             }
