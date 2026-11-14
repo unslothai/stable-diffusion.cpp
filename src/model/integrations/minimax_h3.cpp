@@ -36,8 +36,9 @@ const std::vector<ModelDefinition>& minimax_h3_definitions() {
             definition.traits.vae_kind                  = ModelVAEKind::MINIMAX_H3;
             definition.traits.video_tae                 = true;
             definition.sampling                         = {H3_AV_FLOW_PRED, 12.f};
-            definition.sampling.default_sample_method   = EULER_SAMPLE_METHOD;
-            definition.sampling.default_scheduler       = DISCRETE_SCHEDULER;
+            // The reference video workflows sample with res_multistep (eta 0) on the simple schedule.
+            definition.sampling.default_sample_method   = RES_MULTISTEP_SAMPLE_METHOD;
+            definition.sampling.default_scheduler       = SIMPLE_SCHEDULER;
             definition.build                            = build_minimax_h3;
             result.push_back(std::move(definition));
         }
@@ -46,6 +47,9 @@ const std::vector<ModelDefinition>& minimax_h3_definitions() {
             definition.version                          = VERSION_MINIMAX_H3_IMAGE;
             definition.name                             = "MiniMax-H3-Image";
             definition.traits.supports_video_generation = false;
+            // The image models keep their few-step Euler grid (PDD heads are indexed by it).
+            definition.sampling.default_sample_method   = EULER_SAMPLE_METHOD;
+            definition.sampling.default_scheduler       = DISCRETE_SCHEDULER;
             definition.sampling.default_flow_shift      = 1.f;
             definition.ref_image_preset                 = "qwen";
             result.push_back(std::move(definition));
@@ -55,6 +59,9 @@ const std::vector<ModelDefinition>& minimax_h3_definitions() {
             definition.version                          = VERSION_P_H3_IMAGE;
             definition.name                             = "P-H3-Image";
             definition.traits.supports_video_generation = false;
+            // The image models keep their few-step Euler grid (PDD heads are indexed by it).
+            definition.sampling.default_sample_method   = EULER_SAMPLE_METHOD;
+            definition.sampling.default_scheduler       = DISCRETE_SCHEDULER;
             definition.sampling.default_flow_shift      = 1.f;
             definition.ref_image_preset                 = "qwen";
             result.push_back(std::move(definition));
