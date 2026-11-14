@@ -25,6 +25,8 @@
 namespace MiniMaxH3VAE {
 
     constexpr int H3_VIDEO_VAE_GRAPH_SIZE = 262144;
+    // Tile overlap of the original VAE when the caller did not enable tiling.
+    constexpr float kH3DefaultTileOverlap = 0.25f;
 
     static int64_t sol_output_frames(int64_t latent_frames, int patch_size_t) {
         const int64_t blocks = (latent_frames + sol_block_size - 1) / sol_block_size;
@@ -972,7 +974,7 @@ namespace MiniMaxH3VAE {
 
         static sd_tiling_params_t resolve_original_tiling_params(sd_tiling_params_t params) {
             if (!params.enabled) {
-                params.target_overlap = 0.25f;
+                params.target_overlap = kH3DefaultTileOverlap;
             }
             if (params.tile_size_w == 0 && params.rel_size_w == 0.f) {
                 params.tile_size_w = 256;
@@ -1053,9 +1055,16 @@ namespace MiniMaxH3VAE {
             return tile < 4 * ratio ? 0 : tile;
         }
 
-        // The reference's 64-pixel minimum overlap, kept below a quarter of smaller tiles.
-        static int64_t reference_min_overlap(int64_t tile, int64_t ratio) {
-            return std::max<int64_t>(ratio, std::min<int64_t>(64, tile / 4 / ratio * ratio));
+        // Minimum overlap of one axis. The overlap resolve_original_tiling_params gives a caller that did not
+        // enable tiling keeps the reference's 64-pixel rule (below a quarter of smaller tiles); any other
+        // target_overlap is the caller's fraction of the tile, at most half a tile, on the latent grid.
+        static int64_t reference_min_overlap(int64_t tile, int64_t ratio, float target_overlap) {
+            if (target_overlap == kH3DefaultTileOverlap) {
+                return std::max<int64_t>(ratio, std::min<int64_t>(64, tile / 4 / ratio * ratio));
+            }
+            const float fraction = std::max(0.0f, std::min(target_overlap, 0.5f));
+            const int64_t pixels = static_cast<int64_t>(std::lround(fraction * tile / ratio)) * ratio;
+            return std::max<int64_t>(ratio, std::min<int64_t>(pixels, tile / 2 / ratio * ratio));
         }
 
         bool reference_tile_layout(const sd_tiling_params_t& tiling,
@@ -1074,8 +1083,8 @@ namespace MiniMaxH3VAE {
             if (tile_w == 0 || tile_h == 0) {
                 return false;
             }
-            rows = H3VAETiles::split(height_px, tile_h, reference_min_overlap(tile_h, ratio), ratio);
-            cols = H3VAETiles::split(width_px, tile_w, reference_min_overlap(tile_w, ratio), ratio);
+            rows = H3VAETiles::split(height_px, tile_h, reference_min_overlap(tile_h, ratio, tiling.target_overlap), ratio);
+            cols = H3VAETiles::split(width_px, tile_w, reference_min_overlap(tile_w, ratio, tiling.target_overlap), ratio);
             return true;
         }
 

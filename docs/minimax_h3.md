@@ -208,6 +208,15 @@ the same container, so their encode is the only lossy step. sd-server takes
 reports `result.media_url` (`GET /sdcpp/v1/jobs/{id}/media` returns the bytes)
 instead of base64 JSON. A 1344x768, 124-frame clip is about 385 MB.
 
+## VAE tiles
+
+The video VAE encodes and decodes in 256 px tiles laid out as the reference
+implementation does: overlaps of at least 64 px, with the slack spread in 16 px
+steps. With `--vae-tiling`, `--vae-tile-size` sets the tile size and
+`--vae-tile-overlap` sets the minimum overlap as a fraction of the tile (at most
+0.5, default 0.5); pass `--vae-tile-overlap 0.25` to keep the reference's 64 px
+rule with tiling enabled.
+
 ## Sol-H3-VAE decoding
 
 Pass a [Sol-H3-VAE checkpoint](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae)
