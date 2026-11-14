@@ -820,6 +820,34 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
+    // Uncompressed video results as raw bytes (the job JSON's result.media_url), sparing a base64 copy of ~0.4 GB.
+    routes.get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/media)", [runtime](const httplib::Request& req, httplib::Response& res) {
+        AsyncJobManager& manager = *runtime->async_job_manager;
+        std::shared_ptr<const std::vector<uint8_t>> bytes;
+        std::string mime_type;
+        {
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            purge_expired_jobs(manager);
+            auto it = manager.jobs.find(req.matches[1]);
+            if (it != manager.jobs.end() && it->second->status == AsyncJobStatus::Completed) {
+                bytes     = it->second->result_media_bytes;
+                mime_type = it->second->result_media_mime_type;
+            }
+        }
+        if (!bytes) {
+            res.status = 404;
+            res.set_content(R"({"error":"no media for this job"})", "application/json");
+            return;
+        }
+        res.status = 200;
+        res.set_content_provider(
+            bytes->size(),
+            mime_type,
+            [bytes](size_t offset, size_t length, httplib::DataSink& sink) {
+                return sink.write(reinterpret_cast<const char*>(bytes->data()) + offset, length);
+            });
+    });
+
     routes.post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
