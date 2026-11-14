@@ -57,6 +57,7 @@ struct SDCliParams {
     bool metadata_raw        = false;
     bool metadata_brief      = false;
     bool metadata_all        = false;
+    bool lossless_video      = false;
 
     std::string imatrix_out;
     std::vector<std::string> imatrix_in;
@@ -122,6 +123,10 @@ struct SDCliParams {
              "--color",
              "colors the logging tags according to level",
              true, &color},
+            {"",
+             "--lossless-video",
+             "write .avi video results uncompressed (BGR24 frames, 32-bit float PCM audio) instead of MJPG, for callers that encode the clip themselves",
+             true, &lossless_video},
             {"",
              "--preview-noisy",
              "enables previewing noisy inputs of the models rather than the denoised outputs",
@@ -556,7 +561,8 @@ bool save_results(const SDCliParams& cli_params,
         std::string final_ext_lower = ext.u8string();
         std::transform(final_ext_lower.begin(), final_ext_lower.end(), final_ext_lower.begin(), ::tolower);
         const bool mux_audio = generated_audio != nullptr && (final_ext_lower == ".avi" || final_ext_lower == ".webm");
-        if (create_video_from_sd_images(video_path.u8string().c_str(), results.data(), num_results, gen_params.fps, cli_params.compression_quality, mux_audio ? generated_audio : nullptr, params) == 0) {
+        const std::string video_format = cli_params.lossless_video && final_ext_lower == ".avi" ? "avi_raw" : "";
+        if (create_video_from_sd_images(video_path.u8string().c_str(), results.data(), num_results, gen_params.fps, cli_params.compression_quality, mux_audio ? generated_audio : nullptr, params, video_format) == 0) {
             LOG_INFO("save result video to '%s'", video_path.u8string().c_str());
             if (generated_audio != nullptr && !mux_audio) {
                 fs::path wav_path = video_path;

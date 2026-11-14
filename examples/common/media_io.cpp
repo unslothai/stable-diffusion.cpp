@@ -836,7 +836,19 @@ static void append_avi_metadata(std::vector<uint8_t>& data, const std::string& p
     size_t start_pos = data.size();
 }
 
-std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
+static std::vector<uint8_t> audio_to_f32_bytes(const sd_audio_t* audio) {
+    if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 || audio->channels == 0 || audio->sample_rate == 0) {
+        return {};
+    }
+    const size_t samples = static_cast<size_t>(audio->sample_count) * static_cast<size_t>(audio->channels);
+    std::vector<uint8_t> bytes(samples * sizeof(float));
+    memcpy(bytes.data(), audio->data, bytes.size());
+    return bytes;
+}
+
+// MJPG frames + 16-bit PCM, or (raw) uncompressed bottom-up BGR24 frames + 32-bit float PCM: a lossless
+// intermediate for callers that encode the clip once themselves.
+static std::vector<uint8_t> create_avi_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters, bool raw) {
     if (num_images == 0) {
         fprintf(stderr, "Error: Image array is empty.\n");
         return {};
@@ -855,17 +867,24 @@ std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images
     // <= 90 path.
     const int mjpg_quality               = std::clamp(quality, 1, 90);
     const bool has_audio                 = audio != nullptr && audio->data != nullptr && audio->sample_count > 0 && audio->channels > 0 && audio->sample_rate > 0;
-    const std::vector<uint8_t> audio_pcm = audio_to_pcm16_bytes(audio);
-    const uint16_t audio_bits_per_sample = 16;
+    const std::vector<uint8_t> audio_pcm = raw ? audio_to_f32_bytes(audio) : audio_to_pcm16_bytes(audio);
+    const uint16_t audio_bits_per_sample = raw ? 32 : 16;
+    const uint16_t audio_format_tag      = raw ? 3 : 1;  // WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM
+    const size_t raw_row_bytes           = (static_cast<size_t>(width) * 3 + 3) & ~static_cast<size_t>(3);
+    const size_t raw_frame_bytes         = raw_row_bytes * height;
+    if (raw && raw_frame_bytes * static_cast<size_t>(num_images) + audio_pcm.size() > 0xF0000000ull) {
+        fprintf(stderr, "Error: uncompressed AVI would exceed the 4 GB RIFF limit.\n");
+        return {};
+    }
     const uint16_t audio_block_align     = has_audio ? static_cast<uint16_t>(audio->channels * (audio_bits_per_sample / 8)) : 0;
     const uint32_t audio_byte_rate       = has_audio ? static_cast<uint32_t>(audio->sample_rate * audio_block_align) : 0;
     const uint32_t audio_data_size       = has_audio ? static_cast<uint32_t>(audio_pcm.size()) : 0;
 
-    if (mjpg_quality != quality)
+    if (!raw && mjpg_quality != quality)
         LOG_VERBOSE("create_mjpg_avi...(): compression quality was limited from %i to %i", quality, mjpg_quality);
 
     std::vector<uint8_t> avi_data;
-    avi_data.reserve(static_cast<size_t>(num_images) * 1024);
+    avi_data.reserve(raw ? raw_frame_bytes * num_images + audio_pcm.size() + 4096 : static_cast<size_t>(num_images) * 1024);
 
     write_fourcc(avi_data, "RIFF");
     const size_t riff_size_pos = avi_data.size();
@@ -904,7 +923,7 @@ std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images
     write_fourcc(avi_data, "strh");
     write_u32_le(avi_data, 56);
     write_fourcc(avi_data, "vids");
-    write_fourcc(avi_data, "MJPG");
+    write_fourcc(avi_data, raw ? "DIB " : "MJPG");
     write_u32_le(avi_data, 0);
     write_u16_le(avi_data, 0);
     write_u16_le(avi_data, 0);
@@ -928,8 +947,12 @@ std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images
     write_u32_le(avi_data, height);
     write_u16_le(avi_data, 1);
     write_u16_le(avi_data, 24);
-    write_fourcc(avi_data, "MJPG");
-    write_u32_le(avi_data, width * height * 3);
+    if (raw) {
+        write_u32_le(avi_data, 0);  // BI_RGB
+    } else {
+        write_fourcc(avi_data, "MJPG");
+    }
+    write_u32_le(avi_data, raw ? static_cast<uint32_t>(raw_frame_bytes) : width * height * 3);
     write_u32_le(avi_data, 0);
     write_u32_le(avi_data, 0);
     write_u32_le(avi_data, 0);
@@ -962,7 +985,7 @@ std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images
 
         write_fourcc(avi_data, "strf");
         write_u32_le(avi_data, 16);
-        write_u16_le(avi_data, 1);
+        write_u16_le(avi_data, audio_format_tag);
         write_u16_le(avi_data, static_cast<uint16_t>(audio->channels));
         write_u32_le(avi_data, audio->sample_rate);
         write_u32_le(avi_data, audio_byte_rate);
@@ -979,7 +1002,34 @@ std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images
     index.reserve(static_cast<size_t>(num_images) + (has_audio ? 1 : 0));
     std::vector<uint8_t> jpeg_data;
 
-    for (int i = 0; i < num_images; i++) {
+    for (int i = 0; i < num_images && raw; i++) {
+        if (images[i].width != width || images[i].height != height || images[i].channel != channels) {
+            fprintf(stderr, "Error: video frames differ in size.\n");
+            return {};
+        }
+        avi_chunk_index_entry video_entry = {};
+        memcpy(video_entry.fourcc, "00db", 4);
+        video_entry.flags  = 0x10;
+        video_entry.offset = static_cast<uint32_t>(avi_data.size());
+        video_entry.size   = static_cast<uint32_t>(raw_frame_bytes);
+        write_fourcc(avi_data, "00db");
+        write_u32_le(avi_data, static_cast<uint32_t>(raw_frame_bytes));
+        const size_t frame_start = avi_data.size();
+        avi_data.resize(frame_start + raw_frame_bytes, 0);
+        for (uint32_t y = 0; y < height; ++y) {
+            // DIB rows run bottom-up, pixels in BGR order.
+            const uint8_t* src = images[i].data + static_cast<size_t>(height - 1 - y) * width * channels;
+            uint8_t* dst       = avi_data.data() + frame_start + y * raw_row_bytes;
+            for (uint32_t x = 0; x < width; ++x) {
+                dst[3 * x + 0] = src[channels * x + 2];
+                dst[3 * x + 1] = src[channels * x + 1];
+                dst[3 * x + 2] = src[channels * x + 0];
+            }
+        }
+        index.push_back(video_entry);
+    }
+
+    for (int i = 0; i < num_images && !raw; i++) {
         jpeg_data.clear();
 
         auto write_to_buf = [](void* context, void* data, int size) {
@@ -1041,6 +1091,14 @@ std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images
     patch_u32_le(avi_data, riff_size_pos, static_cast<uint32_t>(file_size));
 
     return avi_data;
+}
+
+std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
+    return create_avi_from_sd_images_to_vector(images, num_images, fps, quality, audio, parameters, false);
+}
+
+std::vector<uint8_t> create_raw_avi_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, const sd_audio_t* audio, const std::string& parameters) {
+    return create_avi_from_sd_images_to_vector(images, num_images, fps, 100, audio, parameters, true);
 }
 
 int create_mjpg_avi_from_sd_images(const char* filename, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
@@ -1341,6 +1399,10 @@ std::vector<uint8_t> create_video_from_sd_images_to_vector(const std::string& ou
         format.erase(format.begin());
     }
 
+    if (format == "avi_raw") {
+        return create_raw_avi_from_sd_images_to_vector(images, num_images, fps, audio, parameters);
+    }
+
 #ifdef SD_USE_WEBM
     if (format == "webm") {
         return create_webm_from_sd_images_to_vector(images, num_images, fps, quality, audio, parameters);
@@ -1359,10 +1421,11 @@ std::vector<uint8_t> create_video_from_sd_images_to_vector(const std::string& ou
     return create_mjpg_avi_from_sd_images_to_vector(images, num_images, fps, quality, audio, parameters);
 }
 
-int create_video_from_sd_images(const char* filename, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters) {
+int create_video_from_sd_images(const char* filename, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio, const std::string& parameters, const std::string& format) {
     std::string path                = filename ? filename : "";
     auto pos                        = path.find_last_of('.');
-    std::string ext                 = pos == std::string::npos ? "" : path.substr(pos);
+    std::string ext                 = !format.empty() ? format : pos == std::string::npos ? ""
+                                                                                          : path.substr(pos);
     std::vector<uint8_t> video_data = create_video_from_sd_images_to_vector(ext, images, num_images, fps, quality, audio, parameters);
     if (video_data.empty()) {
         return -1;

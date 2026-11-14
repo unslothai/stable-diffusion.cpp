@@ -65,6 +65,12 @@ int create_mjpg_avi_from_sd_images(const char* filename,
                                    int quality                   = 90,
                                    const sd_audio_t* audio       = nullptr,
                                    const std::string& parameters = "");
+// Uncompressed BGR24 frames and float PCM audio, for callers that encode the clip themselves (no lossy step).
+std::vector<uint8_t> create_raw_avi_from_sd_images_to_vector(sd_image_t* images,
+                                                             int num_images,
+                                                             int fps,
+                                                             const sd_audio_t* audio       = nullptr,
+                                                             const std::string& parameters = "");
 std::vector<uint8_t> create_mjpg_avi_from_sd_images_to_vector(sd_image_t* images,
                                                               int num_images,
                                                               int fps,
@@ -100,13 +106,15 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images,
                                                           const std::string& parameters = "");
 #endif
 
+// The container follows the file extension; `format` ("avi_raw" for uncompressed AVI) overrides it.
 int create_video_from_sd_images(const char* filename,
                                 sd_image_t* images,
                                 int num_images,
                                 int fps,
                                 int quality                   = 90,
                                 const sd_audio_t* audio       = nullptr,
-                                const std::string& parameters = "");
+                                const std::string& parameters = "",
+                                const std::string& format     = "");
 std::vector<uint8_t> create_video_from_sd_images_to_vector(const std::string& output_format,
                                                            sd_image_t* images,
                                                            int num_images,
