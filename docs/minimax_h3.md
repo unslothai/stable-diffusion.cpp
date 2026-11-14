@@ -188,6 +188,26 @@ The C API exposes the same inputs through `ref_images`, `ref_videos`, and
 `ref_audios` in `sd_vid_gen_params_t`. Each `sd_ref_video_t` supplies its own
 frame rate and optional soundtrack; non-24-fps inputs are resampled internally.
 
+## Sampling defaults
+
+MiniMax-H3 video samples with `res_multistep` (eta 0, one model evaluation per
+step) on the `simple` schedule by default, the recipe of the reference
+workflows, so `--steps 20` runs 20 evaluations on the grid
+`1, 1 - 1/20, ..., 1/20` shifted by `--flow-shift` (12), then 0. Pass
+`--sampling-method euler --scheduler discrete` for the previous default.
+Distilled checkpoints should use `--sampling-method euler` with their own step
+count. `--audio-flow-shift` sets the audio schedule shift (default 3).
+
+## Lossless output for re-encoding
+
+Results written as `.avi` use MJPG frames and 16-bit PCM. Applications that
+encode the clip themselves (for example to H.264 / AAC) can pass
+`--lossless-video` to write uncompressed BGR24 frames and 32-bit float PCM in
+the same container, so their encode is the only lossy step. sd-server takes
+`"output_format": "avi_raw"` for the same container; the finished job then
+reports `result.media_url` (`GET /sdcpp/v1/jobs/{id}/media` returns the bytes)
+instead of base64 JSON. A 1344x768, 124-frame clip is about 385 MB.
+
 ## Sol-H3-VAE decoding
 
 Pass a [Sol-H3-VAE checkpoint](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae)
