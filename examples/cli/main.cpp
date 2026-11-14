@@ -897,8 +897,10 @@ int main(int argc, const char* argv[]) {
             gen_params.ref_videos.push_back(std::move(frames));
         }
 
+        // Loaded in argument order; pairing with videos (by position or by
+        // --ref-video-audio-index) happens when the request is built.
         gen_params.ref_video_audios.clear();
-        gen_params.ref_video_audios.resize(gen_params.ref_videos.size());
+        gen_params.ref_video_audios.resize(gen_params.ref_video_audio_paths.size());
         for (size_t i = 0; i < gen_params.ref_video_audio_paths.size(); ++i) {
             if (!load_audio(gen_params.ref_video_audio_paths[i], gen_params.ref_video_audios[i])) {
                 return 1;

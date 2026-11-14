@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -23,6 +25,7 @@
 
 #include "log.h"
 #include "media_io.h"
+#include "ref_video_audio_pairing.h"
 #include "resource_owners.hpp"
 
 using json   = nlohmann::json;
@@ -1620,6 +1623,22 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_ref_video_audio_index_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        const std::string value = argv[index];
+        char* end               = nullptr;
+        errno                   = 0;
+        long parsed             = std::strtol(value.c_str(), &end, 10);
+        if (value.empty() || end == nullptr || *end != '\0' || errno != 0 || parsed < 0 || parsed > INT32_MAX) {
+            LOG_ERROR("error: --ref-video-audio-index expects a non-negative integer, got '%s'", value.c_str());
+            return -1;
+        }
+        ref_video_audio_indices.push_back(static_cast<int>(parsed));
+        return 1;
+    };
+
     auto on_ref_audio_arg = [&](int argc, const char** argv, int index) {
         if (++index >= argc) {
             return -1;
@@ -1820,8 +1839,14 @@ ArgOptions SDGenerationParams::get_options() {
          on_ref_video_arg},
         {"",
          "--ref-video-audio",
-         "WAV soundtrack paired by index with --ref-video (can be used multiple times)",
+         "WAV soundtrack for a --ref-video (can be used multiple times); paired by position "
+         "unless --ref-video-audio-index is given",
          on_ref_video_audio_arg},
+        {"",
+         "--ref-video-audio-index",
+         "0-based --ref-video index that the matching --ref-video-audio belongs to; give one per "
+         "--ref-video-audio, in the same order (lets a silent video precede one with audio)",
+         on_ref_video_audio_index_arg},
         {"",
          "--ref-audio",
          "standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)",
@@ -2437,6 +2462,26 @@ bool SDGenerationParams::from_json_str(
         LOG_ERROR("invalid input image/audio/video array");
         return false;
     }
+    if (j.contains("ref_video_audio_indices")) {
+        const auto& indices = j.at("ref_video_audio_indices");
+        ref_video_audio_indices.clear();
+        if (!indices.is_null()) {
+            if (!indices.is_array()) {
+                LOG_ERROR("ref_video_audio_indices must be an array of integers");
+                return false;
+            }
+            for (const auto& item : indices) {
+                if (!item.is_number_integer() || item.get<int64_t>() < 0 || item.get<int64_t>() > INT32_MAX) {
+                    LOG_ERROR("ref_video_audio_indices must contain non-negative integers");
+                    return false;
+                }
+                ref_video_audio_indices.push_back(static_cast<int>(item.get<int64_t>()));
+            }
+        }
+    } else if (j.contains("ref_video_audios")) {
+        // A request that sends soundtracks without indices uses positional pairing.
+        ref_video_audio_indices.clear();
+    }
 
     return true;
 }
@@ -2749,9 +2794,14 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
-    if (ref_video_audio_paths.size() + ref_video_audios.size() > ref_video_paths.size() + ref_videos.size()) {
-        LOG_ERROR("error: each --ref-video-audio needs a corresponding --ref-video");
-        return false;
+    {
+        const std::string pairing_error = sd_ref_video_audio::validate(ref_video_audio_indices,
+                                                                       ref_video_audio_paths.size() + ref_video_audios.size(),
+                                                                       ref_video_paths.size() + ref_videos.size());
+        if (!pairing_error.empty()) {
+            LOG_ERROR("error: %s", pairing_error.c_str());
+            return false;
+        }
     }
 
     if (mode != VID_GEN && (!ref_video_paths.empty() || !ref_video_audio_paths.empty() || !ref_audio_paths.empty() ||
@@ -2964,7 +3014,8 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
         for (auto& frame : ref_videos[i]) {
             frame_views.push_back(frame.get());
         }
-        sd_audio_t audio = i < ref_video_audios.size() ? ref_video_audios[i].get() : sd_audio_t{};
+        const int audio_index = sd_ref_video_audio::audio_for_video(ref_video_audio_indices, ref_video_audios.size(), i);
+        sd_audio_t audio      = audio_index >= 0 ? ref_video_audios[static_cast<size_t>(audio_index)].get() : sd_audio_t{};
         ref_video_views.push_back({frame_views.empty() ? nullptr : frame_views.data(),
                                    static_cast<int>(frame_views.size()),
                                    24,
@@ -3084,6 +3135,7 @@ std::string SDGenerationParams::to_string() const {
         << "  ref_image_paths: " << vec_str_to_string(ref_image_paths) << ",\n"
         << "  ref_video_paths: " << vec_str_to_string(ref_video_paths) << ",\n"
         << "  ref_video_audio_paths: " << vec_str_to_string(ref_video_audio_paths) << ",\n"
+        << "  ref_video_audio_indices: " << vec_to_string(ref_video_audio_indices) << ",\n"
         << "  ref_audio_paths: " << vec_str_to_string(ref_audio_paths) << ",\n"
         << "  control_video_path: \"" << control_video_path << "\",\n"
         << "  image_preprocess: " << image_preprocess << ",\n"

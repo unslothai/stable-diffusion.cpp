@@ -152,10 +152,16 @@ video soundtracks, and standalone audio references:
 
 `--ref-image`, `--ref-video`, and `--ref-audio` can each be repeated. A
 reference video is a directory of image frames sorted lexicographically and is
-treated as 24 fps. Repeated `--ref-video-audio` WAV files are paired by index
-with repeated `--ref-video` inputs. WAV PCM (8/16/24/32-bit) and 32/64-bit
+treated as 24 fps. Repeated `--ref-video-audio` WAV files are paired by position
+with repeated `--ref-video` inputs. To leave a video silent while a later one
+has a soundtrack, give one `--ref-video-audio-index N` per `--ref-video-audio`
+(0-based `--ref-video` index, in the same order; each index at most once), for
+example `--ref-video a --ref-video b --ref-video-audio b.wav
+--ref-video-audio-index 1`. The server takes the same mapping as
+`ref_video_audio_indices`. WAV PCM (8/16/24/32-bit) and 32/64-bit
 floating-point samples are accepted; audio is converted to stereo 32 kHz by the
-pipeline.
+pipeline (bandlimited windowed-sinc resampling, then a centre crop to whole
+800-sample frames; a clip shorter than one frame is rejected).
 
 Reference inputs are presented to Qwen3-VL in image, video, then audio order.
 Videos are sampled at 2 fps for the Qwen presentation while their full 24 fps

@@ -186,6 +186,7 @@ Default-enabled features are `img2img`, `mask_image`, `lora`, `vae_tiling`,
 | `ref_videos` | Reference videos as frame arrays |
 | `ref_audios` | Standalone reference audio; runtime requires an Audio VAE or Audio Encoder |
 | `ref_video_audios` | Soundtracks paired with reference videos; runtime requires an Audio VAE |
+| `ref_video_audio_indices` | `ref_video_audio_indices` is accepted: one 0-based `ref_videos` index per `ref_video_audios` entry |
 | `controlnet` | Control image and ControlNet strength |
 | `control_image` | Control image without a separate ControlNet (FLUX Canny/Depth) |
 | `ip_adapter` | IP-Adapter image and strength |
@@ -1507,6 +1508,7 @@ Compared with `img_gen`, the `vid_gen` request body:
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
 - `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
 - `ref_images` is accepted for MiniMax-H3 Ref2VA conditioning; other video model families currently ignore it
+- `ref_video_audios` are paired with `ref_videos` by position unless `ref_video_audio_indices` is given: an array of 0-based `ref_videos` indices, one per soundtrack in the same order, each in range and used at most once (for example `[1]` attaches the only soundtrack to the second video and leaves the first silent)
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `ref_image_args`, `moe_boundary`, and `vace_strength`
 
 Example:
