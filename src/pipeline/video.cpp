@@ -21,6 +21,7 @@
 #include "request.h"
 #include "runtime/denoiser.hpp"
 #include "runtime/image_preprocess.h"
+#include "runtime/sinc_resample.h"
 
 namespace sd::pipeline {
 
@@ -381,29 +382,30 @@ namespace sd::pipeline {
         if (audio.data == nullptr || audio.sample_count == 0 || audio.channels == 0 || audio.sample_rate == 0) {
             return {};
         }
-        uint64_t output_samples = static_cast<uint64_t>(std::llround(
-            static_cast<long double>(audio.sample_count) * target_sample_rate / audio.sample_rate));
-        output_samples          = std::max<uint64_t>(1, output_samples);
-        uint64_t padded_samples = (output_samples + 799) / 800 * 800;
+        // Bandlimited resample to the VAE rate, then centre-crop to whole 800-sample
+        // audio frames the way the reference implementation crops encoder input.
+        constexpr int64_t kFrameSamples = 800;
+        int64_t samples                 = 0;
+        std::vector<float> planar       = sd::sinc_resample::prepare_h3_reference_waveform(
+            audio.data,
+            static_cast<int64_t>(audio.sample_count),
+            static_cast<int>(audio.channels),
+            static_cast<int64_t>(audio.sample_rate),
+            static_cast<int64_t>(target_sample_rate),
+            kFrameSamples,
+            &samples);
+        if (planar.empty()) {
+            LOG_ERROR("MiniMax-H3 reference audio is shorter than one %d-sample frame at %d Hz",
+                      static_cast<int>(kFrameSamples),
+                      target_sample_rate);
+            return {};
+        }
         // Keep stereo streams planar for the mono-per-stream audio encoder:
         // [samples, 1, stereo, batch]. This avoids flattening interleaved L/R
         // storage into alternating samples when the encoder folds streams into
         // its batch dimension.
-        sd::Tensor<float> waveform({static_cast<int64_t>(padded_samples), 1, 2, 1});
-
-        for (uint64_t i = 0; i < output_samples; ++i) {
-            long double source_pos = static_cast<long double>(i) * audio.sample_rate / target_sample_rate;
-            uint64_t source0       = std::min<uint64_t>(static_cast<uint64_t>(source_pos), audio.sample_count - 1);
-            uint64_t source1       = std::min<uint64_t>(source0 + 1, audio.sample_count - 1);
-            float fraction         = static_cast<float>(source_pos - source0);
-            for (uint32_t channel = 0; channel < 2; ++channel) {
-                uint32_t source_channel = audio.channels == 1 ? 0 : std::min<uint32_t>(channel, audio.channels - 1);
-                float a                 = audio.data[source0 * audio.channels + source_channel];
-                float b                 = audio.data[source1 * audio.channels + source_channel];
-                waveform.index(static_cast<int64_t>(i), 0, channel, 0) =
-                    std::clamp(a + (b - a) * fraction, -1.f, 1.f);
-            }
-        }
+        sd::Tensor<float> waveform({samples, 1, 2, 1});
+        std::copy(planar.begin(), planar.end(), waveform.data());
         return waveform;
     }
 
