@@ -976,6 +976,7 @@ namespace sd::pipeline {
         sd->rng->manual_seed(request.seed);
         sd->sampler_rng->manual_seed(request.seed);
         sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
+        sd->set_audio_flow_shift();
         if (!sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count))
             return false;
         sd->apply_circular_axes(sd_img_gen_params->circular_x, sd_img_gen_params->circular_y);

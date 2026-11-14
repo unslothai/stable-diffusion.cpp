@@ -234,6 +234,8 @@ std::vector<std::string> supported_vid_output_formats() {
     formats.push_back("webp");
 #endif
     formats.push_back("avi");
+    // Uncompressed AVI (BGR24 frames, float PCM) for clients that encode the clip once themselves.
+    formats.push_back("avi_raw");
     return formats;
 }
 
@@ -285,7 +287,7 @@ bool assign_output_options(VidGenJobRequest& request,
     request.output_format      = normalize_output_format(std::move(output_format));
     request.output_compression = std::clamp(output_compression, 0, 100);
 
-    if (request.output_format == "avi") {
+    if (request.output_format == "avi" || request.output_format == "avi_raw") {
         return true;
     }
 

@@ -152,10 +152,16 @@ video soundtracks, and standalone audio references:
 
 `--ref-image`, `--ref-video`, and `--ref-audio` can each be repeated. A
 reference video is a directory of image frames sorted lexicographically and is
-treated as 24 fps. Repeated `--ref-video-audio` WAV files are paired by index
-with repeated `--ref-video` inputs. WAV PCM (8/16/24/32-bit) and 32/64-bit
+treated as 24 fps. Repeated `--ref-video-audio` WAV files are paired by position
+with repeated `--ref-video` inputs. To leave a video silent while a later one
+has a soundtrack, give one `--ref-video-audio-index N` per `--ref-video-audio`
+(0-based `--ref-video` index, in the same order; each index at most once), for
+example `--ref-video a --ref-video b --ref-video-audio b.wav
+--ref-video-audio-index 1`. The server takes the same mapping as
+`ref_video_audio_indices`. WAV PCM (8/16/24/32-bit) and 32/64-bit
 floating-point samples are accepted; audio is converted to stereo 32 kHz by the
-pipeline.
+pipeline (bandlimited windowed-sinc resampling, then a centre crop to whole
+800-sample frames; a clip shorter than one frame is rejected).
 
 Reference inputs are presented to Qwen3-VL in image, video, then audio order.
 Videos are sampled at 2 fps for the Qwen presentation while their full 24 fps
@@ -181,6 +187,35 @@ the 32-pixel grid and reports a warning.
 The C API exposes the same inputs through `ref_images`, `ref_videos`, and
 `ref_audios` in `sd_vid_gen_params_t`. Each `sd_ref_video_t` supplies its own
 frame rate and optional soundtrack; non-24-fps inputs are resampled internally.
+
+## Sampling defaults
+
+MiniMax-H3 video samples with `res_multistep` (eta 0, one model evaluation per
+step) on the `simple` schedule by default, the recipe of the reference
+workflows, so `--steps 20` runs 20 evaluations on the grid
+`1, 1 - 1/20, ..., 1/20` shifted by `--flow-shift` (12), then 0. Pass
+`--sampling-method euler --scheduler discrete` for the previous default.
+Distilled checkpoints should use `--sampling-method euler` with their own step
+count. `--audio-flow-shift` sets the audio schedule shift (default 3).
+
+## Lossless output for re-encoding
+
+Results written as `.avi` use MJPG frames and 16-bit PCM. Applications that
+encode the clip themselves (for example to H.264 / AAC) can pass
+`--lossless-video` to write uncompressed BGR24 frames and 32-bit float PCM in
+the same container, so their encode is the only lossy step. sd-server takes
+`"output_format": "avi_raw"` for the same container; the finished job then
+reports `result.media_url` (`GET /sdcpp/v1/jobs/{id}/media` returns the bytes)
+instead of base64 JSON. A 1344x768, 124-frame clip is about 385 MB.
+
+## VAE tiles
+
+The video VAE encodes and decodes in 256 px tiles laid out as the reference
+implementation does: overlaps of at least 64 px, with the slack spread in 16 px
+steps. With `--vae-tiling`, `--vae-tile-size` sets the tile size and
+`--vae-tile-overlap` sets the minimum overlap as a fraction of the tile (at most
+0.5, default 0.5); pass `--vae-tile-overlap 0.25` to keep the reference's 64 px
+rule with tiling enabled.
 
 ## Sol-H3-VAE decoding
 
@@ -270,6 +305,9 @@ Notes for this mode:
   block's working memory must also fit within the VRAM budget.
 - The default video flow shift is 12. The audio stream is mapped internally to
   its shift of 3, so the regular samplers can operate on the packed AV latent.
+  `--audio-flow-shift X` (server: `sample_params.audio_flow_shift`) changes the
+  audio shift; the carried audio scale and the transformer both use the new
+  value.
 
 ## HyperFlow H3 Flash
 

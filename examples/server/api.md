@@ -176,6 +176,7 @@ Default-enabled features are `img2img`, `mask_image`, `lora`, `vae_tiling`,
 | Feature | Controls |
 | --- | --- |
 | `flow_shift` | Flow shift, where used by the selected scheduler |
+| `audio_flow_shift` | MiniMax-H3 video audio schedule shift (`sample_params.audio_flow_shift`) |
 | `distilled_guidance` | Distilled guidance embedding |
 | `shifted_timestep` | SDXL timestep shifting |
 | `img_cfg` | Image CFG |
@@ -186,6 +187,7 @@ Default-enabled features are `img2img`, `mask_image`, `lora`, `vae_tiling`,
 | `ref_videos` | Reference videos as frame arrays |
 | `ref_audios` | Standalone reference audio; runtime requires an Audio VAE or Audio Encoder |
 | `ref_video_audios` | Soundtracks paired with reference videos; runtime requires an Audio VAE |
+| `ref_video_audio_indices` | `ref_video_audio_indices` is accepted: one 0-based `ref_videos` index per `ref_video_audios` entry |
 | `controlnet` | Control image and ControlNet strength |
 | `control_image` | Control image without a separate ControlNet (FLUX Canny/Depth) |
 | `ip_adapter` | IP-Adapter image and strength |
@@ -952,6 +954,7 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `sample_params.eta` | `number \| null` |
 | `sample_params.shifted_timestep` | `integer` |
 | `sample_params.flow_shift` | `number \| null` |
+| `sample_params.audio_flow_shift` | `number \| null` |
 | `sample_params.guidance.txt_cfg` | `number` |
 | `sample_params.guidance.img_cfg` | `number \| null` |
 | `sample_params.guidance.distilled_guidance` | `number` |
@@ -1507,6 +1510,7 @@ Compared with `img_gen`, the `vid_gen` request body:
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
 - `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
 - `ref_images` is accepted for MiniMax-H3 Ref2VA conditioning; other video model families currently ignore it
+- `ref_video_audios` are paired with `ref_videos` by position unless `ref_video_audio_indices` is given: an array of 0-based `ref_videos` indices, one per soundtrack in the same order, each in range and used at most once (for example `[1]` attaches the only soundtrack to the second video and leaves the first silent)
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `ref_image_args`, `moe_boundary`, and `vace_strength`
 
 Example:
@@ -1689,6 +1693,7 @@ Sampling fields:
 | `sample_params.shifted_timestep` | `integer` |
 | `sample_params.custom_sigmas` | `array<number>` |
 | `sample_params.flow_shift` | `number` |
+| `sample_params.audio_flow_shift` | `number` |
 | `sample_params.guidance.txt_cfg` | `number` |
 | `sample_params.guidance.img_cfg` | `number` |
 | `sample_params.guidance.distilled_guidance` | `number` |
@@ -1786,6 +1791,7 @@ When omitted, backend defaults apply to these fields:
 - `sample_params.sample_method`
 - `sample_params.eta`
 - `sample_params.flow_shift`
+- `sample_params.audio_flow_shift` (MiniMax-H3 video only; default 3, must be in (0, 1000])
 - `sample_params.guidance.img_cfg`
 - `high_noise_sample_params.scheduler`
 - `high_noise_sample_params.sample_method`

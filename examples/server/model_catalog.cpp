@@ -309,6 +309,7 @@ static const std::map<std::string, bool> k_recipe_features = {
     {"cache_dit", true},
     {"preview", true},
     {"flow_shift", false},
+    {"audio_flow_shift", false},
     {"distilled_guidance", false},
     {"shifted_timestep", false},
     {"img_cfg", false},
@@ -324,6 +325,7 @@ static const std::map<std::string, bool> k_recipe_features = {
     {"ref_videos", false},
     {"ref_audios", false},
     {"ref_video_audios", false},
+    {"ref_video_audio_indices", false},
     {"vace", false},
     {"high_noise", false},
     {"cache_unet", false},
@@ -384,6 +386,8 @@ json model_generation_features(const ServerRuntime& runtime) {
     features["ref_audios"]       = features.value("ref_audios", false) &&
                                    (!runtime.ctx_params->audio_vae_path.empty() || !runtime.ctx_params->audio_encoder_path.empty());
     features["ref_video_audios"] = features.value("ref_video_audios", false) && !runtime.ctx_params->audio_vae_path.empty();
+    // Explicit soundtrack-to-video pairing is only meaningful where soundtracks are accepted.
+    features["ref_video_audio_indices"] = features.value("ref_video_audio_indices", false) && features.value("ref_video_audios", false);
     if (!runtime.ctx_params->pulid_weights_path.empty())
         features["slg"] = false;
     return features;

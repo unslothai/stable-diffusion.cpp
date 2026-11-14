@@ -67,6 +67,9 @@ public:
     std::unique_ptr<sd::ParallelExecutor> tensor_executor;
     float default_flow_shift = INFINITY;
     float active_flow_shift  = INFINITY;
+    // MiniMax-H3 audio schedule shift (the audio stream is carried on the video schedule).
+    float default_audio_flow_shift = 3.f;
+    float active_audio_flow_shift  = 3.f;
 
     std::shared_ptr<Conditioner> cond_stage_model;
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
@@ -523,6 +526,7 @@ public:
     sd::Tensor<float> decode_ltx_audio_latent(const sd::Tensor<float>& audio_latent);
 
     void set_flow_shift(float flow_shift = INFINITY);
+    void set_audio_flow_shift(float audio_flow_shift = INFINITY);
 
     bool is_flow_denoiser();
 

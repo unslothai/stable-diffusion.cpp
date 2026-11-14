@@ -297,6 +297,10 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                 {"b64_json", job.result_media_b64},
                 {"generation_info", job.result_generation_info},
             };
+            if (job.result_media_bytes) {
+                result["result"]["media_url"]  = "/sdcpp/v1/jobs/" + job.id + "/media";
+                result["result"]["media_size"] = job.result_media_bytes->size();
+            }
         } else {
             json images = json::array();
             for (size_t i = 0; i < job.result_images_b64.size(); ++i) {
@@ -418,6 +422,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::string& output_media_b64,
+                         std::shared_ptr<const std::vector<uint8_t>>& output_media_bytes,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
@@ -470,7 +475,11 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         return false;
     }
 
-    output_media_b64       = base64_encode(video_bytes);
+    if (job.vid_gen.output_format == "avi_raw") {
+        output_media_bytes = std::make_shared<const std::vector<uint8_t>>(std::move(video_bytes));
+    } else {
+        output_media_b64 = base64_encode(video_bytes);
+    }
     output_media_mime_type = video_mime_type(job.vid_gen.output_format);
     output_frame_count     = num_results;
     return true;
@@ -511,6 +520,7 @@ void async_job_worker(ServerRuntime& runtime) {
         std::vector<std::string> output_images;
         json output_info;
         std::string output_media_b64;
+        std::shared_ptr<const std::vector<uint8_t>> output_media_bytes;
         std::string output_media_mime_type;
         int output_frame_count = 0;
         int output_fps         = 0;
@@ -523,6 +533,7 @@ void async_job_worker(ServerRuntime& runtime) {
             ok = execute_vid_gen_job(runtime,
                                      *job,
                                      output_media_b64,
+                                     output_media_bytes,
                                      output_media_mime_type,
                                      output_frame_count,
                                      output_fps,
@@ -550,6 +561,7 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->result_images_b64      = std::move(output_images);
                 job->result_generation_info = std::move(output_info);
                 job->result_media_b64       = std::move(output_media_b64);
+                job->result_media_bytes     = std::move(output_media_bytes);
                 job->result_media_mime_type = std::move(output_media_mime_type);
                 job->result_frame_count     = output_frame_count;
                 job->result_fps             = output_fps;
@@ -562,6 +574,7 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->result_images_b64.clear();
                 job->result_generation_info = nullptr;
                 job->result_media_b64.clear();
+                job->result_media_bytes.reset();
                 job->result_media_mime_type.clear();
                 job->result_frame_count = 0;
                 job->result_fps         = 0;

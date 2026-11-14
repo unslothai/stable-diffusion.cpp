@@ -233,6 +233,9 @@ struct SDGenerationParams {
     std::vector<std::string> ref_image_paths;
     std::vector<std::string> ref_video_paths;
     std::vector<std::string> ref_video_audio_paths;
+    // Optional 0-based --ref-video index for each soundtrack (CLI --ref-video-audio-index,
+    // JSON ref_video_audio_indices). Empty pairs soundtracks with videos by position.
+    std::vector<int> ref_video_audio_indices;
     std::vector<std::string> ref_audio_paths;
     std::string control_video_path;
 

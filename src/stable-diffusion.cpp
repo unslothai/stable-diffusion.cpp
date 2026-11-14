@@ -523,6 +523,7 @@ void sd_sample_params_init(sd_sample_params_t* sample_params) {
     sample_params->custom_sigmas_count         = 0;
     sample_params->flow_shift                  = INFINITY;
     sample_params->extra_sample_args           = nullptr;
+    sample_params->audio_flow_shift            = INFINITY;
 }
 
 char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
@@ -545,6 +546,7 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              "eta: %.2f, "
              "shifted_timestep: %d, "
              "flow_shift: %.2f, "
+             "audio_flow_shift: %.2f, "
              "extra_sample_args: %s)",
              sample_params->guidance.txt_cfg,
              std::isfinite(sample_params->guidance.img_cfg)
@@ -561,6 +563,7 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              sample_params->eta,
              sample_params->shifted_timestep,
              sample_params->flow_shift,
+             sample_params->audio_flow_shift,
              SAFE_STR(sample_params->extra_sample_args));
 
     return buf;

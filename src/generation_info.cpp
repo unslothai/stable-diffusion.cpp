@@ -45,6 +45,8 @@ namespace sd {
             info["eta"] = p.eta;
         if (!high_noise && std::isfinite(p.flow_shift))
             info["flow_shift"] = p.flow_shift;
+        if (!high_noise && std::isfinite(p.audio_flow_shift))
+            info["audio_flow_shift"] = p.audio_flow_shift;
         if (!high_noise && p.custom_sigmas && p.custom_sigmas_count > 0)
             info["custom_sigmas"] = std::vector<float>(p.custom_sigmas, p.custom_sigmas + p.custom_sigmas_count);
         if (p.extra_sample_args && *p.extra_sample_args)

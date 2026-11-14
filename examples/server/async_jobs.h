@@ -54,6 +54,8 @@ struct AsyncGenerationJob {
     std::vector<std::string> result_images_b64;
     json result_generation_info;
     std::string result_media_b64;
+    // Uncompressed results (avi_raw) are kept as bytes and served by GET /sdcpp/v1/jobs/{id}/media, not base64.
+    std::shared_ptr<const std::vector<uint8_t>> result_media_bytes;
     std::string result_media_mime_type;
     int result_frame_count = 0;
     int result_fps         = 0;
@@ -94,6 +96,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::string& output_media_b64,
+                         std::shared_ptr<const std::vector<uint8_t>>& output_media_bytes,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,

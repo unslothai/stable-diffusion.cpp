@@ -478,10 +478,11 @@ struct SimpleScheduler : SigmaScheduler {
 
         int model_sigmas_len = TIMESTEPS;
 
-        float step_factor = static_cast<float>(model_sigmas_len) / static_cast<float>(n);
+        // Double, as the reference computes len(sigmas) / steps: in float, 3 * (1000 / 30.f) truncates to 99, not 100.
+        double step_factor = static_cast<double>(model_sigmas_len) / static_cast<double>(n);
 
         for (uint32_t i = 0; i < n; ++i) {
-            int offset_from_start_of_py_array = static_cast<int>(static_cast<float>(i) * step_factor);
+            int offset_from_start_of_py_array = static_cast<int>(static_cast<double>(i) * step_factor);
             int timestep_index                = model_sigmas_len - 1 - offset_from_start_of_py_array;
 
             if (timestep_index < 0) {
@@ -1447,6 +1448,11 @@ struct H3AVFlowDenoiser : public DiscreteFlowDenoiser {
           video_channels(video_channels),
           audio_shift(audio_shift) {
         GGML_ASSERT(shift > 0.f && audio_shift > 0.f && video_channels > 0);
+    }
+
+    void set_audio_shift(float value) {
+        GGML_ASSERT(value > 0.f);
+        audio_shift = value;
     }
 
     sd::Tensor<float> process_latent_in(const sd::Tensor<float>& latent) override {

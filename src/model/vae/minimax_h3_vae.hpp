@@ -17,6 +17,7 @@
 #include "core/rng_mt19937.hpp"
 #include "model/common/rope.hpp"
 #include "model/diffusion/dit.hpp"
+#include "model/vae/h3_vae_tiles.hpp"
 #include "model/vae/minimax_h3_sol_attention.hpp"
 #include "model/vae/vae.hpp"
 #include "runtime/tiling.h"
@@ -24,6 +25,8 @@
 namespace MiniMaxH3VAE {
 
     constexpr int H3_VIDEO_VAE_GRAPH_SIZE = 262144;
+    // Tile overlap of the original VAE when the caller did not enable tiling.
+    constexpr float kH3DefaultTileOverlap = 0.25f;
 
     static int64_t sol_output_frames(int64_t latent_frames, int patch_size_t) {
         const int64_t blocks = (latent_frames + sol_block_size - 1) / sol_block_size;
@@ -686,7 +689,8 @@ namespace MiniMaxH3VAE {
                              ggml_tensor* pixel_mean,
                              ggml_tensor* pixel_std,
                              ggml_tensor* rope_a = nullptr,
-                             ggml_tensor* rope_b = nullptr) {
+                             ggml_tensor* rope_b = nullptr,
+                             bool clamp          = true) {
             int64_t width      = z->ne[0];
             int64_t height     = z->ne[1];
             int64_t num_frames = z->ne[2];
@@ -765,9 +769,10 @@ namespace MiniMaxH3VAE {
 
             auto norm_out              = std::dynamic_pointer_cast<LayerNorm>(blocks["norm_out"]);
             auto proj_out              = std::dynamic_pointer_cast<Linear>(blocks["proj_out"]);
+            // clamp = false leaves the clamp to the caller, which blends tiles first as the reference does.
             auto denormalize_and_clamp = [&](ggml_tensor* pixels) {
-                auto scaled = ggml_mul(ctx->ggml_ctx, pixels, pixel_std);
-                return ggml_clamp(ctx->ggml_ctx, ggml_add(ctx->ggml_ctx, scaled, pixel_mean), 0.f, 1.f);
+                auto scaled = ggml_add(ctx->ggml_ctx, ggml_mul(ctx->ggml_ctx, pixels, pixel_std), pixel_mean);
+                return clamp ? ggml_clamp(ctx->ggml_ctx, scaled, 0.f, 1.f) : scaled;
             };
             if (sol) {
                 const int64_t frame_rows    = width * height;
@@ -848,7 +853,8 @@ namespace MiniMaxH3VAE {
                             ggml_tensor* pixel_mean,
                             ggml_tensor* pixel_std,
                             ggml_tensor* rope_a = nullptr,
-                            ggml_tensor* rope_b = nullptr) {
+                            ggml_tensor* rope_b = nullptr,
+                            bool clamp          = true) {
             auto post_quant = std::dynamic_pointer_cast<UnaryBlock>(blocks["post_quant_conv"]);
             auto decoder    = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
             if (vit_decoder_2d) {
@@ -859,101 +865,9 @@ namespace MiniMaxH3VAE {
             if (vit_decoder_2d) {
                 latent = ggml_reshape_4d(ctx->ggml_ctx, latent, latent->ne[0], latent->ne[1], 1, latent->ne[2] * latent->ne[3]);
             }
-            return decoder->forward(ctx, latent, pe, shifted_pe, sol_inputs, pixel_mean, pixel_std, rope_a, rope_b);
+            return decoder->forward(ctx, latent, pe, shifted_pe, sol_inputs, pixel_mean, pixel_std, rope_a, rope_b, clamp);
         }
     };
-
-    // The MiniMax-H3-Image release tiles its VAE as diffusers' AutoencoderKLMiniMaxH3Image does: the fewest
-    // `tile`-pixel tiles whose overlaps are all >= `min_overlap`, the slack spread round-robin over the overlaps in
-    // `ratio` steps, every overlap blended linearly over its whole width.
-    struct ImageTileAxis {
-        std::vector<int64_t> starts;
-        int64_t size = 0;
-        std::vector<int64_t> overlaps;
-    };
-
-    static ImageTileAxis split_image_tiles(int64_t length, int64_t tile, int64_t min_overlap, int64_t ratio) {
-        ImageTileAxis axis;
-        if (tile >= length) {
-            axis.starts = {0};
-            axis.size   = length;
-            return axis;
-        }
-        int64_t count = (length + tile - 1) / tile;
-        while (tile * count - min_overlap * (count - 1) - length < 0) {
-            ++count;
-        }
-        axis.overlaps.assign(static_cast<size_t>(count - 1), min_overlap);
-        int64_t remaining = tile * count - min_overlap * (count - 1) - length;
-        for (int64_t i = 0; i < remaining / ratio; ++i) {
-            axis.overlaps[static_cast<size_t>(i % (count - 1))] += ratio;
-        }
-        axis.starts = {0};
-        for (int64_t i = 0; i + 1 < count; ++i) {
-            axis.starts.push_back(axis.starts.back() + tile - axis.overlaps[static_cast<size_t>(i)]);
-        }
-        axis.size = tile;
-        return axis;
-    }
-
-    // tiles[i][j] are [W, H, C...] tensors (C... flattened into planes) of the tile at row i, column j.
-    static sd::Tensor<float> stitch_image_tiles(const std::vector<std::vector<sd::Tensor<float>>>& tiles,
-                                                const ImageTileAxis& rows,
-                                                const ImageTileAxis& cols,
-                                                int64_t out_w,
-                                                int64_t out_h) {
-        std::vector<int64_t> shape = tiles[0][0].shape();
-        shape[0]                   = out_w;
-        shape[1]                   = out_h;
-        sd::Tensor<float> output(shape);
-        const int64_t planes = tiles[0][0].numel() / (tiles[0][0].shape()[0] * tiles[0][0].shape()[1]);
-        int64_t y0           = 0;
-        for (size_t i = 0; i < tiles.size(); ++i) {
-            int64_t x0     = 0;
-            int64_t keep_h = 0;
-            for (size_t j = 0; j < tiles[i].size(); ++j) {
-                const auto& tile     = tiles[i][j];
-                const int64_t tw     = tile.shape()[0];
-                const int64_t th     = tile.shape()[1];
-                const int64_t ext_h  = i > 0 ? std::min({rows.overlaps[i - 1], tiles[i - 1][j].shape()[1], th}) : 0;
-                const int64_t ext_w  = j > 0 ? std::min({cols.overlaps[j - 1], tiles[i][j - 1].shape()[0], tw}) : 0;
-                const int64_t crop_h = i + 1 < tiles.size() ? th - rows.overlaps[i] : th;
-                const int64_t crop_w = j + 1 < tiles[i].size() ? tw - cols.overlaps[j] : tw;
-                keep_h               = crop_h;
-                for (int64_t p = 0; p < planes; ++p) {
-                    const float* cur = tile.data() + p * tw * th;
-                    auto vertical    = [&](int64_t x, int64_t y) {
-                        float value = cur[y * tw + x];
-                        if (y < ext_h) {
-                            const auto& above = tiles[i - 1][j];
-                            const int64_t aw  = above.shape()[0];
-                            const int64_t ah  = above.shape()[1];
-                            const float w     = static_cast<float>(y) / ext_h;
-                            value             = above.data()[p * aw * ah + (ah - ext_h + y) * aw + x] * (1.f - w) + value * w;
-                        }
-                        return value;
-                    };
-                    for (int64_t y = 0; y < crop_h; ++y) {
-                        float* dst = output.data() + p * out_w * out_h + (y0 + y) * out_w + x0;
-                        for (int64_t x = 0; x < crop_w; ++x) {
-                            float value = vertical(x, y);
-                            if (x < ext_w) {
-                                const auto& left = tiles[i][j - 1];
-                                const int64_t lw = left.shape()[0];
-                                const int64_t lh = left.shape()[1];
-                                const float w    = static_cast<float>(x) / ext_w;
-                                value            = left.data()[p * lw * lh + y * lw + (lw - ext_w + x)] * (1.f - w) + value * w;
-                            }
-                            dst[x] = value;
-                        }
-                    }
-                }
-                x0 += crop_w;
-            }
-            y0 += keep_h;
-        }
-        return output;
-    }
 
     struct MiniMaxH3VideoVAERunner : public VAE {
         MiniMaxH3VAEConfig config;
@@ -1060,7 +974,7 @@ namespace MiniMaxH3VAE {
 
         static sd_tiling_params_t resolve_original_tiling_params(sd_tiling_params_t params) {
             if (!params.enabled) {
-                params.target_overlap = 0.25f;
+                params.target_overlap = kH3DefaultTileOverlap;
             }
             if (params.tile_size_w == 0 && params.rel_size_w == 0.f) {
                 params.tile_size_w = 256;
@@ -1125,47 +1039,125 @@ namespace MiniMaxH3VAE {
             return config.vit_decoder_2d && enabled && !circular_x && !circular_y;
         }
 
-        // One graph per tile of the release layout (256-pixel tiles, >= 64-pixel overlaps), stitched as the release
-        // stitches them. `decode` tiles latents [W, H, 1, 24], `encode` pixels [W, H, 1, 3].
-        sd::Tensor<float> compute_release_image_tiles(int n_threads, const sd::Tensor<float>& input, bool decode_graph) {
-            constexpr int64_t tile_pixels = 256;
-            constexpr int64_t min_overlap = 64;
-            const int64_t ratio           = get_scale_factor();
-            const int64_t in_scale        = decode_graph ? ratio : 1;
-            const int64_t width           = input.shape()[0] * in_scale;
-            const int64_t height          = input.shape()[1] * in_scale;
-            auto rows                     = split_image_tiles(height, tile_pixels, min_overlap, ratio);
-            auto cols                     = split_image_tiles(width, tile_pixels, min_overlap, ratio);
+        // Pixel tile size of one axis for the reference tile layout (h3_vae_tiles.hpp), or 0 when the request
+        // (relative sizes, sizes off the latent grid) needs the generic tiler. An out-of-memory retry caps it.
+        int64_t reference_tile_pixels(const sd_tiling_params_t& tiling, bool width_axis) {
+            const int64_t ratio = get_scale_factor();
+            int64_t tile        = width_axis ? tiling.tile_size_w : tiling.tile_size_h;
+            const float rel     = width_axis ? tiling.rel_size_w : tiling.rel_size_h;
+            if (tile <= 0 || rel != 0.f || tile % ratio != 0) {
+                return 0;
+            }
+            const int retry = width_axis ? retry_tile_limit_w : retry_tile_limit_h;
+            if (retry > 0) {
+                tile = std::min<int64_t>(tile, std::max(4, retry) * ratio);
+            }
+            return tile < 4 * ratio ? 0 : tile;
+        }
+
+        // Minimum overlap of one axis. The overlap resolve_original_tiling_params gives a caller that did not
+        // enable tiling keeps the reference's 64-pixel rule (below a quarter of smaller tiles); any other
+        // target_overlap is the caller's fraction of the tile, at most half a tile, on the latent grid.
+        static int64_t reference_min_overlap(int64_t tile, int64_t ratio, float target_overlap) {
+            if (target_overlap == kH3DefaultTileOverlap) {
+                return std::max<int64_t>(ratio, std::min<int64_t>(64, tile / 4 / ratio * ratio));
+            }
+            const float fraction = std::max(0.0f, std::min(target_overlap, 0.5f));
+            const int64_t pixels = static_cast<int64_t>(std::lround(fraction * tile / ratio)) * ratio;
+            return std::max<int64_t>(ratio, std::min<int64_t>(pixels, tile / 2 / ratio * ratio));
+        }
+
+        bool reference_tile_layout(const sd_tiling_params_t& tiling,
+                                   int64_t width_px,
+                                   int64_t height_px,
+                                   bool circular_x,
+                                   bool circular_y,
+                                   H3VAETiles::Axis& rows,
+                                   H3VAETiles::Axis& cols) {
+            if (circular_x || circular_y || circular_x_enabled || circular_y_enabled) {
+                return false;
+            }
+            const int64_t ratio  = get_scale_factor();
+            const int64_t tile_w = reference_tile_pixels(tiling, true);
+            const int64_t tile_h = reference_tile_pixels(tiling, false);
+            if (tile_w == 0 || tile_h == 0) {
+                return false;
+            }
+            rows = H3VAETiles::split(height_px, tile_h, reference_min_overlap(tile_h, ratio, tiling.target_overlap), ratio);
+            cols = H3VAETiles::split(width_px, tile_w, reference_min_overlap(tile_w, ratio, tiling.target_overlap), ratio);
+            return true;
+        }
+
+        // The reference layout (rows, cols in pixel units) with one graph per tile, every tile blended against its
+        // raw neighbours: the reference's encode (latent overlaps = pixel overlaps / ratio). `last_frame` keeps the
+        // last frame of single-frame encodes.
+        sd::Tensor<float> compute_reference_tiles_raw(int n_threads,
+                                                      const sd::Tensor<float>& input,
+                                                      const H3VAETiles::Axis& rows,
+                                                      const H3VAETiles::Axis& cols,
+                                                      bool decode_graph,
+                                                      bool last_frame) {
+            const int64_t ratio    = get_scale_factor();
+            const int64_t in_scale = decode_graph ? ratio : 1;
+            const int64_t width    = input.shape()[0] * in_scale;
+            const int64_t height   = input.shape()[1] * in_scale;
             std::vector<std::vector<sd::Tensor<float>>> tiles(rows.starts.size());
             for (size_t i = 0; i < rows.starts.size(); ++i) {
                 for (size_t j = 0; j < cols.starts.size(); ++j) {
-                    auto piece = sd::ops::slice(input, 1, rows.starts[i] / in_scale, (rows.starts[i] + rows.size) / in_scale);
-                    piece      = sd::ops::slice(piece, 0, cols.starts[j] / in_scale, (cols.starts[j] + cols.size) / in_scale);
+                    // Ends past the input clamp to it, as tensor slicing does in the reference.
+                    auto piece = sd::ops::slice(input, 1, rows.starts[i] / in_scale,
+                                                std::min(height, rows.starts[i] + rows.size) / in_scale);
+                    piece      = sd::ops::slice(piece, 0, cols.starts[j] / in_scale,
+                                                std::min(width, cols.starts[j] + cols.size) / in_scale);
                     auto out   = _compute(n_threads, piece, decode_graph);
                     if (out.empty()) {
-                        LOG_ERROR("MiniMax-H3-Image VAE %s failed on tile %zu,%zu", decode_graph ? "decode" : "encode", i, j);
+                        LOG_ERROR("MiniMax-H3 VAE %s failed on tile %zu,%zu", decode_graph ? "decode" : "encode", i, j);
                         return {};
                     }
-                    if (!decode_graph && out.shape()[2] > 1) {
+                    if (last_frame && out.shape()[2] > 1) {
                         out = sd::ops::slice(out, 2, out.shape()[2] - 1, out.shape()[2]);
                     }
                     tiles[i].push_back(std::move(out));
                 }
             }
-            if (decode_graph) {
-                return stitch_image_tiles(tiles, rows, cols, width, height);
+            const int64_t out_scale    = decode_graph ? 1 : ratio;
+            std::vector<int64_t> shape = tiles[0][0].shape();
+            shape[0]                   = width / out_scale;
+            shape[1]                   = height / out_scale;
+            sd::Tensor<float> output(shape);
+            std::vector<std::vector<H3VAETiles::TileView>> views(tiles.size());
+            for (size_t i = 0; i < tiles.size(); ++i) {
+                for (const auto& tile : tiles[i]) {
+                    views[i].push_back({tile.data(), tile.shape()[0], tile.shape()[1]});
+                }
             }
-            auto scale_axis = [&](ImageTileAxis axis) {
-                for (auto& v : axis.starts) {
-                    v /= ratio;
+            const int64_t planes = tiles[0][0].numel() / (tiles[0][0].shape()[0] * tiles[0][0].shape()[1]);
+            H3VAETiles::stitch_raw(views, H3VAETiles::scale_down(rows, out_scale), H3VAETiles::scale_down(cols, out_scale),
+                                   planes, output.data(), shape[0], shape[1]);
+            return output;
+        }
+
+        sd::Tensor<float> compute_release_image_tiles(int n_threads, const sd::Tensor<float>& input, bool decode_graph) {
+            constexpr int64_t tile_pixels = 256;
+            constexpr int64_t min_overlap = 64;
+            const int64_t ratio           = get_scale_factor();
+            const int64_t in_scale        = decode_graph ? ratio : 1;
+            auto rows                     = H3VAETiles::split(input.shape()[1] * in_scale, tile_pixels, min_overlap, ratio);
+            auto cols                     = H3VAETiles::split(input.shape()[0] * in_scale, tile_pixels, min_overlap, ratio);
+            if (!decode_graph) {
+                return compute_reference_tiles_raw(n_threads, input, rows, cols, false, true);
+            }
+            // Decode blends against the already blended canvas and clamps after the blend, as the reference does.
+            defer_clamp_ = true;
+            struct DeferClampGuard {
+                bool& flag;
+                ~DeferClampGuard() {
+                    flag = false;
                 }
-                for (auto& v : axis.overlaps) {
-                    v /= ratio;
-                }
-                axis.size /= ratio;
-                return axis;
-            };
-            return stitch_image_tiles(tiles, scale_axis(rows), scale_axis(cols), width / ratio, height / ratio);
+            } defer_clamp_guard{defer_clamp_};
+            auto output = decode_reference_tiles(n_threads, ensure_video_shape(input), rows, cols, true);
+            clamp_unit(output);
+            return output;
         }
 
         sd::Tensor<float> encode(int n_threads,
@@ -1185,6 +1177,16 @@ namespace MiniMaxH3VAE {
             if (config.patch_size_t == 1 && input.shape()[2] != 1) {
                 LOG_ERROR("H3 image VAE encodes single-frame images only");
                 return {};
+            }
+            H3VAETiles::Axis rows, cols;
+            const bool reference_tiles = !config.vit_decoder_2d && reference_tile_layout(tiling, input.shape()[0], input.shape()[1], circular_x,
+                                                               circular_y, rows, cols);
+            if (input.shape()[2] == 1 && reference_tiles) {
+                int64_t t0  = ggml_time_ms();
+                auto result = compute_reference_tiles_raw(n_threads, input, rows, cols, false, true);
+                runner_end();
+                LOG_VERBOSE("computing vae encode graph completed, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
+                return result;
             }
             if (input.shape()[2] == 1) {
                 auto encoded = VAE::encode(n_threads, input, tiling, circular_x, circular_y);
@@ -1209,6 +1211,9 @@ namespace MiniMaxH3VAE {
                 SD_UNUSED(tile);
                 // keep the runner alive across chunks; ending it here would
                 // evict and reload the encoder weights every chunk
+                if (reference_tiles) {
+                    return compute_reference_tiles_raw(n_threads, chunk, rows, cols, false, false);
+                }
                 return VAE::encode(n_threads, chunk, tiling, circular_x, circular_y, false);
             });
             runner_end();
@@ -1301,14 +1306,18 @@ namespace MiniMaxH3VAE {
                 }
                 return result;
             }
+            // The reference blends the tiles (and chunks) of the raw decoder output and clamps after.
+            defer_clamp_ = true;
+            struct DeferClampGuard {
+                bool& flag;
+                ~DeferClampGuard() {
+                    flag = false;
+                }
+            } defer_clamp_guard{defer_clamp_};
             if (input.shape()[2] == 1) {
-                auto decoded = VAE::decode(n_threads,
-                                           input,
-                                           tiling,
-                                           decode_video,
-                                           circular_x,
-                                           circular_y,
-                                           silent);
+                auto decoded = decode_spatial_tiles(n_threads, input, tiling, circular_x, circular_y, silent);
+                runner_end();
+                clamp_unit(decoded);
                 if (!decoded.empty() && decoded.shape()[2] > 1) {
                     decoded = sd::ops::slice(decoded,
                                              2,
@@ -1376,6 +1385,7 @@ namespace MiniMaxH3VAE {
                     first   = sd::ops::concat(first, overlap, 2);
                     overlap = {};
                 }
+                clamp_unit(first);
                 return first;
             };
             const bool async_assembly = env_int("SD_H3_VAE_ASYNC_ASSEMBLY", 1) != 0;
@@ -1486,6 +1496,14 @@ namespace MiniMaxH3VAE {
 
         int tile_batch_                = 0;
         size_t per_tile_compute_bytes_ = 0;
+        bool defer_clamp_              = false;
+
+        static void clamp_unit(sd::Tensor<float>& tensor) {
+            float* data = tensor.data();
+            for (int64_t i = 0, n = tensor.numel(); i < n; ++i) {
+                data[i] = std::min(std::max(data[i], 0.f), 1.f);
+            }
+        }
 
         static int env_int(const char* name, int fallback) {
             const char* value = getenv(name);
@@ -1586,6 +1604,123 @@ namespace MiniMaxH3VAE {
             return output;
         }
 
+        // Decode with the reference layout (rows, cols in pixel units): latent tiles sliced at pixel / ratio, up to
+        // resolve_tile_batch() tiles per decoder graph, every pixel tile blended in row-major order against the
+        // already blended canvas (h3_vae_tiles.hpp). A batch is blended on a worker while the next one computes.
+        sd::Tensor<float> decode_reference_tiles(int n_threads,
+                                                 const sd::Tensor<float>& chunk,
+                                                 const H3VAETiles::Axis& rows,
+                                                 const H3VAETiles::Axis& cols,
+                                                 bool silent) {
+            const int64_t ratio = get_scale_factor();
+            const int64_t out_w = chunk.shape()[0] * ratio;
+            const int64_t out_h = chunk.shape()[1] * ratio;
+            std::vector<std::pair<size_t, size_t>> placements;
+            for (size_t i = 0; i < rows.starts.size(); ++i) {
+                for (size_t j = 0; j < cols.starts.size(); ++j) {
+                    placements.emplace_back(i, j);
+                }
+            }
+            const int num_tiles = static_cast<int>(placements.size());
+            if (!silent) {
+                LOG_VERBOSE("num tiles : %d, %d ", static_cast<int>(cols.starts.size()), static_cast<int>(rows.starts.size()));
+                LOG_VERBOSE("processing %i tiles", num_tiles);
+                pretty_progress(0, num_tiles, 0.0f);
+            }
+            sd::Tensor<float> output;
+            std::unique_ptr<H3VAETiles::CanvasStitcher> stitcher;
+            std::thread merger;
+            bool merge_failed = false;
+            struct MergerGuard {
+                std::thread& thread;
+                ~MergerGuard() {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+            } merger_guard{merger};
+            auto join_merger = [&]() {
+                if (merger.joinable()) {
+                    merger.join();
+                }
+            };
+            std::vector<sd::Tensor<float>> tiles;
+            int done = 0;
+            for (size_t first = 0; first < placements.size();) {
+                const int remaining = static_cast<int>(placements.size() - first);
+                const int count     = std::max(1, std::min(remaining, resolve_tile_batch()));
+                const size_t last   = first + static_cast<size_t>(count);
+                int64_t t1          = ggml_time_ms();
+                tiles.clear();
+                for (size_t k = first; k < last; ++k) {
+                    const auto [i, j] = placements[k];
+                    auto piece        = sd::ops::slice(chunk, 1, rows.starts[i] / ratio, (rows.starts[i] + rows.size) / ratio);
+                    tiles.push_back(sd::ops::slice(piece, 0, cols.starts[j] / ratio, (cols.starts[j] + cols.size) / ratio));
+                }
+                auto batch = compute_tile_batch(n_threads, tiles);
+                if (batch.data.empty()) {
+                    LOG_ERROR("vae decode compute failed while processing a tile");
+                    return {};
+                }
+                std::vector<int64_t> tile_shape = batch.data.shape();
+                GGML_ASSERT(tile_shape[batch.stack_dim] % count == 0);
+                tile_shape[batch.stack_dim] /= count;
+                GGML_ASSERT(tile_shape[0] == cols.size && tile_shape[1] == rows.size);
+                auto merge_batch = [&, first, last, tile_shape](const sd::Tensor<float>& data) {
+                    const int64_t tile_numel = data.numel() / static_cast<int64_t>(last - first);
+                    if (!stitcher) {
+                        std::vector<int64_t> shape = tile_shape;
+                        shape[0]                   = out_w;
+                        shape[1]                   = out_h;
+                        output                     = sd::Tensor<float>(std::move(shape));
+                        stitcher                   = std::make_unique<H3VAETiles::CanvasStitcher>(
+                            rows, cols, tile_numel / (tile_shape[0] * tile_shape[1]), output.data(), out_w, out_h);
+                    }
+                    for (size_t k = first; k < last; ++k) {
+                        stitcher->add(placements[k].first, placements[k].second,
+                                      {data.data() + static_cast<int64_t>(k - first) * tile_numel, tile_shape[0], tile_shape[1]});
+                    }
+                };
+                join_merger();
+                if (merge_failed) {
+                    return {};
+                }
+                bool merged_async = false;
+                if (last < placements.size() && env_int("SD_TILE_ASYNC_MERGE", 1) != 0) {
+                    auto data = std::make_shared<sd::Tensor<float>>(std::move(batch.data));
+                    try {
+                        merger = std::thread([&merge_failed, merge_batch, data]() {
+                            try {
+                                merge_batch(*data);
+                            } catch (const std::exception& error) {
+                                LOG_ERROR("tile merge failed: %s", error.what());
+                                merge_failed = true;
+                            }
+                        });
+                    } catch (const std::system_error&) {
+                        merge_batch(*data);  // no thread available: merge inline
+                    }
+                    merged_async = true;
+                }
+                if (!merged_async) {
+                    merge_batch(batch.data);
+                }
+                const float tile_time = (ggml_time_ms() - t1) / 1000.0f / static_cast<float>(count);
+                for (int k = 0; k < count; ++k) {
+                    ++done;
+                    if (!silent) {
+                        pretty_progress(done, num_tiles, tile_time);
+                    }
+                }
+                first = last;
+            }
+            join_merger();
+            if (merge_failed) {
+                return {};
+            }
+            return output;
+        }
+
         sd::Tensor<float> decode_spatial_tiles(int n_threads,
                                                const sd::Tensor<float>& chunk,
                                                const sd_tiling_params_t& tiling,
@@ -1593,6 +1728,11 @@ namespace MiniMaxH3VAE {
                                                bool circular_y,
                                                bool silent) {
             const int scale_factor = get_scale_factor();
+            H3VAETiles::Axis rows, cols;
+            if (reference_tile_layout(tiling, chunk.shape()[0] * scale_factor, chunk.shape()[1] * scale_factor,
+                                      circular_x, circular_y, rows, cols)) {
+                return decode_reference_tiles(n_threads, chunk, rows, cols, silent);
+            }
             float tile_overlap;
             int tile_size_w, tile_size_h;
             if (!get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling, chunk.shape()[0], chunk.shape()[1], circular_x, circular_y)) {
@@ -1756,7 +1896,7 @@ namespace MiniMaxH3VAE {
                         sol_inputs[0].row_ids = row_ids;
                         sol_inputs[1].row_ids = row_ids;
                     }
-                    out = model.decode(&runner_ctx, value, pe, shifted_pe, sol_inputs, mean, std, ropea, ropeb);
+                    out = model.decode(&runner_ctx, value, pe, shifted_pe, sol_inputs, mean, std, ropea, ropeb, !defer_clamp_);
                 } else {
                     out = model.encode(&runner_ctx, value, mean, std);
                 }

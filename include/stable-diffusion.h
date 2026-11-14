@@ -329,6 +329,8 @@ typedef struct {
     int custom_sigmas_count;
     float flow_shift;
     const char* extra_sample_args;
+    // MiniMax-H3 video audio schedule shift; INFINITY keeps the model default (3).
+    float audio_flow_shift;
 } sd_sample_params_t;
 
 typedef struct {
