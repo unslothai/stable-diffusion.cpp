@@ -1135,7 +1135,20 @@ namespace MiniMaxH3VAE {
             const int64_t in_scale        = decode_graph ? ratio : 1;
             auto rows                     = H3VAETiles::split(input.shape()[1] * in_scale, tile_pixels, min_overlap, ratio);
             auto cols                     = H3VAETiles::split(input.shape()[0] * in_scale, tile_pixels, min_overlap, ratio);
-            return compute_reference_tiles_raw(n_threads, input, rows, cols, decode_graph, !decode_graph);
+            if (!decode_graph) {
+                return compute_reference_tiles_raw(n_threads, input, rows, cols, false, true);
+            }
+            // Decode blends against the already blended canvas and clamps after the blend, as the reference does.
+            defer_clamp_ = true;
+            struct DeferClampGuard {
+                bool& flag;
+                ~DeferClampGuard() {
+                    flag = false;
+                }
+            } defer_clamp_guard{defer_clamp_};
+            auto output = decode_reference_tiles(n_threads, ensure_video_shape(input), rows, cols, true);
+            clamp_unit(output);
+            return output;
         }
 
         sd::Tensor<float> encode(int n_threads,
