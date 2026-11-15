@@ -131,7 +131,10 @@ them the build uses the stock ggml kernels and the unfused DiT graph.
 
 ## First/last-frame conditioning
 
-Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
+Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA.
+As in the reference workflows, the first frame is stretched to the canvas and
+the last frame is scaled to cover it and centre-cropped, both with Lanczos on
+8-bit values. `--image-preprocess` rules, when given, replace this geometry.
 
 ```sh
 .\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\minimax_h3_fl2va-Q4_K_M.gguf --vae ..\models\vae\minimax_h3_video_vae_fp16.safetensors --audio-vae ..\models\vae\minimax_h3_audio_vae_fp32.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "a lovely cat" -i ..\assets\ernie_image\turbo_example.png --cfg-scale 1.0 -v -W 864 -H 480 --offload-to-cpu --rng cpu --fps 24 --video-frames 56

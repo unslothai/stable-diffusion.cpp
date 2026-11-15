@@ -352,6 +352,13 @@ namespace sd::pipeline {
                                                               image_channels));
         }
 
+        if (sd->version == VERSION_MINIMAX_H3_IMAGE && !ref_images.empty()) {
+            // The reference edit template scales the picture to edit to 4 MP (area filter) and covers the nearest
+            // multiple of 32 on each side before the model sees it; the output takes that size unless one is set.
+            ref_images[0] = sd::scale_total_pixels_to_multiple(ref_images[0], 4.0, 32);
+            LOG_INFO("MiniMax-H3-Image picture 1 scaled to %" PRId64 "x%" PRId64, ref_images[0].shape()[0], ref_images[0].shape()[1]);
+        }
+
         if (ref_images.empty() && sd_version_is_unet_edit(sd->version)) {
             LOG_WARN("This model needs at least one reference image; using an empty reference");
             ref_images.push_back(sd::zeros<float>({request->width, request->height, image_channels, 1}));

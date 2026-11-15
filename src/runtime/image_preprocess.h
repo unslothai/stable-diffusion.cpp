@@ -19,6 +19,15 @@ namespace sd {
     // Aspect-preserving size that puts the short edge inside [min_edge, max_edge], each side rounded (halves to even)
     // to a multiple of `multiple`, at least one multiple.
     std::pair<int, int> fit_short_edge_size(int width, int height, int min_edge, int max_edge, int multiple);
+    // torch's "area" interpolation (adaptive average pooling): each output value is the float sum of its input box,
+    // row by row, divided by the box height and then by its width.
+    Tensor<float> resize_area(const Tensor<float>& image, int width, int height);
+    // Scale to `megapixels` (units of 2^20 pixels) with the area filter, then cover the nearest smaller multiple of
+    // `multiple` on each side and crop the centre. The size alone, then the picture.
+    std::pair<int, int> scale_total_pixels_to_multiple_size(int width, int height, double megapixels, int multiple);
+    Tensor<float> scale_total_pixels_to_multiple(const Tensor<float>& image, double megapixels, int multiple);
+    // The centred window with the aspect ratio of width x height (no resize).
+    Tensor<float> center_crop_to_aspect(const Tensor<float>& image, int width, int height);
 
     enum class ImageTarget {
         Init,

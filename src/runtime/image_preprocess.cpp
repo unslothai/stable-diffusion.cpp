@@ -196,6 +196,125 @@ namespace sd {
         return {fit(width), fit(height)};
     }
 
+    Tensor<float> resize_area(const Tensor<float>& image, int width, int height) {
+        GGML_ASSERT(image.dim() >= 2 && width > 0 && height > 0);
+        const int64_t in_width  = image.shape()[0];
+        const int64_t in_height = image.shape()[1];
+        const int64_t planes    = image.numel() / (in_width * in_height);
+        auto shape              = image.shape();
+        shape[0]                = width;
+        shape[1]                = height;
+        Tensor<float> output(shape);
+        if (width == in_width && height == in_height) {
+            std::copy_n(image.data(), image.numel(), output.data());
+            return output;
+        }
+        // start = floor(i * in / out), end = ceil((i + 1) * in / out), as adaptive average pooling does.
+        auto box = [](int64_t index, int64_t in, int64_t out) {
+            return std::pair<int64_t, int64_t>{index * in / out, ((index + 1) * in + out - 1) / out};
+        };
+        parallel_for(0, planes * height, std::max<int64_t>(1, 4096 / width), [&](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const int64_t plane = row / height;
+                const int64_t y     = row % height;
+                const float* src    = image.data() + plane * in_width * in_height;
+                float* dst          = output.data() + row * width;
+                const auto [y0, y1] = box(y, in_height, height);
+                for (int64_t x = 0; x < width; ++x) {
+                    const auto [x0, x1] = box(x, in_width, width);
+                    float sum           = 0.f;
+                    for (int64_t iy = y0; iy < y1; ++iy) {
+                        for (int64_t ix = x0; ix < x1; ++ix) {
+                            sum += src[iy * in_width + ix];
+                        }
+                    }
+                    dst[x] = sum / static_cast<float>(y1 - y0) / static_cast<float>(x1 - x0);
+                }
+            }
+        });
+        return output;
+    }
+
+    // The total-pixel scale (halves of the rounded sides to even), then the cover size and the cropped multiple.
+    struct TotalPixelsPlan {
+        int scaled_width  = 0;
+        int scaled_height = 0;
+        int cover_width   = 0;
+        int cover_height  = 0;
+        int width         = 0;
+        int height        = 0;
+    };
+
+    static TotalPixelsPlan plan_total_pixels_to_multiple(int width, int height, double megapixels, int multiple) {
+        TotalPixelsPlan plan;
+        const double total = static_cast<double>(static_cast<int64_t>(megapixels * 1024 * 1024));
+        const double scale = std::sqrt(total / (static_cast<double>(width) * height));
+        plan.scaled_width  = static_cast<int>(std::nearbyint(width * scale));
+        plan.scaled_height = static_cast<int>(std::nearbyint(height * scale));
+        plan.width         = plan.scaled_width / multiple * multiple;
+        plan.height        = plan.scaled_height / multiple * multiple;
+        plan.cover_width   = plan.scaled_width;
+        plan.cover_height  = plan.scaled_height;
+        if (multiple <= 1 || plan.width == 0 || plan.height == 0) {
+            plan.width  = plan.scaled_width;
+            plan.height = plan.scaled_height;
+            return plan;
+        }
+        if (plan.width == plan.scaled_width && plan.height == plan.scaled_height) {
+            return plan;
+        }
+        const double scale_w = static_cast<double>(plan.width) / plan.scaled_width;
+        const double scale_h = static_cast<double>(plan.height) / plan.scaled_height;
+        if (scale_w >= scale_h) {
+            plan.cover_width  = plan.width;
+            plan.cover_height = std::max(plan.height, static_cast<int>(std::ceil(plan.scaled_height * scale_w)));
+        } else {
+            plan.cover_height = plan.height;
+            plan.cover_width  = std::max(plan.width, static_cast<int>(std::ceil(plan.scaled_width * scale_h)));
+        }
+        return plan;
+    }
+
+    std::pair<int, int> scale_total_pixels_to_multiple_size(int width, int height, double megapixels, int multiple) {
+        const auto plan = plan_total_pixels_to_multiple(width, height, megapixels, multiple);
+        return {plan.width, plan.height};
+    }
+
+    Tensor<float> scale_total_pixels_to_multiple(const Tensor<float>& image, double megapixels, int multiple) {
+        const auto plan = plan_total_pixels_to_multiple(static_cast<int>(image.shape()[0]),
+                                                        static_cast<int>(image.shape()[1]),
+                                                        megapixels,
+                                                        multiple);
+        auto scaled     = resize_area(image, plan.scaled_width, plan.scaled_height);
+        if (plan.cover_width == plan.width && plan.cover_height == plan.height && plan.width == plan.scaled_width &&
+            plan.height == plan.scaled_height) {
+            return scaled;
+        }
+        auto cover      = resize_area(scaled, plan.cover_width, plan.cover_height);
+        const int64_t x = (plan.cover_width - plan.width) / 2;
+        const int64_t y = (plan.cover_height - plan.height) / 2;
+        return ops::slice(ops::slice(cover, 0, x, x + plan.width), 1, y, y + plan.height);
+    }
+
+    Tensor<float> center_crop_to_aspect(const Tensor<float>& image, int width, int height) {
+        const int64_t old_width  = image.shape()[0];
+        const int64_t old_height = image.shape()[1];
+        const double old_aspect  = static_cast<double>(old_width) / old_height;
+        const double new_aspect  = static_cast<double>(width) / height;
+        int64_t x                = 0;
+        int64_t y                = 0;
+        // Halves round to even, as the reference's round() does.
+        if (old_aspect > new_aspect) {
+            x = static_cast<int64_t>(std::nearbyint((old_width - old_width * (new_aspect / old_aspect)) / 2));
+        } else if (old_aspect < new_aspect) {
+            y = static_cast<int64_t>(std::nearbyint((old_height - old_height * (old_aspect / new_aspect)) / 2));
+        }
+        if (x == 0 && y == 0) {
+            return image;
+        }
+        return ops::slice(ops::slice(image, 0, x, old_width - x), 1, y, old_height - y);
+    }
+
     static constexpr std::pair<const char*, ImageTarget> image_targets[] = {
         {"init", ImageTarget::Init},
         {"end", ImageTarget::End},
