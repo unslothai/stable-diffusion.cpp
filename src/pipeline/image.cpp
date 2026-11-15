@@ -175,18 +175,20 @@ namespace sd::pipeline {
     }
 
     // MiniMax-H3-Image sizes a reference once per consumer, as the reference does: an aspect-preserving scale that puts
-    // the short edge inside [min_edge, max_edge], both sides on the 32 px grid. A picture already at that size is used
-    // as it is; any other is resized with Pillow's 8-bit Lanczos.
-    static sd::Tensor<float> fit_h3_image_short_edge(const sd::Tensor<float>& image, int min_edge, int max_edge) {
+    // the short edge inside [min_edge, max_edge], both sides on the 32 px grid. Returns false (and leaves `resized`
+    // alone) when the picture is already at that size and is used as it is; else resizes it with Pillow's 8-bit
+    // Lanczos into `resized`.
+    static bool fit_h3_image_short_edge(const sd::Tensor<float>& image, int min_edge, int max_edge, sd::Tensor<float>* resized) {
         const auto [width, height] = sd::fit_short_edge_size(static_cast<int>(image.shape()[0]),
                                                              static_cast<int>(image.shape()[1]),
                                                              min_edge,
                                                              max_edge,
                                                              32);
         if (width == image.shape()[0] && height == image.shape()[1]) {
-            return image;
+            return false;
         }
-        return sd::resize_lanczos_8bit(image, width, height);
+        *resized = sd::resize_lanczos_8bit(image, width, height);
+        return true;
     }
 
     static std::optional<ImageGenerationLatents> prepare_image_generation_latents(StableDiffusionGGML* sd,
@@ -374,7 +376,9 @@ namespace sd::pipeline {
             if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
                 // The VAE sees the reference with its short edge fitted into 1024-2048 on the 32 px grid, so the
                 // latent always covers whole 2x2 patches.
-                ref_latent = sd->encode_first_stage(fit_h3_image_short_edge(ref_images[i], 1024, 2048));
+                sd::Tensor<float> resized;
+                const bool scaled = fit_h3_image_short_edge(ref_images[i], 1024, 2048, &resized);
+                ref_latent        = sd->encode_first_stage(scaled ? resized : ref_images[i]);
                 if (!ref_latent.empty()) {
                     const int64_t width    = ref_latent.shape()[0];
                     const int64_t height   = ref_latent.shape()[1];
@@ -527,7 +531,12 @@ namespace sd::pipeline {
                 latents.minimax_reference_blocks.push_back({MiniMaxH3ReferenceKind::IMAGE, static_cast<int32_t>(i), -1});
             }
             for (auto& image : ref_images) {
-                image = sd->version == VERSION_P_H3_IMAGE ? resize_ph3_reference(image, 1000000) : fit_h3_image_short_edge(image, 1024, 1024);
+                sd::Tensor<float> resized;
+                if (sd->version == VERSION_P_H3_IMAGE) {
+                    image = resize_ph3_reference(image, 1000000);
+                } else if (fit_h3_image_short_edge(image, 1024, 1024, &resized)) {
+                    image = std::move(resized);
+                }
             }
         }
         latents.init_latent              = std::move(init_latent);

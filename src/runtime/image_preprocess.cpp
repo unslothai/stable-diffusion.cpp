@@ -1,4 +1,5 @@
 #include "image_preprocess.h"
+#include "core/parallel.h"
 #include "core/util.h"
 
 #include <algorithm>
@@ -117,53 +118,71 @@ namespace sd {
         const bool vertical   = height != in_height;
         const auto x_axis     = pillow_lanczos_coeffs(in_width, width);
         const auto y_axis     = pillow_lanczos_coeffs(in_height, height);
-        const int temp_width  = horizontal ? width : in_width;
+        const int mid_width   = horizontal ? width : in_width;
         const int32_t half    = 1 << (pillow_precision_bits - 1);
-        for (int64_t plane = 0; plane < planes; ++plane) {
-            const float* src = image.data() + plane * in_width * in_height;
-            std::vector<uint8_t> pixels(static_cast<size_t>(in_width) * in_height);
-            for (size_t i = 0; i < pixels.size(); ++i) {
-                // float32 scaling and truncation, as numpy's (255. * x).clip(0, 255).astype(uint8).
-                const float value = 255.f * src[i];
-                pixels[i]         = static_cast<uint8_t>(std::clamp(value, 0.f, 255.f));
+        // One 8-bit plane at a time: the horizontal pass (each input row quantized into a per-thread row first), or
+        // the quantized input when only the height changes. The vertical pass writes the float output directly.
+        std::vector<uint8_t> middle(static_cast<size_t>(mid_width) * in_height);
+        // float32 scaling and truncation, as numpy's (255. * x).clip(0, 255).astype(uint8).
+        auto quantize = [](const float* in, uint8_t* out, int64_t count) {
+            for (int64_t i = 0; i < count; ++i) {
+                out[i] = static_cast<uint8_t>(std::clamp(255.f * in[i], 0.f, 255.f));
             }
-            std::vector<uint8_t> temp = pixels;
-            if (horizontal) {
-                temp.assign(static_cast<size_t>(width) * in_height, 0);
-                for (int y = 0; y < in_height; ++y) {
-                    const uint8_t* row = pixels.data() + static_cast<size_t>(y) * in_width;
+        };
+        const int out_rows = vertical ? height : in_height;
+        for (int64_t plane = 0; plane < planes; ++plane) {
+            const float* src_plane = image.data() + plane * in_width * in_height;
+            float* dst_plane       = output.data() + plane * mid_width * out_rows;
+            parallel_for(0, in_height, std::max<int64_t>(1, 4096 / in_width), [&](int64_t begin, int64_t end) {
+                std::vector<uint8_t> row_pixels(horizontal ? static_cast<size_t>(in_width) : 0);
+                for (int64_t row = begin; row < end; ++row) {
+                    const float* src = src_plane + row * in_width;
+                    uint8_t* out     = middle.data() + row * mid_width;
+                    if (!horizontal) {
+                        quantize(src, out, in_width);
+                        continue;
+                    }
+                    quantize(src, row_pixels.data(), in_width);
                     for (int xx = 0; xx < width; ++xx) {
                         const int xmin   = x_axis.bounds[static_cast<size_t>(xx) * 2];
                         const int xmax   = x_axis.bounds[static_cast<size_t>(xx) * 2 + 1];
                         const int32_t* k = x_axis.coeffs.data() + static_cast<size_t>(xx) * x_axis.ksize;
                         int32_t sum      = half;
                         for (int x = 0; x < xmax; ++x) {
-                            sum += row[xmin + x] * k[x];
+                            sum += row_pixels[xmin + x] * k[x];
                         }
-                        temp[static_cast<size_t>(y) * width + xx] = pillow_clip8(sum);
+                        out[xx] = pillow_clip8(sum);
                     }
                 }
-            }
-            std::vector<uint8_t> result = temp;
-            if (vertical) {
-                result.assign(static_cast<size_t>(temp_width) * height, 0);
-                for (int yy = 0; yy < height; ++yy) {
+            });
+            parallel_for(0, out_rows, std::max<int64_t>(1, 4096 / mid_width), [&](int64_t begin, int64_t end) {
+                std::vector<int32_t> sums(static_cast<size_t>(mid_width));
+                for (int64_t yy = begin; yy < end; ++yy) {
+                    float* dst = dst_plane + yy * mid_width;
+                    if (!vertical) {
+                        const uint8_t* line = middle.data() + yy * mid_width;
+                        for (int xx = 0; xx < mid_width; ++xx) {
+                            dst[xx] = static_cast<float>(line[xx]) / 255.f;
+                        }
+                        continue;
+                    }
                     const int ymin   = y_axis.bounds[static_cast<size_t>(yy) * 2];
                     const int ymax   = y_axis.bounds[static_cast<size_t>(yy) * 2 + 1];
                     const int32_t* k = y_axis.coeffs.data() + static_cast<size_t>(yy) * y_axis.ksize;
-                    for (int xx = 0; xx < temp_width; ++xx) {
-                        int32_t sum = half;
-                        for (int y = 0; y < ymax; ++y) {
-                            sum += temp[static_cast<size_t>(ymin + y) * temp_width + xx] * k[y];
+                    std::fill(sums.begin(), sums.end(), half);
+                    // Tap-major, so the inner loop runs along a contiguous row (vectorizes).
+                    for (int y = 0; y < ymax; ++y) {
+                        const uint8_t* line = middle.data() + static_cast<size_t>(ymin + y) * mid_width;
+                        const int32_t tap   = k[y];
+                        for (int xx = 0; xx < mid_width; ++xx) {
+                            sums[xx] += line[xx] * tap;
                         }
-                        result[static_cast<size_t>(yy) * temp_width + xx] = pillow_clip8(sum);
+                    }
+                    for (int xx = 0; xx < mid_width; ++xx) {
+                        dst[xx] = static_cast<float>(pillow_clip8(sums[xx])) / 255.f;
                     }
                 }
-            }
-            float* dst = output.data() + plane * static_cast<int64_t>(width) * height;
-            for (size_t i = 0; i < result.size(); ++i) {
-                dst[i] = static_cast<float>(result[i]) / 255.f;
-            }
+            });
         }
         return output;
     }
