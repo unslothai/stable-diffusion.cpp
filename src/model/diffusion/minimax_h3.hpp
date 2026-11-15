@@ -1649,10 +1649,13 @@ namespace MiniMaxH3 {
                 audio_condition_inputs.push_back(make_input(condition));
             }
 
+            // The image model (no audio stream) takes t = 1 - timestep / 1000 in double and rounds it once.
+            const bool image_model = config.audio_latent_channels == 0;
+
             float sigma_v     = std::clamp(timestep[0] / 1000.f, 1e-6f, 1.f);
             float sigma_a     = time_shift_sigma(sigma_v, video_shift, audio_shift);
             float audio_scale = video_shift / audio_shift;
-            float t_v         = 1.f - sigma_v;
+            float t_v         = image_model ? static_cast<float>(1.0 - static_cast<double>(timestep[0]) / 1000.0) : 1.f - sigma_v;
             float t_a         = 1.f - sigma_a;
             float r_v         = t_v;
             float r_a         = t_a;

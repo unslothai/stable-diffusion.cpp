@@ -34,32 +34,33 @@ VAE are incompatible. No audio VAE or P-H3 text connector is needed.
 ## Text-to-image
 
 ```sh
-.\bin\Release\sd-cli.exe --diffusion-model ..\models\diffusion_models\minimax_h3_image_pruned_bf16.safetensors --vae ..\models\vae\minimax_h3_image_vae_fp16.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "A silver tabby kitten holding a sign reading 'sd.cpp', natural daylight" --cfg-scale 1.0 --steps 6 --sampling-method euler --sigmas minimax-h3-image -v -W 1024 -H 1024 --offload-to-cpu --rng cpu --diffusion-fa --vae-tiling
+.\bin\Release\sd-cli.exe --diffusion-model ..\models\diffusion_models\minimax_h3_image_pruned_bf16.safetensors --vae ..\models\vae\minimax_h3_image_vae_fp16.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "A silver tabby kitten holding a sign reading 'sd.cpp', natural daylight" --cfg-scale 1.0 --steps 6 --sampling-method euler -v -W 1024 -H 1024 --offload-to-cpu --rng cpu --diffusion-fa --vae-tiling
 ```
 
-Use Euler, CFG 1, and `--sigmas minimax-h3-image` for the model's six-step
-schedule. The default discrete scheduler also produces this schedule with
-`--steps 6`. Prompt expansion is not included.
+Use Euler, CFG 1 and 6 steps. The default scheduler is `simple`, as in the
+reference workflows: at 6 steps it lands within 9e-4 of the model's PDD sigma
+grid. `--scheduler discrete` or `--sigmas minimax-h3-image` samples on the exact
+grid instead. Prompt expansion is not included.
 
 ## Reference-image editing
 
 Add `--ref-image` (or `-r`) for reference-image editing:
 
 ```sh
-.\bin\Release\sd-cli.exe --diffusion-model ..\models\diffusion_models\minimax_h3_image_pruned_bf16.safetensors --vae ..\models\vae\minimax_h3_image_vae_fp16.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "Edit <Picture 1>. Put a red scarf on the cat, preserving its face and the background." -r ..\assets\ernie_image\turbo_example.png --cfg-scale 1.0 --steps 6 --sampling-method euler --sigmas minimax-h3-image -v -W 1024 -H 1024 --offload-to-cpu --rng cpu --diffusion-fa --vae-tiling
+.\bin\Release\sd-cli.exe --diffusion-model ..\models\diffusion_models\minimax_h3_image_pruned_bf16.safetensors --vae ..\models\vae\minimax_h3_image_vae_fp16.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "Edit <Picture 1>. Put a red scarf on the cat, preserving its face and the background." -r ..\assets\ernie_image\turbo_example.png --cfg-scale 1.0 --steps 6 --sampling-method euler -v -W 1024 -H 1024 --offload-to-cpu --rng cpu --diffusion-fa --vae-tiling
 ```
 
 `--ref-image` can be repeated. Reference images are numbered in argument order
 as `<Picture 1>`, `<Picture 2>`, and so on, with up to 16 references supported
 by the model. Prompts are passed through without an automatic editing prefix.
 
-Reference images keep their aspect ratio. As in the release, each consumer
-sizes a reference on its own: the VAE keeps the original pixels while the short
-edge is between 1024 and 2048 pixels (otherwise a Lanczos resize puts it on the
-nearer bound, both sides rounded to 32), then crops at the top left to whole
-16-pixel VAE cells and the latent to whole 2x2 patches; the text encoder sees
-the reference with a 1024-pixel short edge. The reference latent is the VAE
-posterior sample rounded to float16, noised to t = 0.999.
+Reference images keep their aspect ratio. As in the reference workflows, each
+consumer sizes a reference on its own: the VAE sees it with the short edge
+scaled into 1024-2048 pixels and the text encoder with a 1024-pixel short edge,
+both sides rounded to multiples of 32 in each case. A reference already at that
+size is used as it is; any other is resized with Lanczos on 8-bit values. Nothing
+is cropped. The reference latent is the VAE posterior sample (seed 42) in
+float32, noised to t = 0.999.
 
 ## Shape and runtime notes
 

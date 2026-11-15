@@ -1416,7 +1416,20 @@ struct MiniMaxH3ImageDenoiser : public DiscreteFlowDenoiser {
     float sigma_min() override { return 0.f; }
     float sigma_max() override { return 1.f; }
 
+    // The reference's model sigmas: timestep t + 1 of 1000 read linearly off the ascending PDD grid, in float32 with
+    // torch.lerp's fused two-sided form. The stock schedulers (simple at 6 steps) land next to the grid points.
     float t_to_sigma(float t) override {
+        const float timestep = static_cast<float>(t + 1.f) / 1000.f * 1000.f;
+        const float position = std::clamp(timestep / 1000.f, 0.f, 1.f) * 6.f;
+        const int index      = std::min(static_cast<int>(std::floor(position)), 5);
+        const float weight   = position - static_cast<float>(index);
+        const float start    = pdd_sigmas[6 - index];
+        const float end      = pdd_sigmas[5 - index];
+        return std::abs(weight) < 0.5f ? std::fma(weight, end - start, start) : std::fma(weight - 1.f, end - start, end);
+    }
+
+    // The exact PDD grid at n steps (`--scheduler discrete`).
+    float discrete_t_to_sigma(float t) const {
         const float position = (1.f - std::clamp(t / (TIMESTEPS - 1.f), 0.f, 1.f)) * 6.f;
         const size_t index   = std::min<size_t>(static_cast<size_t>(position), 5);
         const auto& grid     = pdd_sigmas;
@@ -1433,7 +1446,7 @@ struct MiniMaxH3ImageDenoiser : public DiscreteFlowDenoiser {
         std::vector<float> sigmas;
         sigmas.reserve(n + 1);
         for (uint32_t i = 0; i <= n; ++i) {
-            sigmas.push_back(t_to_sigma((1.f - static_cast<float>(i) / n) * (TIMESTEPS - 1.f)));
+            sigmas.push_back(discrete_t_to_sigma((1.f - static_cast<float>(i) / n) * (TIMESTEPS - 1.f)));
         }
         return sigmas;
     }
