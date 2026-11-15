@@ -105,11 +105,16 @@ namespace sd {
         return static_cast<uint8_t>(std::clamp(value >> pillow_precision_bits, 0, 255));
     }
 
-    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height) {
+    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height, CropWindow crop) {
         GGML_ASSERT(image.dim() >= 2 && width > 0 && height > 0);
-        const int in_width   = static_cast<int>(image.shape()[0]);
-        const int in_height  = static_cast<int>(image.shape()[1]);
-        const int64_t planes = image.numel() / (static_cast<int64_t>(in_width) * in_height);
+        const int64_t stride      = image.shape()[0];
+        const int64_t plane_size  = stride * image.shape()[1];
+        const bool whole          = crop.width <= 0 || crop.height <= 0;
+        const int in_width        = whole ? static_cast<int>(image.shape()[0]) : crop.width;
+        const int in_height       = whole ? static_cast<int>(image.shape()[1]) : crop.height;
+        const int64_t crop_offset = whole ? 0 : static_cast<int64_t>(crop.y) * stride + crop.x;
+        GGML_ASSERT(whole || (crop.x >= 0 && crop.y >= 0 && crop.x + crop.width <= stride && crop.y + crop.height <= image.shape()[1]));
+        const int64_t planes = image.numel() / plane_size;
         auto shape           = image.shape();
         shape[0]             = width;
         shape[1]             = height;
@@ -131,12 +136,12 @@ namespace sd {
         };
         const int out_rows = vertical ? height : in_height;
         for (int64_t plane = 0; plane < planes; ++plane) {
-            const float* src_plane = image.data() + plane * in_width * in_height;
+            const float* src_plane = image.data() + plane * plane_size + crop_offset;
             float* dst_plane       = output.data() + plane * mid_width * out_rows;
             parallel_for(0, in_height, std::max<int64_t>(1, 4096 / in_width), [&](int64_t begin, int64_t end) {
                 std::vector<uint8_t> row_pixels(horizontal ? static_cast<size_t>(in_width) : 0);
                 for (int64_t row = begin; row < end; ++row) {
-                    const float* src = src_plane + row * in_width;
+                    const float* src = src_plane + row * stride;
                     uint8_t* out     = middle.data() + row * mid_width;
                     if (!horizontal) {
                         quantize(src, out, in_width);
@@ -196,7 +201,14 @@ namespace sd {
         return {fit(width), fit(height)};
     }
 
-    Tensor<float> resize_area(const Tensor<float>& image, int width, int height) {
+    // The area resize to full_width x full_height, computing only the window at (x0, y0) of width x height.
+    static Tensor<float> resize_area_window(const Tensor<float>& image,
+                                            int64_t full_width,
+                                            int64_t full_height,
+                                            int64_t x0,
+                                            int64_t y0,
+                                            int64_t width,
+                                            int64_t height) {
         GGML_ASSERT(image.dim() >= 2 && width > 0 && height > 0);
         const int64_t in_width  = image.shape()[0];
         const int64_t in_height = image.shape()[1];
@@ -205,7 +217,7 @@ namespace sd {
         shape[0]                = width;
         shape[1]                = height;
         Tensor<float> output(shape);
-        if (width == in_width && height == in_height) {
+        if (full_width == in_width && full_height == in_height && x0 == 0 && y0 == 0 && width == in_width && height == in_height) {
             std::copy_n(image.data(), image.numel(), output.data());
             return output;
         }
@@ -213,26 +225,33 @@ namespace sd {
         auto box = [](int64_t index, int64_t in, int64_t out) {
             return std::pair<int64_t, int64_t>{index * in / out, ((index + 1) * in + out - 1) / out};
         };
+        std::vector<std::pair<int64_t, int64_t>> x_boxes(static_cast<size_t>(width));
+        for (int64_t x = 0; x < width; ++x) {
+            x_boxes[static_cast<size_t>(x)] = box(x0 + x, in_width, full_width);
+        }
         parallel_for(0, planes * height, std::max<int64_t>(1, 4096 / width), [&](int64_t begin, int64_t end) {
             for (int64_t row = begin; row < end; ++row) {
                 const int64_t plane = row / height;
-                const int64_t y     = row % height;
                 const float* src    = image.data() + plane * in_width * in_height;
                 float* dst          = output.data() + row * width;
-                const auto [y0, y1] = box(y, in_height, height);
+                const auto [ys, ye] = box(y0 + row % height, in_height, full_height);
                 for (int64_t x = 0; x < width; ++x) {
-                    const auto [x0, x1] = box(x, in_width, width);
+                    const auto [xs, xe] = x_boxes[static_cast<size_t>(x)];
                     float sum           = 0.f;
-                    for (int64_t iy = y0; iy < y1; ++iy) {
-                        for (int64_t ix = x0; ix < x1; ++ix) {
+                    for (int64_t iy = ys; iy < ye; ++iy) {
+                        for (int64_t ix = xs; ix < xe; ++ix) {
                             sum += src[iy * in_width + ix];
                         }
                     }
-                    dst[x] = sum / static_cast<float>(y1 - y0) / static_cast<float>(x1 - x0);
+                    dst[x] = sum / static_cast<float>(ye - ys) / static_cast<float>(xe - xs);
                 }
             }
         });
         return output;
+    }
+
+    Tensor<float> resize_area(const Tensor<float>& image, int width, int height) {
+        return resize_area_window(image, width, height, 0, 0, width, height);
     }
 
     // The total-pixel scale (halves of the rounded sides to even), then the cover size and the cropped multiple.
@@ -290,29 +309,28 @@ namespace sd {
             plan.height == plan.scaled_height) {
             return scaled;
         }
-        auto cover      = resize_area(scaled, plan.cover_width, plan.cover_height);
-        const int64_t x = (plan.cover_width - plan.width) / 2;
-        const int64_t y = (plan.cover_height - plan.height) / 2;
-        return ops::slice(ops::slice(cover, 0, x, x + plan.width), 1, y, y + plan.height);
+        // The cover resize computes only the centred crop.
+        return resize_area_window(scaled,
+                                  plan.cover_width,
+                                  plan.cover_height,
+                                  (plan.cover_width - plan.width) / 2,
+                                  (plan.cover_height - plan.height) / 2,
+                                  plan.width,
+                                  plan.height);
     }
 
-    Tensor<float> center_crop_to_aspect(const Tensor<float>& image, int width, int height) {
-        const int64_t old_width  = image.shape()[0];
-        const int64_t old_height = image.shape()[1];
-        const double old_aspect  = static_cast<double>(old_width) / old_height;
-        const double new_aspect  = static_cast<double>(width) / height;
-        int64_t x                = 0;
-        int64_t y                = 0;
+    CropWindow center_crop_window(int image_width, int image_height, int width, int height) {
+        const double old_aspect = static_cast<double>(image_width) / image_height;
+        const double new_aspect = static_cast<double>(width) / height;
+        int x                   = 0;
+        int y                   = 0;
         // Halves round to even, as the reference's round() does.
         if (old_aspect > new_aspect) {
-            x = static_cast<int64_t>(std::nearbyint((old_width - old_width * (new_aspect / old_aspect)) / 2));
+            x = static_cast<int>(std::nearbyint((image_width - image_width * (new_aspect / old_aspect)) / 2));
         } else if (old_aspect < new_aspect) {
-            y = static_cast<int64_t>(std::nearbyint((old_height - old_height * (old_aspect / new_aspect)) / 2));
+            y = static_cast<int>(std::nearbyint((image_height - image_height * (old_aspect / new_aspect)) / 2));
         }
-        if (x == 0 && y == 0) {
-            return image;
-        }
-        return ops::slice(ops::slice(image, 0, x, old_width - x), 1, y, old_height - y);
+        return {x, y, image_width - 2 * x, image_height - 2 * y};
     }
 
     static constexpr std::pair<const char*, ImageTarget> image_targets[] = {

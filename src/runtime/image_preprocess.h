@@ -13,9 +13,16 @@ namespace sd {
 
     std::pair<int, int> select_image_size_bucket(int source_width, int source_height, int area, int factor, int fallback_width, int fallback_height);
     Tensor<float> resize_and_center_crop(const Tensor<float>& image, int width, int height, ops::InterpolateMode filter = ops::InterpolateMode::Lanczos);
-    // Pillow's LANCZOS resize of an 8-bit picture: values are scaled to 0..255 and truncated, resized in Pillow's
-    // fixed point (horizontal pass, then vertical, each rounded to 8 bits) and read back as value / 255.
-    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height);
+    struct CropWindow {
+        int x      = 0;
+        int y      = 0;
+        int width  = 0;  // <= 0: the whole picture
+        int height = 0;
+    };
+    // Pillow's LANCZOS resize of an 8-bit picture (or of a crop window of it): values are scaled to 0..255 and
+    // truncated, resized in Pillow's fixed point (horizontal pass, then vertical, each rounded to 8 bits) and read
+    // back as value / 255.
+    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height, CropWindow crop = {});
     // Aspect-preserving size that puts the short edge inside [min_edge, max_edge], each side rounded (halves to even)
     // to a multiple of `multiple`, at least one multiple.
     std::pair<int, int> fit_short_edge_size(int width, int height, int min_edge, int max_edge, int multiple);
@@ -26,8 +33,8 @@ namespace sd {
     // `multiple` on each side and crop the centre. The size alone, then the picture.
     std::pair<int, int> scale_total_pixels_to_multiple_size(int width, int height, double megapixels, int multiple);
     Tensor<float> scale_total_pixels_to_multiple(const Tensor<float>& image, double megapixels, int multiple);
-    // The centred window with the aspect ratio of width x height (no resize).
-    Tensor<float> center_crop_to_aspect(const Tensor<float>& image, int width, int height);
+    // The centred window with the aspect ratio of width x height, as the reference's centre crop picks it.
+    CropWindow center_crop_window(int image_width, int image_height, int width, int height);
 
     enum class ImageTarget {
         Init,

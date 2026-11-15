@@ -520,11 +520,12 @@ namespace sd::pipeline {
                                                       request->height);
             }
             if (sd_vid_gen_params->end_image.data) {
-                end_image = sd::resize_lanczos_8bit(sd::center_crop_to_aspect(ensure_image_tensor_channels(sd_image_to_tensor(sd_vid_gen_params->end_image), 3),
-                                                                              request->width,
-                                                                              request->height),
-                                                    request->width,
-                                                    request->height);
+                auto image  = ensure_image_tensor_channels(sd_image_to_tensor(sd_vid_gen_params->end_image), 3);
+                auto window = sd::center_crop_window(static_cast<int>(image.shape()[0]),
+                                                     static_cast<int>(image.shape()[1]),
+                                                     request->width,
+                                                     request->height);
+                end_image   = sd::resize_lanczos_8bit(image, request->width, request->height, window);
             }
         }
 
