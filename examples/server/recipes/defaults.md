@@ -5,12 +5,12 @@ Reviewed against model-publisher cards and reference implementations on 2026-10-
 These are starting values, not limits on supported resolutions or generation settings.
 Built-in step defaults above 20 are reduced to 20; the cited sources may recommend more steps.
 Users can still choose a higher step count.
-Except for PiD recipes, built-in dimensions above 1,048,576 pixels (1024 x 1024) are reduced to 1024 x 1024, even when the cited source uses a larger size.
-PiD recipes retain their 2048 x 2048 defaults.
+Except for PiD and MiniMax-H3-Image recipes, built-in dimensions above 1,048,576 pixels (1024 x 1024) are reduced to 1024 x 1024, even when the cited source uses a larger size.
+PiD and MiniMax-H3-Image recipes retain their 2048 x 2048 defaults.
 Users can still choose a higher resolution.
 When several aspect ratios or ranges are published, the selected example or square bucket is noted below.
 A dash means no recipe override: the available primary sources did not establish a fixed value, or the size depends on the input image.
-Ordinary DiT recipes explicitly use Euler; PiD retains its LCM sampling path.
+Ordinary DiT recipes explicitly use Euler; PiD retains its LCM sampling path, and MiniMax-H3 video uses the reference workflows' `res_multistep`.
 Guidance-distilled models use `cfg_scale: 1` to disable external CFG in sd.cpp. FLUX embedded guidance is stored separately as `distilled_guidance`.
 For community edit adapters and other optional extensions, these are the base-model settings unless the source specifies otherwise.
 
@@ -68,9 +68,9 @@ For community edit adapters and other optional extensions, these are the base-mo
 | `mage-flow-edit` | 5 | 20 | 1024 × 1024 | [Source](https://huggingface.co/microsoft/Mage-Flow)  |
 | `mage-flow-turbo` | 1 | 4 | 1024 × 1024 | [Source](https://huggingface.co/microsoft/Mage-Flow)  |
 | `ming-image` | 1 | 12 | 1024 × 1024 | [Source](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design)  |
-| `minimax-h3-fl2va` | 1 | — | 1344 × 768 | [Source](https://huggingface.co/docs/diffusers/main/en/api/pipelines/minimax_h3) Guidance-distilled; official 768p canvas. No fixed step count is prescribed here; the upstream API counts sigma grid points rather than sd.cpp denoising steps. |
-| `minimax-h3-ref2va` | 1 | — | 1344 × 768 | [Source](https://huggingface.co/docs/diffusers/main/en/api/pipelines/minimax_h3) Guidance-distilled; official 768p canvas. No fixed step count is prescribed here; the upstream API counts sigma grid points rather than sd.cpp denoising steps. |
-| `minimax-h3-image` | 1 | 6 | 1024 × 1024 | [Runtime guide](../../../docs/minimax_h3_image.md) Dedicated image VAE and fixed PDD sigma schedule. |
+| `minimax-h3-fl2va` | 1 | 20 | 1344 × 768 | Reference workflow templates: `res_multistep` on the `simple` schedule, 20 steps, 124 frames (5 s at 24 fps) on the 768p canvas. Guidance-distilled. |
+| `minimax-h3-ref2va` | 1 | 20 | 1344 × 768 | Reference workflow templates: `res_multistep` on the `simple` schedule, 20 steps, 124 frames (5 s at 24 fps) on the 768p canvas. Guidance-distilled. |
+| `minimax-h3-image` | 1 | 6 | 2048 × 2048 | [Runtime guide](../../../docs/minimax_h3_image.md) Reference workflow templates: Euler on the `simple` schedule, 6 steps, a 4 MP square; the model is tuned for 2048 × 2048 pixels of area. |
 | `minit2i` | 2.5 | 20 | 512 × 512 | [Source](https://huggingface.co/MiniT2I/MiniT2I/raw/main/pipeline.py) B/16 example and native model size; L/16 uses CFG 6. |
 | `moss-image-base` | 3 | 20 | 1024 × 1024 | [Source](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base)  |
 | `moss-image-sft` | 3 | 20 | 1024 × 1024 | [Source](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT)  |

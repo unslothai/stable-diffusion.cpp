@@ -44,12 +44,14 @@
     "fixed_fps": 24
   },
   "defaults": {
-    "video_frames": 56,
+    "video_frames": 124,
     "fps": 24,
     "cfg_scale": 1,
+    "steps": 20,
     "width": 1344,
     "height": 768,
-    "sampling_method": "euler"
+    "sampling_method": "res_multistep",
+    "scheduler": "simple"
   },
   "features": [
     "end_image",
