@@ -2966,9 +2966,11 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.ref_images_count    = static_cast<int>(ref_image_views.size());
     params.ref_image_args      = ref_image_args.c_str();
     params.mask_image          = mask_image.get();
-    // Neither side set: -1 lets the library pick the model's default size (512 x 512 for most models).
-    params.width               = width > 0 || height > 0 ? get_resolved_width() : -1;
-    params.height              = width > 0 || height > 0 ? get_resolved_height() : -1;
+    // Size filled in by sd-cli from the first reference only, or no size and no references: -1 lets the library pick
+    // the model's default size (that reference's size, else 512 x 512, for most models).
+    const bool model_size      = size_from_ref_image || (width <= 0 && height <= 0 && ref_images.empty());
+    params.width               = model_size ? -1 : get_resolved_width();
+    params.height              = model_size ? -1 : get_resolved_height();
     params.sample_params       = sample_params;
     params.strength            = strength;
     params.seed                = seed;

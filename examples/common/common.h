@@ -332,6 +332,8 @@ struct SDGenerationParams {
     bool extract_and_remove_lora(const std::string& lora_model_dir);
     bool width_and_height_are_set() const;
     void set_width_and_height_if_unset(int w, int h);
+    // The size was filled in from the first reference image only (sd-cli); image generation then passes -1.
+    bool size_from_ref_image = false;
     int get_resolved_width() const;
     int get_resolved_height() const;
     bool resolve(const std::string& lora_model_dir, const std::string& hires_upscalers_dir, bool strict = false, bool validate_missing_loras = false);

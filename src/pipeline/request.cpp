@@ -135,14 +135,15 @@ namespace sd::pipeline {
         height                      = sd_img_gen_params->height;
         if (width <= 0 || height <= 0) {
             // No size requested. MiniMax-H3-Image follows its reference template: the 4 MP multiple-of-32 scale of
-            // picture 1 for an edit, else 2048 x 2048; every other model keeps 512 x 512.
-            width  = 512;
-            height = 512;
+            // picture 1 for an edit, else 2048 x 2048. Every other model takes the first reference's size, else
+            // 512 x 512 (what sd-cli always picked).
+            const auto* ref  = sd_img_gen_params->ref_images_count > 0 ? sd_img_gen_params->ref_images : nullptr;
+            const bool sized = ref != nullptr && ref->width > 0 && ref->height > 0;
+            width            = sized ? static_cast<int>(ref->width) : 512;
+            height           = sized ? static_cast<int>(ref->height) : 512;
             if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
-                const auto* ref = sd_img_gen_params->ref_images_count > 0 ? sd_img_gen_params->ref_images : nullptr;
-                const auto size = ref != nullptr && ref->width > 0 && ref->height > 0
-                                      ? sd::scale_total_pixels_to_multiple_size(static_cast<int>(ref->width), static_cast<int>(ref->height), 4.0, 32)
-                                      : std::pair<int, int>{2048, 2048};
+                const auto size = sized ? sd::scale_total_pixels_to_multiple_size(static_cast<int>(ref->width), static_cast<int>(ref->height), 4.0, 32)
+                                        : std::pair<int, int>{2048, 2048};
                 width           = size.first;
                 height          = size.second;
             }
