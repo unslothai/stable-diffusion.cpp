@@ -13,6 +13,12 @@ namespace sd {
 
     std::pair<int, int> select_image_size_bucket(int source_width, int source_height, int area, int factor, int fallback_width, int fallback_height);
     Tensor<float> resize_and_center_crop(const Tensor<float>& image, int width, int height, ops::InterpolateMode filter = ops::InterpolateMode::Lanczos);
+    // Pillow's LANCZOS resize of an 8-bit picture: values are scaled to 0..255 and truncated, resized in Pillow's
+    // fixed point (horizontal pass, then vertical, each rounded to 8 bits) and read back as value / 255.
+    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height);
+    // Aspect-preserving size that puts the short edge inside [min_edge, max_edge], each side rounded (halves to even)
+    // to a multiple of `multiple`, at least one multiple.
+    std::pair<int, int> fit_short_edge_size(int width, int height, int min_edge, int max_edge, int multiple);
 
     enum class ImageTarget {
         Init,

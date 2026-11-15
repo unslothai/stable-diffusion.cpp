@@ -1,7 +1,10 @@
 #include "image_preprocess.h"
 #include "core/util.h"
 
+#include <algorithm>
 #include <climits>
+#include <cmath>
+#include <cstdint>
 #include <set>
 
 namespace sd {
@@ -40,6 +43,138 @@ namespace sd {
         auto resized = ops::interpolate(image, {w, h, image.shape()[2], image.shape()[3]}, filter);
         resized      = ops::slice(resized, 0, (w - width) / 2, (w - width) / 2 + width);
         return ops::slice(resized, 1, (h - height) / 2, (h - height) / 2 + height);
+    }
+
+    // Pillow's Resample.c: LANCZOS (a = 3) and 8-bit fixed point with PRECISION_BITS = 32 - 8 - 2.
+    static constexpr int pillow_precision_bits = 32 - 8 - 2;
+
+    static double pillow_sinc(double x) {
+        if (x == 0.0) {
+            return 1.0;
+        }
+        x = x * 3.14159265358979323846;
+        return std::sin(x) / x;
+    }
+
+    static double pillow_lanczos(double x) {
+        if (-3.0 <= x && x < 3.0) {
+            return pillow_sinc(x) * pillow_sinc(x / 3);
+        }
+        return 0.0;
+    }
+
+    struct PillowAxisCoeffs {
+        int ksize = 0;
+        std::vector<int> bounds;      // (first input index, tap count) per output index
+        std::vector<int32_t> coeffs;  // ksize fixed-point taps per output index
+    };
+
+    static PillowAxisCoeffs pillow_lanczos_coeffs(int in_size, int out_size) {
+        PillowAxisCoeffs axis;
+        const double scale       = static_cast<double>(in_size) / out_size;
+        const double filterscale = scale < 1.0 ? 1.0 : scale;
+        const double support     = 3.0 * filterscale;
+        axis.ksize               = static_cast<int>(std::ceil(support)) * 2 + 1;
+        axis.bounds.assign(static_cast<size_t>(out_size) * 2, 0);
+        axis.coeffs.assign(static_cast<size_t>(out_size) * axis.ksize, 0);
+        std::vector<double> k(static_cast<size_t>(axis.ksize));
+        for (int xx = 0; xx < out_size; ++xx) {
+            const double center = (xx + 0.5) * scale;
+            const double ss     = 1.0 / filterscale;
+            double ww           = 0.0;
+            int xmin            = std::max(static_cast<int>(center - support + 0.5), 0);
+            int xmax            = std::min(static_cast<int>(center + support + 0.5), in_size) - xmin;
+            for (int x = 0; x < xmax; ++x) {
+                k[x] = pillow_lanczos((x + xmin - center + 0.5) * ss);
+                ww += k[x];
+            }
+            for (int x = 0; x < xmax; ++x) {
+                const double w = ww != 0.0 ? k[x] / ww : k[x];
+                // Rounded half away from zero, as normalize_coeffs_8bpc does.
+                axis.coeffs[static_cast<size_t>(xx) * axis.ksize + x] =
+                    static_cast<int32_t>(w < 0 ? -0.5 + w * (1 << pillow_precision_bits) : 0.5 + w * (1 << pillow_precision_bits));
+            }
+            axis.bounds[static_cast<size_t>(xx) * 2]     = xmin;
+            axis.bounds[static_cast<size_t>(xx) * 2 + 1] = xmax;
+        }
+        return axis;
+    }
+
+    static uint8_t pillow_clip8(int32_t value) {
+        return static_cast<uint8_t>(std::clamp(value >> pillow_precision_bits, 0, 255));
+    }
+
+    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height) {
+        GGML_ASSERT(image.dim() >= 2 && width > 0 && height > 0);
+        const int in_width   = static_cast<int>(image.shape()[0]);
+        const int in_height  = static_cast<int>(image.shape()[1]);
+        const int64_t planes = image.numel() / (static_cast<int64_t>(in_width) * in_height);
+        auto shape           = image.shape();
+        shape[0]             = width;
+        shape[1]             = height;
+        Tensor<float> output(shape);
+        const bool horizontal = width != in_width;
+        const bool vertical   = height != in_height;
+        const auto x_axis     = pillow_lanczos_coeffs(in_width, width);
+        const auto y_axis     = pillow_lanczos_coeffs(in_height, height);
+        const int temp_width  = horizontal ? width : in_width;
+        const int32_t half    = 1 << (pillow_precision_bits - 1);
+        for (int64_t plane = 0; plane < planes; ++plane) {
+            const float* src = image.data() + plane * in_width * in_height;
+            std::vector<uint8_t> pixels(static_cast<size_t>(in_width) * in_height);
+            for (size_t i = 0; i < pixels.size(); ++i) {
+                // float32 scaling and truncation, as numpy's (255. * x).clip(0, 255).astype(uint8).
+                const float value = 255.f * src[i];
+                pixels[i]         = static_cast<uint8_t>(std::clamp(value, 0.f, 255.f));
+            }
+            std::vector<uint8_t> temp = pixels;
+            if (horizontal) {
+                temp.assign(static_cast<size_t>(width) * in_height, 0);
+                for (int y = 0; y < in_height; ++y) {
+                    const uint8_t* row = pixels.data() + static_cast<size_t>(y) * in_width;
+                    for (int xx = 0; xx < width; ++xx) {
+                        const int xmin   = x_axis.bounds[static_cast<size_t>(xx) * 2];
+                        const int xmax   = x_axis.bounds[static_cast<size_t>(xx) * 2 + 1];
+                        const int32_t* k = x_axis.coeffs.data() + static_cast<size_t>(xx) * x_axis.ksize;
+                        int32_t sum      = half;
+                        for (int x = 0; x < xmax; ++x) {
+                            sum += row[xmin + x] * k[x];
+                        }
+                        temp[static_cast<size_t>(y) * width + xx] = pillow_clip8(sum);
+                    }
+                }
+            }
+            std::vector<uint8_t> result = temp;
+            if (vertical) {
+                result.assign(static_cast<size_t>(temp_width) * height, 0);
+                for (int yy = 0; yy < height; ++yy) {
+                    const int ymin   = y_axis.bounds[static_cast<size_t>(yy) * 2];
+                    const int ymax   = y_axis.bounds[static_cast<size_t>(yy) * 2 + 1];
+                    const int32_t* k = y_axis.coeffs.data() + static_cast<size_t>(yy) * y_axis.ksize;
+                    for (int xx = 0; xx < temp_width; ++xx) {
+                        int32_t sum = half;
+                        for (int y = 0; y < ymax; ++y) {
+                            sum += temp[static_cast<size_t>(ymin + y) * temp_width + xx] * k[y];
+                        }
+                        result[static_cast<size_t>(yy) * temp_width + xx] = pillow_clip8(sum);
+                    }
+                }
+            }
+            float* dst = output.data() + plane * static_cast<int64_t>(width) * height;
+            for (size_t i = 0; i < result.size(); ++i) {
+                dst[i] = static_cast<float>(result[i]) / 255.f;
+            }
+        }
+        return output;
+    }
+
+    std::pair<int, int> fit_short_edge_size(int width, int height, int min_edge, int max_edge, int multiple) {
+        const int short_edge = std::min(width, height);
+        const double scale   = static_cast<double>(std::clamp(short_edge, min_edge, max_edge)) / short_edge;
+        auto fit             = [&](int side) {
+            return std::max(multiple, static_cast<int>(std::nearbyint(side * scale / multiple)) * multiple);
+        };
+        return {fit(width), fit(height)};
     }
 
     static constexpr std::pair<const char*, ImageTarget> image_targets[] = {

@@ -178,9 +178,11 @@ edge instead, which preserves more identity detail at a higher sampling cost:
 reference latents are attended at every sampling step.
 
 Whichever limit applies, each axis is then snapped to the nearest 32-pixel
-multiple. An axis of at least 16 pixels can therefore grow by up to 16 pixels
-past the scaled size (a 48-pixel axis becomes 64), and references are never
-narrower than 32 pixels.
+multiple (halves round to even). An axis of at least 16 pixels can therefore
+grow by up to 16 pixels past the scaled size (a 48-pixel axis becomes 64), and
+references are never narrower than 32 pixels. Reference images and reference
+video frames are resized with Lanczos on 8-bit values, as the reference
+workflows do.
 `resize_before_vae=false` is not supported here; MiniMax-H3 keeps references on
 the 32-pixel grid and reports a warning.
 

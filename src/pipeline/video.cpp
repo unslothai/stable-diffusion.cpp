@@ -487,8 +487,9 @@ namespace sd::pipeline {
             double target_area = static_cast<double>(target_w) * target_h;
             scale              = std::min(1.0, std::sqrt(target_area / source_area));
         }
+        // Halves round to even, as the reference's round() does.
         auto align32 = [kCanvasMultiple](double value) {
-            return std::max(32, static_cast<int>(std::round(value / kCanvasMultiple)) * 32);
+            return std::max(32, static_cast<int>(std::nearbyint(value / kCanvasMultiple)) * 32);
         };
         return {align32(source_w * scale), align32(source_h * scale)};
     }
@@ -572,12 +573,11 @@ namespace sd::pipeline {
                 return true;
             };
 
+            // Reference pictures and video frames go through Pillow's 8-bit Lanczos, as in the reference nodes.
             auto resize_reference = [&](const sd::Tensor<float>& image,
                                         int width,
                                         int height) {
-                return sd::ops::interpolate(
-                    image,
-                    std::vector<int64_t>{width, height, image.shape()[2], image.shape()[3]});
+                return sd::resize_lanczos_8bit(image, width, height);
             };
 
             auto encode_reference_audio = [&](const sd_audio_t& audio,
@@ -683,11 +683,12 @@ namespace sd::pipeline {
                         nominal_w *= scale;
                         nominal_h *= scale;
                     }
-                    int width  = std::max(32, static_cast<int>(std::round(nominal_w / 32.0)) * 32);
-                    int height = std::max(32, static_cast<int>(std::round(nominal_h / 32.0)) * 32);
+                    // Halves round to even, as the reference's round() does.
+                    int width  = std::max(32, static_cast<int>(std::nearbyint(nominal_w / 32.0)) * 32);
+                    int height = std::max(32, static_cast<int>(std::nearbyint(nominal_h / 32.0)) * 32);
                     if (source_w * source_h < width * height) {
-                        width  = std::max(32, static_cast<int>(std::round(source_w / 32.0)) * 32);
-                        height = std::max(32, static_cast<int>(std::round(source_h / 32.0)) * 32);
+                        width  = std::max(32, static_cast<int>(std::nearbyint(source_w / 32.0)) * 32);
+                        height = std::max(32, static_cast<int>(std::nearbyint(source_h / 32.0)) * 32);
                     }
 
                     sd::Tensor<float> video({width, height, normalized_frames, 3, 1});
