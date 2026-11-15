@@ -817,6 +817,10 @@ enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sample_me
     return sd::pipeline::default_scheduler(sd_ctx != nullptr ? sd_ctx->sd : nullptr, sample_method);
 }
 
+int sd_get_default_sample_steps(const sd_ctx_t* sd_ctx) {
+    return sd::pipeline::default_sample_steps(sd_ctx != nullptr ? sd_ctx->sd : nullptr);
+}
+
 SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* params,
                            sd_image_generation_result_t** result_out) {

@@ -174,31 +174,21 @@ namespace sd::pipeline {
         return packed;
     }
 
-    // MiniMax-H3-Image sizes a reference once per consumer, as the release does: the original pixels while the short
-    // edge is within [min_edge, max_edge], else a Lanczos resize that puts the short edge on the nearer bound, both
-    // sides rounded to 32.
-    static sd::Tensor<float> bound_h3_image_short_edge(const sd::Tensor<float>& image, int64_t min_edge, int64_t max_edge) {
-        constexpr int64_t multiple = 32;
-        const int64_t width        = image.shape()[0];
-        const int64_t height       = image.shape()[1];
-        const int64_t short_edge   = std::min(width, height);
-        if (short_edge >= min_edge && short_edge <= max_edge) {
-            return image;
+    // MiniMax-H3-Image sizes a reference once per consumer, as the reference does: an aspect-preserving scale that puts
+    // the short edge inside [min_edge, max_edge], both sides on the 32 px grid. Returns false (and leaves `resized`
+    // alone) when the picture is already at that size and is used as it is; else resizes it with Pillow's 8-bit
+    // Lanczos into `resized`.
+    static bool fit_h3_image_short_edge(const sd::Tensor<float>& image, int min_edge, int max_edge, sd::Tensor<float>* resized) {
+        const auto [width, height] = sd::fit_short_edge_size(static_cast<int>(image.shape()[0]),
+                                                             static_cast<int>(image.shape()[1]),
+                                                             min_edge,
+                                                             max_edge,
+                                                             32);
+        if (width == image.shape()[0] && height == image.shape()[1]) {
+            return false;
         }
-        const double scale       = static_cast<double>(short_edge < min_edge ? min_edge : max_edge) / short_edge;
-        const int64_t new_width  = std::max<int64_t>(multiple, static_cast<int64_t>(std::nearbyint(width * scale / multiple)) * multiple);
-        const int64_t new_height = std::max<int64_t>(multiple, static_cast<int64_t>(std::nearbyint(height * scale / multiple)) * multiple);
-        return sd::ops::interpolate(image, {new_width, new_height, image.shape()[2], image.shape()[3]}, sd::ops::InterpolateMode::Lanczos);
-    }
-
-    // Crops [W, H, ...] at the top left to multiples of `cell` along W and H.
-    static sd::Tensor<float> crop_to_cells(const sd::Tensor<float>& tensor, int64_t cell) {
-        const int64_t width  = tensor.shape()[0] / cell * cell;
-        const int64_t height = tensor.shape()[1] / cell * cell;
-        if (width == tensor.shape()[0] && height == tensor.shape()[1]) {
-            return tensor;
-        }
-        return sd::ops::slice(sd::ops::slice(tensor, 0, 0, width), 1, 0, height);
+        *resized = sd::resize_lanczos_8bit(image, width, height);
+        return true;
     }
 
     static std::optional<ImageGenerationLatents> prepare_image_generation_latents(StableDiffusionGGML* sd,
@@ -362,6 +352,13 @@ namespace sd::pipeline {
                                                               image_channels));
         }
 
+        if (sd->version == VERSION_MINIMAX_H3_IMAGE && !ref_images.empty()) {
+            // The reference edit template scales the picture to edit to 4 MP (area filter) and covers the nearest
+            // multiple of 32 on each side before the model sees it; the output takes that size unless one is set.
+            ref_images[0] = sd::scale_total_pixels_to_multiple(ref_images[0], 4.0, 32);
+            LOG_INFO("MiniMax-H3-Image picture 1 scaled to %" PRId64 "x%" PRId64, ref_images[0].shape()[0], ref_images[0].shape()[1]);
+        }
+
         if (ref_images.empty() && sd_version_is_unet_edit(sd->version)) {
             LOG_WARN("This model needs at least one reference image; using an empty reference");
             ref_images.push_back(sd::zeros<float>({request->width, request->height, image_channels, 1}));
@@ -384,12 +381,12 @@ namespace sd::pipeline {
             }
             sd::Tensor<float> ref_latent;
             if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
-                // The VAE sees the reference at its own size (short edge kept within 1024-2048), cropped to whole
-                // VAE cells; the latent is then cropped to whole 2x2 patches.
-                const int vae_cell = sd->first_stage_model->get_scale_factor();
-                ref_latent         = sd->encode_first_stage(crop_to_cells(bound_h3_image_short_edge(ref_images[i], 1024, 2048), vae_cell));
+                // The VAE sees the reference with its short edge fitted into 1024-2048 on the 32 px grid, so the
+                // latent always covers whole 2x2 patches.
+                sd::Tensor<float> resized;
+                const bool scaled = fit_h3_image_short_edge(ref_images[i], 1024, 2048, &resized);
+                ref_latent        = sd->encode_first_stage(scaled ? resized : ref_images[i]);
                 if (!ref_latent.empty()) {
-                    ref_latent             = crop_to_cells(ref_latent, 2);
                     const int64_t width    = ref_latent.shape()[0];
                     const int64_t height   = ref_latent.shape()[1];
                     const int64_t channels = ref_latent.shape()[3];
@@ -541,7 +538,12 @@ namespace sd::pipeline {
                 latents.minimax_reference_blocks.push_back({MiniMaxH3ReferenceKind::IMAGE, static_cast<int32_t>(i), -1});
             }
             for (auto& image : ref_images) {
-                image = sd->version == VERSION_P_H3_IMAGE ? resize_ph3_reference(image, 1000000) : bound_h3_image_short_edge(image, 1024, 1024);
+                sd::Tensor<float> resized;
+                if (sd->version == VERSION_P_H3_IMAGE) {
+                    image = resize_ph3_reference(image, 1000000);
+                } else if (fit_h3_image_short_edge(image, 1024, 1024, &resized)) {
+                    image = std::move(resized);
+                }
             }
         }
         latents.init_latent              = std::move(init_latent);

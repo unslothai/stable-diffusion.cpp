@@ -875,6 +875,8 @@ int main(int argc, const char* argv[]) {
     }
 
     if (gen_params.ref_image_paths.size() > 0) {
+        // A size taken only from the first reference is left to the library (the model may size edits itself).
+        gen_params.size_from_ref_image = !gen_params.width_and_height_are_set();
         gen_params.ref_images.clear();
         for (auto& path : gen_params.ref_image_paths) {
             SDImageOwner ref_image({0, 0, 0, nullptr});

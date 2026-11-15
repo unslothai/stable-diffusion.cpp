@@ -47,9 +47,10 @@ const std::vector<ModelDefinition>& minimax_h3_definitions() {
             definition.version                          = VERSION_MINIMAX_H3_IMAGE;
             definition.name                             = "MiniMax-H3-Image";
             definition.traits.supports_video_generation = false;
-            // The image models keep their few-step Euler grid (PDD heads are indexed by it).
+            // The reference templates sample with Euler on the simple schedule (6 steps land next to the PDD grid).
             definition.sampling.default_sample_method   = EULER_SAMPLE_METHOD;
-            definition.sampling.default_scheduler       = DISCRETE_SCHEDULER;
+            definition.sampling.default_scheduler       = SIMPLE_SCHEDULER;
+            definition.sampling.default_sample_steps    = 6;
             definition.sampling.default_flow_shift      = 1.f;
             definition.ref_image_preset                 = "qwen";
             result.push_back(std::move(definition));

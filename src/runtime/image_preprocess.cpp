@@ -1,7 +1,11 @@
 #include "image_preprocess.h"
+#include "core/parallel.h"
 #include "core/util.h"
 
+#include <algorithm>
 #include <climits>
+#include <cmath>
+#include <cstdint>
 #include <set>
 
 namespace sd {
@@ -40,6 +44,293 @@ namespace sd {
         auto resized = ops::interpolate(image, {w, h, image.shape()[2], image.shape()[3]}, filter);
         resized      = ops::slice(resized, 0, (w - width) / 2, (w - width) / 2 + width);
         return ops::slice(resized, 1, (h - height) / 2, (h - height) / 2 + height);
+    }
+
+    // Pillow's Resample.c: LANCZOS (a = 3) and 8-bit fixed point with PRECISION_BITS = 32 - 8 - 2.
+    static constexpr int pillow_precision_bits = 32 - 8 - 2;
+
+    static double pillow_sinc(double x) {
+        if (x == 0.0) {
+            return 1.0;
+        }
+        x = x * 3.14159265358979323846;
+        return std::sin(x) / x;
+    }
+
+    static double pillow_lanczos(double x) {
+        if (-3.0 <= x && x < 3.0) {
+            return pillow_sinc(x) * pillow_sinc(x / 3);
+        }
+        return 0.0;
+    }
+
+    struct PillowAxisCoeffs {
+        int ksize = 0;
+        std::vector<int> bounds;      // (first input index, tap count) per output index
+        std::vector<int32_t> coeffs;  // ksize fixed-point taps per output index
+    };
+
+    static PillowAxisCoeffs pillow_lanczos_coeffs(int in_size, int out_size) {
+        PillowAxisCoeffs axis;
+        const double scale       = static_cast<double>(in_size) / out_size;
+        const double filterscale = scale < 1.0 ? 1.0 : scale;
+        const double support     = 3.0 * filterscale;
+        axis.ksize               = static_cast<int>(std::ceil(support)) * 2 + 1;
+        axis.bounds.assign(static_cast<size_t>(out_size) * 2, 0);
+        axis.coeffs.assign(static_cast<size_t>(out_size) * axis.ksize, 0);
+        std::vector<double> k(static_cast<size_t>(axis.ksize));
+        for (int xx = 0; xx < out_size; ++xx) {
+            const double center = (xx + 0.5) * scale;
+            const double ss     = 1.0 / filterscale;
+            double ww           = 0.0;
+            int xmin            = std::max(static_cast<int>(center - support + 0.5), 0);
+            int xmax            = std::min(static_cast<int>(center + support + 0.5), in_size) - xmin;
+            for (int x = 0; x < xmax; ++x) {
+                k[x] = pillow_lanczos((x + xmin - center + 0.5) * ss);
+                ww += k[x];
+            }
+            for (int x = 0; x < xmax; ++x) {
+                const double w = ww != 0.0 ? k[x] / ww : k[x];
+                // Rounded half away from zero, as normalize_coeffs_8bpc does.
+                axis.coeffs[static_cast<size_t>(xx) * axis.ksize + x] =
+                    static_cast<int32_t>(w < 0 ? -0.5 + w * (1 << pillow_precision_bits) : 0.5 + w * (1 << pillow_precision_bits));
+            }
+            axis.bounds[static_cast<size_t>(xx) * 2]     = xmin;
+            axis.bounds[static_cast<size_t>(xx) * 2 + 1] = xmax;
+        }
+        return axis;
+    }
+
+    static uint8_t pillow_clip8(int32_t value) {
+        return static_cast<uint8_t>(std::clamp(value >> pillow_precision_bits, 0, 255));
+    }
+
+    Tensor<float> resize_lanczos_8bit(const Tensor<float>& image, int width, int height, CropWindow crop) {
+        GGML_ASSERT(image.dim() >= 2 && width > 0 && height > 0);
+        const int64_t stride      = image.shape()[0];
+        const int64_t plane_size  = stride * image.shape()[1];
+        const bool whole          = crop.width <= 0 || crop.height <= 0;
+        const int in_width        = whole ? static_cast<int>(image.shape()[0]) : crop.width;
+        const int in_height       = whole ? static_cast<int>(image.shape()[1]) : crop.height;
+        const int64_t crop_offset = whole ? 0 : static_cast<int64_t>(crop.y) * stride + crop.x;
+        GGML_ASSERT(whole || (crop.x >= 0 && crop.y >= 0 && crop.x + crop.width <= stride && crop.y + crop.height <= image.shape()[1]));
+        const int64_t planes = image.numel() / plane_size;
+        auto shape           = image.shape();
+        shape[0]             = width;
+        shape[1]             = height;
+        Tensor<float> output(shape);
+        const bool horizontal = width != in_width;
+        const bool vertical   = height != in_height;
+        const auto x_axis     = pillow_lanczos_coeffs(in_width, width);
+        const auto y_axis     = pillow_lanczos_coeffs(in_height, height);
+        const int mid_width   = horizontal ? width : in_width;
+        const int32_t half    = 1 << (pillow_precision_bits - 1);
+        // One 8-bit plane at a time: the horizontal pass (each input row quantized into a per-thread row first), or
+        // the quantized input when only the height changes. The vertical pass writes the float output directly.
+        std::vector<uint8_t> middle(static_cast<size_t>(mid_width) * in_height);
+        // float32 scaling and truncation, as numpy's (255. * x).clip(0, 255).astype(uint8).
+        auto quantize = [](const float* in, uint8_t* out, int64_t count) {
+            for (int64_t i = 0; i < count; ++i) {
+                out[i] = static_cast<uint8_t>(std::clamp(255.f * in[i], 0.f, 255.f));
+            }
+        };
+        const int out_rows = vertical ? height : in_height;
+        for (int64_t plane = 0; plane < planes; ++plane) {
+            const float* src_plane = image.data() + plane * plane_size + crop_offset;
+            float* dst_plane       = output.data() + plane * mid_width * out_rows;
+            parallel_for(0, in_height, std::max<int64_t>(1, 4096 / in_width), [&](int64_t begin, int64_t end) {
+                std::vector<uint8_t> row_pixels(horizontal ? static_cast<size_t>(in_width) : 0);
+                for (int64_t row = begin; row < end; ++row) {
+                    const float* src = src_plane + row * stride;
+                    uint8_t* out     = middle.data() + row * mid_width;
+                    if (!horizontal) {
+                        quantize(src, out, in_width);
+                        continue;
+                    }
+                    quantize(src, row_pixels.data(), in_width);
+                    for (int xx = 0; xx < width; ++xx) {
+                        const int xmin   = x_axis.bounds[static_cast<size_t>(xx) * 2];
+                        const int xmax   = x_axis.bounds[static_cast<size_t>(xx) * 2 + 1];
+                        const int32_t* k = x_axis.coeffs.data() + static_cast<size_t>(xx) * x_axis.ksize;
+                        int32_t sum      = half;
+                        for (int x = 0; x < xmax; ++x) {
+                            sum += row_pixels[xmin + x] * k[x];
+                        }
+                        out[xx] = pillow_clip8(sum);
+                    }
+                }
+            });
+            parallel_for(0, out_rows, std::max<int64_t>(1, 4096 / mid_width), [&](int64_t begin, int64_t end) {
+                std::vector<int32_t> sums(static_cast<size_t>(mid_width));
+                for (int64_t yy = begin; yy < end; ++yy) {
+                    float* dst = dst_plane + yy * mid_width;
+                    if (!vertical) {
+                        const uint8_t* line = middle.data() + yy * mid_width;
+                        for (int xx = 0; xx < mid_width; ++xx) {
+                            dst[xx] = static_cast<float>(line[xx]) / 255.f;
+                        }
+                        continue;
+                    }
+                    const int ymin   = y_axis.bounds[static_cast<size_t>(yy) * 2];
+                    const int ymax   = y_axis.bounds[static_cast<size_t>(yy) * 2 + 1];
+                    const int32_t* k = y_axis.coeffs.data() + static_cast<size_t>(yy) * y_axis.ksize;
+                    std::fill(sums.begin(), sums.end(), half);
+                    // Tap-major, so the inner loop runs along a contiguous row (vectorizes).
+                    for (int y = 0; y < ymax; ++y) {
+                        const uint8_t* line = middle.data() + static_cast<size_t>(ymin + y) * mid_width;
+                        const int32_t tap   = k[y];
+                        for (int xx = 0; xx < mid_width; ++xx) {
+                            sums[xx] += line[xx] * tap;
+                        }
+                    }
+                    for (int xx = 0; xx < mid_width; ++xx) {
+                        dst[xx] = static_cast<float>(pillow_clip8(sums[xx])) / 255.f;
+                    }
+                }
+            });
+        }
+        return output;
+    }
+
+    std::pair<int, int> fit_short_edge_size(int width, int height, int min_edge, int max_edge, int multiple) {
+        const int short_edge = std::min(width, height);
+        const double scale   = static_cast<double>(std::clamp(short_edge, min_edge, max_edge)) / short_edge;
+        auto fit             = [&](int side) {
+            return std::max(multiple, static_cast<int>(std::nearbyint(side * scale / multiple)) * multiple);
+        };
+        return {fit(width), fit(height)};
+    }
+
+    // The area resize to full_width x full_height, computing only the window at (x0, y0) of width x height.
+    static Tensor<float> resize_area_window(const Tensor<float>& image,
+                                            int64_t full_width,
+                                            int64_t full_height,
+                                            int64_t x0,
+                                            int64_t y0,
+                                            int64_t width,
+                                            int64_t height) {
+        GGML_ASSERT(image.dim() >= 2 && width > 0 && height > 0);
+        const int64_t in_width  = image.shape()[0];
+        const int64_t in_height = image.shape()[1];
+        const int64_t planes    = image.numel() / (in_width * in_height);
+        auto shape              = image.shape();
+        shape[0]                = width;
+        shape[1]                = height;
+        Tensor<float> output(shape);
+        if (full_width == in_width && full_height == in_height && x0 == 0 && y0 == 0 && width == in_width && height == in_height) {
+            std::copy_n(image.data(), image.numel(), output.data());
+            return output;
+        }
+        // start = floor(i * in / out), end = ceil((i + 1) * in / out), as adaptive average pooling does.
+        auto box = [](int64_t index, int64_t in, int64_t out) {
+            return std::pair<int64_t, int64_t>{index * in / out, ((index + 1) * in + out - 1) / out};
+        };
+        std::vector<std::pair<int64_t, int64_t>> x_boxes(static_cast<size_t>(width));
+        for (int64_t x = 0; x < width; ++x) {
+            x_boxes[static_cast<size_t>(x)] = box(x0 + x, in_width, full_width);
+        }
+        parallel_for(0, planes * height, std::max<int64_t>(1, 4096 / width), [&](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const int64_t plane = row / height;
+                const float* src    = image.data() + plane * in_width * in_height;
+                float* dst          = output.data() + row * width;
+                const auto [ys, ye] = box(y0 + row % height, in_height, full_height);
+                for (int64_t x = 0; x < width; ++x) {
+                    const auto [xs, xe] = x_boxes[static_cast<size_t>(x)];
+                    float sum           = 0.f;
+                    for (int64_t iy = ys; iy < ye; ++iy) {
+                        for (int64_t ix = xs; ix < xe; ++ix) {
+                            sum += src[iy * in_width + ix];
+                        }
+                    }
+                    dst[x] = sum / static_cast<float>(ye - ys) / static_cast<float>(xe - xs);
+                }
+            }
+        });
+        return output;
+    }
+
+    Tensor<float> resize_area(const Tensor<float>& image, int width, int height) {
+        return resize_area_window(image, width, height, 0, 0, width, height);
+    }
+
+    // The total-pixel scale (halves of the rounded sides to even), then the cover size and the cropped multiple.
+    struct TotalPixelsPlan {
+        int scaled_width  = 0;
+        int scaled_height = 0;
+        int cover_width   = 0;
+        int cover_height  = 0;
+        int width         = 0;
+        int height        = 0;
+    };
+
+    static TotalPixelsPlan plan_total_pixels_to_multiple(int width, int height, double megapixels, int multiple) {
+        TotalPixelsPlan plan;
+        const double total = static_cast<double>(static_cast<int64_t>(megapixels * 1024 * 1024));
+        const double scale = std::sqrt(total / (static_cast<double>(width) * height));
+        plan.scaled_width  = static_cast<int>(std::nearbyint(width * scale));
+        plan.scaled_height = static_cast<int>(std::nearbyint(height * scale));
+        plan.width         = plan.scaled_width / multiple * multiple;
+        plan.height        = plan.scaled_height / multiple * multiple;
+        plan.cover_width   = plan.scaled_width;
+        plan.cover_height  = plan.scaled_height;
+        if (multiple <= 1 || plan.width == 0 || plan.height == 0) {
+            plan.width  = plan.scaled_width;
+            plan.height = plan.scaled_height;
+            return plan;
+        }
+        if (plan.width == plan.scaled_width && plan.height == plan.scaled_height) {
+            return plan;
+        }
+        const double scale_w = static_cast<double>(plan.width) / plan.scaled_width;
+        const double scale_h = static_cast<double>(plan.height) / plan.scaled_height;
+        if (scale_w >= scale_h) {
+            plan.cover_width  = plan.width;
+            plan.cover_height = std::max(plan.height, static_cast<int>(std::ceil(plan.scaled_height * scale_w)));
+        } else {
+            plan.cover_height = plan.height;
+            plan.cover_width  = std::max(plan.width, static_cast<int>(std::ceil(plan.scaled_width * scale_h)));
+        }
+        return plan;
+    }
+
+    std::pair<int, int> scale_total_pixels_to_multiple_size(int width, int height, double megapixels, int multiple) {
+        const auto plan = plan_total_pixels_to_multiple(width, height, megapixels, multiple);
+        return {plan.width, plan.height};
+    }
+
+    Tensor<float> scale_total_pixels_to_multiple(const Tensor<float>& image, double megapixels, int multiple) {
+        const auto plan = plan_total_pixels_to_multiple(static_cast<int>(image.shape()[0]),
+                                                        static_cast<int>(image.shape()[1]),
+                                                        megapixels,
+                                                        multiple);
+        auto scaled     = resize_area(image, plan.scaled_width, plan.scaled_height);
+        if (plan.cover_width == plan.width && plan.cover_height == plan.height && plan.width == plan.scaled_width &&
+            plan.height == plan.scaled_height) {
+            return scaled;
+        }
+        // The cover resize computes only the centred crop.
+        return resize_area_window(scaled,
+                                  plan.cover_width,
+                                  plan.cover_height,
+                                  (plan.cover_width - plan.width) / 2,
+                                  (plan.cover_height - plan.height) / 2,
+                                  plan.width,
+                                  plan.height);
+    }
+
+    CropWindow center_crop_window(int image_width, int image_height, int width, int height) {
+        const double old_aspect = static_cast<double>(image_width) / image_height;
+        const double new_aspect = static_cast<double>(width) / height;
+        int x                   = 0;
+        int y                   = 0;
+        // Halves round to even, as the reference's round() does.
+        if (old_aspect > new_aspect) {
+            x = static_cast<int>(std::nearbyint((image_width - image_width * (new_aspect / old_aspect)) / 2));
+        } else if (old_aspect < new_aspect) {
+            y = static_cast<int>(std::nearbyint((image_height - image_height * (old_aspect / new_aspect)) / 2));
+        }
+        return {x, y, image_width - 2 * x, image_height - 2 * y};
     }
 
     static constexpr std::pair<const char*, ImageTarget> image_targets[] = {

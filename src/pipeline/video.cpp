@@ -487,29 +487,55 @@ namespace sd::pipeline {
             double target_area = static_cast<double>(target_w) * target_h;
             scale              = std::min(1.0, std::sqrt(target_area / source_area));
         }
+        // Halves round to even, as the reference's round() does.
         auto align32 = [kCanvasMultiple](double value) {
-            return std::max(32, static_cast<int>(std::round(value / kCanvasMultiple)) * 32);
+            return std::max(32, static_cast<int>(std::nearbyint(value / kCanvasMultiple)) * 32);
         };
         return {align32(source_w * scale), align32(source_h * scale)};
+    }
+
+    // The reference MiniMax-H3 keyframe geometry applies when the caller sets no preprocessing rules.
+    static bool uses_minimax_h3_keyframe_geometry(const StableDiffusionGGML* sd, const sd_vid_gen_params_t* params) {
+        const char* rules = params->image_preprocess.rules;
+        return sd->version == VERSION_MINIMAX_H3 && (rules == nullptr || rules[0] == '\0');
     }
 
     static std::optional<ImageGenerationLatents> prepare_video_generation_latents(StableDiffusionGGML* sd,
                                                                                   const sd_vid_gen_params_t* sd_vid_gen_params,
                                                                                   GenerationRequest* request,
-                                                                                  const RefImageParams& ref_image_params) {
+                                                                                  const RefImageParams& ref_image_params,
+                                                                                  bool h3_keyframes) {
         ImageGenerationLatents latents;
         int64_t prepare_start_ms = ggml_time_ms();
 
         sd::Tensor<float> start_image;
         sd::Tensor<float> end_image;
 
-        if (sd_vid_gen_params->init_image.data) {
+        if (h3_keyframes) {
+            // As the reference: the first frame is stretched to the canvas, the last one cover-cropped to its aspect,
+            // both with the 8-bit Lanczos.
+            if (sd_vid_gen_params->init_image.data) {
+                start_image = sd::resize_lanczos_8bit(ensure_image_tensor_channels(sd_image_to_tensor(sd_vid_gen_params->init_image), 3),
+                                                      request->width,
+                                                      request->height);
+            }
+            if (sd_vid_gen_params->end_image.data) {
+                auto image  = ensure_image_tensor_channels(sd_image_to_tensor(sd_vid_gen_params->end_image), 3);
+                auto window = sd::center_crop_window(static_cast<int>(image.shape()[0]),
+                                                     static_cast<int>(image.shape()[1]),
+                                                     request->width,
+                                                     request->height);
+                end_image   = sd::resize_lanczos_8bit(image, request->width, request->height, window);
+            }
+        }
+
+        if (sd_vid_gen_params->init_image.data && start_image.empty()) {
             start_image = ensure_image_tensor_channels(
                 sd_image_to_tensor(sd_vid_gen_params->init_image, request->width, request->height),
                 sd->get_image_channels());
         }
 
-        if (sd_vid_gen_params->end_image.data) {
+        if (sd_vid_gen_params->end_image.data && end_image.empty()) {
             end_image = ensure_image_tensor_channels(
                 sd_image_to_tensor(sd_vid_gen_params->end_image, request->width, request->height),
                 sd->get_image_channels());
@@ -572,12 +598,11 @@ namespace sd::pipeline {
                 return true;
             };
 
+            // Reference pictures and video frames go through Pillow's 8-bit Lanczos, as in the reference nodes.
             auto resize_reference = [&](const sd::Tensor<float>& image,
                                         int width,
                                         int height) {
-                return sd::ops::interpolate(
-                    image,
-                    std::vector<int64_t>{width, height, image.shape()[2], image.shape()[3]});
+                return sd::resize_lanczos_8bit(image, width, height);
             };
 
             auto encode_reference_audio = [&](const sd_audio_t& audio,
@@ -683,11 +708,12 @@ namespace sd::pipeline {
                         nominal_w *= scale;
                         nominal_h *= scale;
                     }
-                    int width  = std::max(32, static_cast<int>(std::round(nominal_w / 32.0)) * 32);
-                    int height = std::max(32, static_cast<int>(std::round(nominal_h / 32.0)) * 32);
+                    // Halves round to even, as the reference's round() does.
+                    int width  = std::max(32, static_cast<int>(std::nearbyint(nominal_w / 32.0)) * 32);
+                    int height = std::max(32, static_cast<int>(std::nearbyint(nominal_h / 32.0)) * 32);
                     if (source_w * source_h < width * height) {
-                        width  = std::max(32, static_cast<int>(std::round(source_w / 32.0)) * 32);
-                        height = std::max(32, static_cast<int>(std::round(source_h / 32.0)) * 32);
+                        width  = std::max(32, static_cast<int>(std::nearbyint(source_w / 32.0)) * 32);
+                        height = std::max(32, static_cast<int>(std::nearbyint(source_h / 32.0)) * 32);
                     }
 
                     sd::Tensor<float> video({width, height, normalized_frames, 3, 1});
@@ -1852,8 +1878,18 @@ namespace sd::pipeline {
         sd->apply_circular_axes(sd_vid_gen_params->circular_x, sd_vid_gen_params->circular_y);
         sd::ImagePreprocessor preprocessing(sd_vid_gen_params->image_preprocess.rules);
         sd_vid_gen_params_t processed_params = *sd_vid_gen_params;
+        // MiniMax-H3 keyframes keep their pixels here and take the reference geometry later, unless rules are set.
+        const bool h3_keyframes = uses_minimax_h3_keyframe_geometry(sd, sd_vid_gen_params);
+        if (h3_keyframes) {
+            processed_params.init_image = sd_image_t{};
+            processed_params.end_image  = sd_image_t{};
+        }
         if (!preprocessing.prepare_inputs(processed_params, request.width, request.height))
             return false;
+        if (h3_keyframes) {
+            processed_params.init_image = sd_vid_gen_params->init_image;
+            processed_params.end_image  = sd_vid_gen_params->end_image;
+        }
         sd_vid_gen_params = &processed_params;
         if (fps_out != nullptr) {
             *fps_out = request.fps;
@@ -1923,7 +1959,7 @@ namespace sd::pipeline {
 
         SamplePlan plan(sd, sd_vid_gen_params, request);
         sd->generation_progress.report("preparing", "inputs");
-        auto latent_inputs_opt = prepare_video_generation_latents(sd, sd_vid_gen_params, &request, ref_image_params);
+        auto latent_inputs_opt = prepare_video_generation_latents(sd, sd_vid_gen_params, &request, ref_image_params, h3_keyframes);
         if (!latent_inputs_opt.has_value()) {
             return false;
         }

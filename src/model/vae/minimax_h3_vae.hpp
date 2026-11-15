@@ -933,15 +933,10 @@ namespace MiniMaxH3VAE {
             if (config.patch_size_t == 1) {
                 auto mean   = sd::ops::slice(vae_output, 3, 0, 24);
                 auto logvar = sd::ops::slice(vae_output, 3, 24, 48);
-                auto noise  = MT19937RNG(42).randn(static_cast<uint32_t>(mean.numel()));
+                // The image VAEs condition on the posterior sample at seed 42, kept in float32 as the reference does.
+                auto noise = MT19937RNG(42).randn(static_cast<uint32_t>(mean.numel()));
                 for (int64_t i = 0; i < mean.numel(); ++i) {
                     mean[i] += std::exp(0.5f * std::clamp(logvar[i], -30.f, 20.f)) * noise[i];
-                }
-                if (config.vit_decoder_2d) {
-                    // MiniMax-H3-Image conditions an edit on the posterior sample rounded to float16.
-                    for (int64_t i = 0; i < mean.numel(); ++i) {
-                        mean[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(mean[i]));
-                    }
                 }
                 return mean;
             }
@@ -1315,14 +1310,20 @@ namespace MiniMaxH3VAE {
                 }
             } defer_clamp_guard{defer_clamp_};
             if (input.shape()[2] == 1) {
-                auto decoded = decode_spatial_tiles(n_threads, input, tiling, circular_x, circular_y, silent);
+                // A still latent decodes badly alone, so the video VAE decodes it as a whole chunk of 5 copies and
+                // keeps the first real frame (after the 3 pre-padding frames), as the reference does.
+                const bool video_chunk = config.patch_size_t != 1;
+                auto decoded           = decode_spatial_tiles(n_threads,
+                                                              video_chunk ? repeat_last_frame(input, 4) : input,
+                                                              tiling,
+                                                              circular_x,
+                                                              circular_y,
+                                                              silent);
                 runner_end();
                 clamp_unit(decoded);
                 if (!decoded.empty() && decoded.shape()[2] > 1) {
-                    decoded = sd::ops::slice(decoded,
-                                             2,
-                                             decoded.shape()[2] - 1,
-                                             decoded.shape()[2]);
+                    const int64_t frame = video_chunk ? std::min<int64_t>(3, decoded.shape()[2] - 1) : decoded.shape()[2] - 1;
+                    decoded             = sd::ops::slice(decoded, 2, frame, frame + 1);
                 }
                 return decoded;
             }

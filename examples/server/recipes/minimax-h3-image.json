@@ -28,19 +28,11 @@
   ],
   "defaults": {
     "sampling_method": "euler",
+    "scheduler": "simple",
     "cfg_scale": 1,
     "steps": 6,
-    "width": 1024,
-    "height": 1024,
-    "custom_sigmas": [
-      1.0,
-      0.9675236940383911,
-      0.8875485062599182,
-      0.75,
-      0.5327739119529724,
-      0.23200887441635132,
-      0.0
-    ]
+    "width": 2048,
+    "height": 2048
   },
   "features": [
     "ref_images"
