@@ -16,6 +16,7 @@ namespace sd::pipeline {
     enum sample_method_t default_sample_method(const StableDiffusionGGML* sd);
 
     enum scheduler_t default_scheduler(const StableDiffusionGGML* sd, enum sample_method_t sample_method);
+    int default_sample_steps(const StableDiffusionGGML* sd);
 
     int64_t resolve_seed(int64_t seed);
 

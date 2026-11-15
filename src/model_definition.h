@@ -23,6 +23,9 @@ struct ModelSamplingPolicy {
 
     prediction_t (*prediction_from_weights)(const String2TensorStorage&) = nullptr;
     float (*flow_shift_from_weights)(const String2TensorStorage&)        = nullptr;
+
+    // Steps when the request leaves sample_steps unset (<= 0).
+    int default_sample_steps = 20;
 };
 
 struct ModelGeometry {

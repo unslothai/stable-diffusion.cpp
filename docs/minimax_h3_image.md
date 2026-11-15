@@ -37,10 +37,12 @@ VAE are incompatible. No audio VAE or P-H3 text connector is needed.
 .\bin\Release\sd-cli.exe --diffusion-model ..\models\diffusion_models\minimax_h3_image_pruned_bf16.safetensors --vae ..\models\vae\minimax_h3_image_vae_fp16.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "A silver tabby kitten holding a sign reading 'sd.cpp', natural daylight" --cfg-scale 1.0 --steps 6 --sampling-method euler -v -W 1024 -H 1024 --offload-to-cpu --rng cpu --diffusion-fa --vae-tiling
 ```
 
-Use Euler, CFG 1 and 6 steps. The default scheduler is `simple`, as in the
-reference workflows: at 6 steps it lands within 9e-4 of the model's PDD sigma
-grid. `--scheduler discrete` or `--sigmas minimax-h3-image` samples on the exact
-grid instead. Prompt expansion is not included.
+Use Euler, CFG 1 and 6 steps; without `--steps`, MiniMax-H3-Image runs 6. The
+default scheduler is `simple`, as in the reference workflows: at 6 steps it
+lands within 9e-4 of the model's PDD sigma grid. `--scheduler discrete` or
+`--sigmas minimax-h3-image` samples on the exact grid instead. Without `-W` and
+`-H`, text-to-image renders 2048 × 2048, the reference template's 4 MP square.
+Prompt expansion is not included.
 
 ## Reference-image editing
 
@@ -53,6 +55,11 @@ Add `--ref-image` (or `-r`) for reference-image editing:
 `--ref-image` can be repeated. Reference images are numbered in argument order
 as `<Picture 1>`, `<Picture 2>`, and so on, with up to 16 references supported
 by the model. Prompts are passed through without an automatic editing prefix.
+
+As in the reference edit template, `<Picture 1>` is first scaled to 4 MP (area
+filter) and then to the nearest smaller multiple of 32 on each side (scaled to
+cover it and centre-cropped). Without `-W` and `-H` the output takes that size,
+for example 2720 × 1536 for a 1360 × 768 picture.
 
 Reference images keep their aspect ratio. As in the reference workflows, each
 consumer sizes a reference on its own: the VAE sees it with the short edge

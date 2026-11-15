@@ -11,6 +11,7 @@
 #include "model/vae/vae.hpp"
 #include "model_definition.h"
 #include "runtime/denoiser.hpp"
+#include "runtime/image_preprocess.h"
 
 namespace sd::pipeline {
 
@@ -69,6 +70,13 @@ namespace sd::pipeline {
         return DISCRETE_SCHEDULER;
     }
 
+    int default_sample_steps(const StableDiffusionGGML* sd) {
+        if (const auto* definition = sd ? find_model_definition(sd->version) : nullptr) {
+            return definition->sampling.default_sample_steps;
+        }
+        return 20;
+    }
+
     int64_t resolve_seed(int64_t seed) {
         if (seed >= 0) {
             return seed;
@@ -125,6 +133,20 @@ namespace sd::pipeline {
         negative_prompt             = SAFE_STR(sd_img_gen_params->negative_prompt);
         width                       = sd_img_gen_params->width;
         height                      = sd_img_gen_params->height;
+        if (width <= 0 || height <= 0) {
+            // No size requested. MiniMax-H3-Image follows its reference template: the 4 MP multiple-of-32 scale of
+            // picture 1 for an edit, else 2048 x 2048; every other model keeps 512 x 512.
+            width  = 512;
+            height = 512;
+            if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
+                const auto* ref = sd_img_gen_params->ref_images_count > 0 ? sd_img_gen_params->ref_images : nullptr;
+                const auto size = ref != nullptr && ref->width > 0 && ref->height > 0
+                                      ? sd::scale_total_pixels_to_multiple_size(static_cast<int>(ref->width), static_cast<int>(ref->height), 4.0, 32)
+                                      : std::pair<int, int>{2048, 2048};
+                width           = size.first;
+                height          = size.second;
+            }
+        }
         vae_scale_factor            = sd->get_vae_scale_factor();
         diffusion_model_down_factor = sd->get_diffusion_model_down_factor();
         seed                        = sd_img_gen_params->seed;
@@ -396,6 +418,9 @@ namespace sd::pipeline {
         sample_params.shifted_timestep = shifted_timestep;
         sample_params.sample_method    = resolve_sample_method(sd, sample_params.sample_method);
         sample_params.scheduler        = resolve_scheduler(sd, sample_params.scheduler, sample_params.sample_method);
+        if (sample_params.sample_steps <= 0) {
+            sample_params.sample_steps = default_sample_steps(sd);
+        }
         sample_params.eta              = resolve_eta(sd, sample_params.eta, sample_params.sample_method);
         if (frames > 0) {
             high_noise_sample_params.guidance      = high_noise_guidance;

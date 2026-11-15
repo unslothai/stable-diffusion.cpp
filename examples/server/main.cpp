@@ -66,6 +66,10 @@ static void parse_args(int argc,
     if (random_seed_requested) {
         default_gen_params.seed = -1;
     }
+    // The server keeps advertising 20 steps by default; recipes carry the per-model step counts.
+    if (default_gen_params.sample_params.sample_steps <= 0) {
+        default_gen_params.sample_params.sample_steps = 20;
+    }
 }
 
 void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {

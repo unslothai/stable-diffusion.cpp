@@ -1102,6 +1102,8 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t() {
 SDGenerationParams::SDGenerationParams() {
     sd_sample_params_init(&sample_params);
     sd_sample_params_init(&high_noise_sample_params);
+    // Unset: the library uses the model's own step count (20 for most models).
+    sample_params.sample_steps = -1;
 }
 
 ArgOptions SDGenerationParams::get_options() {
@@ -1221,15 +1223,15 @@ ArgOptions SDGenerationParams::get_options() {
     options.int_options = {
         {"-H",
          "--height",
-         "image height, in pixel space (default: 512)",
+         "image height, in pixel space (default: 512; MiniMax-H3-Image: 2048, or the edit picture's 4 MP size)",
          &height},
         {"-W",
          "--width",
-         "image width, in pixel space (default: 512)",
+         "image width, in pixel space (default: 512; MiniMax-H3-Image: 2048, or the edit picture's 4 MP size)",
          &width},
         {"",
          "--steps",
-         "number of sample steps (default: 20)",
+         "number of sample steps (default: the model's, 20 for most; 6 for MiniMax-H3-Image)",
          &sample_params.sample_steps},
         {"",
          "--high-noise-steps",
@@ -2709,7 +2711,9 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
 
     if (strict) {
         batch_count                = std::clamp(batch_count, 1, 8);
-        sample_params.sample_steps = std::clamp(sample_params.sample_steps, 1, 100);
+        if (sample_params.sample_steps > 0) {
+            sample_params.sample_steps = std::clamp(sample_params.sample_steps, 1, 100);
+        }
     }
 
     resolved_control_type = SD_CONTROL_TYPE_NONE;
@@ -2767,8 +2771,8 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
-    if (sample_params.sample_steps <= 0) {
-        LOG_ERROR("error: the sample_steps must be greater than 0\n");
+    if (sample_params.sample_steps == 0 || sample_params.sample_steps < -1) {
+        LOG_ERROR("error: the sample_steps must be greater than 0 (or -1 for the model's default)\n");
         return false;
     }
 
@@ -2962,8 +2966,9 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.ref_images_count    = static_cast<int>(ref_image_views.size());
     params.ref_image_args      = ref_image_args.c_str();
     params.mask_image          = mask_image.get();
-    params.width               = get_resolved_width();
-    params.height              = get_resolved_height();
+    // Neither side set: -1 lets the library pick the model's default size (512 x 512 for most models).
+    params.width               = width > 0 || height > 0 ? get_resolved_width() : -1;
+    params.height              = width > 0 || height > 0 ? get_resolved_height() : -1;
     params.sample_params       = sample_params;
     params.strength            = strength;
     params.seed                = seed;
