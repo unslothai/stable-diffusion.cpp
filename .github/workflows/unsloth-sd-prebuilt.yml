@@ -1158,6 +1158,8 @@ jobs:
           Write-Host "i8mm reported: $i8mm; picked: $($picks['auto']) (want $want), with GGML_CPU_ARM_NO_I8MM=1: $($picks['no_i8mm'])"
           if ($picks['auto'] -ne $want) { Write-Host "::error::picked CPU variant '$($picks['auto'])', want $want"; exit 1 }
           if ($picks['no_i8mm'] -ne 'armv8.2_2') { Write-Host "::error::without i8mm the pick is '$($picks['no_i8mm'])', want armv8.2_2"; exit 1 }
+          # sd-cli exits 1 at the missing model, which would otherwise become the step's exit code.
+          exit 0
 
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
