@@ -1,0 +1,597 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index ddf63619..58e81275 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1665,6 +1665,10 @@ UseGgmlGemm1:;
+         char *        work  = (char *) params->wdata + GGML_PAD(nbw1*n, 64) + ggml_tiled_wdata_size(params->nth, dst);
+         work = (char *) GGML_PAD((uintptr_t) work, 64);
+         ggml_cpu_legacy_q8_prepare(src0->type, ne00, n, params->wdata, work, ith, nth);
++        // the compute call hands its row chunks out through the chunk counter, from nth on
++        if (ith == 0) {
++            ggml_threadpool_chunk_set(params->threadpool, nth);
++        }
+         ggml_barrier(params->threadpool);
+         ggml_cpu_legacy_q8_compute(params, src0->type, ne00, ne01, n, src0->data, nb01, params->wdata, work,
+                                    (float *) dst->data, nb1/sizeof(float), ith, nth);
+@@ -1701,6 +1705,9 @@ UseGgmlGemm2:;
+         const int64_t r3i = ne13 / ne03;
+         const bool   in_place = src1->type == vec_dot_type;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++        // one matrix: its chunks come from the chunk counter (at nth since the barrier above); a batch of matrices
++        // keeps the fixed split, as the counter is not reset between them
++        struct ggml_threadpool * steal_tp = ne12*ne13 == 1 ? params->threadpool : NULL;
+         for (int64_t i13 = 0; i13 < ne13; i13++) {
+             for (int64_t i12 = 0; i12 < ne12; i12++) {
+                 const char * b = in_place ? (const char *) src1->data + i12*nb12 + i13*nb13
+@@ -1709,7 +1716,7 @@ UseGgmlGemm2:;
+                                      (const char *) src0->data + i12/r2i*nb02 + i13/r3i*nb03, nb01,
+                                      b, in_place ? nb11 : row_size,
+                                      (float *) ((char *) dst->data + i12*nb2 + i13*nb3), nb1/sizeof(float),
+-                                     ith, nth);
++                                     ith, nth, steal_tp);
+             }
+         }
+         return;
+diff --git a/src/ggml-cpu/iqk/iqk_gemm.cpp b/src/ggml-cpu/iqk/iqk_gemm.cpp
+index 6259c34a..2a780a2b 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm.cpp
++++ b/src/ggml-cpu/iqk/iqk_gemm.cpp
+@@ -162,6 +162,36 @@ void iqk_split_units_and_columns(int nunit, int nrow, int Ny, int max_units, int
+         }
+     }
+ }
++
++// Unsloth: the same units and columns handed out in chunks through the threadpool's chunk counter (at nth on entry)
++// instead of one fixed range per thread, so a thread on a busy or slower core no longer holds the op up by its
++// share. A chunk is up to max_units units with all columns; only when that leaves fewer than 4 chunks per thread are
++// the columns split too, in blocks of 8. Each unit is converted and multiplied the same way whichever thread takes
++// it, so the output is unchanged.
++template <typename Work>
++void iqk_steal_units_and_columns(ggml_threadpool * tp, int nunit, int nrow, int Ny, int max_units, int ith, int nth,
++                                 const Work & work) {
++    constexpr int k_y_blk = 8;
++    const int64_t nxb = (nunit + max_units - 1)/max_units;
++    const int64_t nyb = (Ny + k_y_blk - 1)/k_y_blk;
++    int64_t nyc = 1;
++    while (nxb*nyc < 4*(int64_t) nth && nyc < nyb) {
++        nyc *= 2;
++    }
++    if (nyc > nyb) nyc = nyb;
++    const int64_t nchunk = nxb*nyc;
++    for (int64_t c = ith; c < nchunk; c = ggml_threadpool_chunk_add(tp, 1)) {
++        const int64_t xb = c/nyc;
++        const int64_t yb = c - xb*nyc;
++        const int u0 = (int) (xb*max_units);
++        const int nu = std::min(max_units, nunit - u0);
++        const int y0 = (int) ((yb*nyb/nyc)*k_y_blk);
++        const int y1 = (int) std::min<int64_t>(Ny, ((yb + 1)*nyb/nyc)*k_y_blk);
++        if (y1 > y0) {
++            work(u0*nrow, nu*nrow, y0, y1);
++        }
++    }
++}
+ #endif
+ 
+ #endif // IQK_IMPLEMENT
+@@ -266,7 +296,7 @@ void ggml_cpu_iqk_set_types(uint64_t mask) {
+ 
+ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+                           const void * A, size_t stride_A, const void * B, size_t stride_B,
+-                          float * C, size_t stride_C, int ith, int nth) {
++                          float * C, size_t stride_C, int ith, int nth, struct ggml_threadpool * tp) {
+ #ifdef IQK_IMPLEMENT
+     if (ne00 % QK_K != 0 || Nx <= 0 || Ny <= 0 || Nx > INT32_MAX || Ny > INT32_MAX || ne00 > INT32_MAX) {
+         return false;
+@@ -289,8 +319,7 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+         const size_t row_size_qx = (size_t) (ne00/QK_K) * sizeof(block_q8_k_r8) / k_rows;
+         thread_local std::vector<char> f;
+         bool ok = true;
+-        iqk_split_units_and_columns((int) Nx/k_rows, k_rows, (int) Ny, k_x_step/k_rows, ith, nth,
+-                [&](int ix, int nrc_x, int first_y, int last_y) {
++        auto work = [&](int ix, int nrc_x, int first_y, int last_y) {
+             if (!ok) return;
+             if (f.size() < row_size_qx*nrc_x) f.resize(row_size_qx*nrc_x);
+             if (!iqk_convert_q8_k_r8(type, (int) ne00, (const char *) A + ix*stride_A, stride_A, f.data(), nrc_x)) {
+@@ -298,7 +327,12 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+             }
+             DataInfo info{C + ix, (const char *) B, stride_C, stride_B, first_y};
+             iqk_mul_mat_NxM(funcs, (int) ne00, f.data(), row_size_qx, info, nrc_x, last_y);
+-        });
++        };
++        if (tp != NULL) {
++            iqk_steal_units_and_columns(tp, (int) Nx/k_rows, k_rows, (int) Ny, k_x_step/k_rows, ith, nth, work);
++        } else {
++            iqk_split_units_and_columns((int) Nx/k_rows, k_rows, (int) Ny, k_x_step/k_rows, ith, nth, work);
++        }
+         GGML_ASSERT(ok);
+         return true;
+     }
+@@ -318,14 +352,16 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+     // Tiles of rows x activation columns: the rows are split over the threads first (each thread then walks all
+     // columns of its row range, 64 rows x up to 8 columns per kernel call); with fewer than 16 rows per thread the
+     // columns are split too.
++    // With tp (chunk counter at nth) the grid aims at 4 tiles per thread, taken in turn from the counter.
+     const int nx = (int) Nx;
+     const int ny = (int) Ny;
+-    int ntile_x = nth < nx/16 ? nth : (nx/16 > 0 ? nx/16 : 1);
+-    int ntile_y = nth/ntile_x;
++    const int want = tp != NULL ? 4*nth : nth;
++    int ntile_x = want < nx/16 ? want : (nx/16 > 0 ? nx/16 : 1);
++    int ntile_y = want/ntile_x;
+     if (ntile_y > (ny + 7)/8) ntile_y = (ny + 7)/8;
+     if (ntile_y < 1) ntile_y = 1;
+     const int ntile = ntile_x*ntile_y;
+-    for (int itile = ith; itile < ntile; itile += nth) {
++    for (int itile = ith; itile < ntile; itile = tp != NULL ? ggml_threadpool_chunk_add(tp, 1) : itile + nth) {
+         const int jx = itile % ntile_x;
+         const int jy = itile / ntile_x;
+         const int ix0 = (int)((int64_t) jx      * nx / ntile_x);
+@@ -341,7 +377,7 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+     return true;
+ #else
+     (void) type; (void) Nx; (void) Ny; (void) ne00; (void) A; (void) stride_A; (void) B; (void) stride_B;
+-    (void) C; (void) stride_C; (void) ith; (void) nth;
++    (void) C; (void) stride_C; (void) ith; (void) nth; (void) tp;
+     return false;
+ #endif
+ }
+diff --git a/src/ggml-cpu/iqk/iqk_gemm.h b/src/ggml-cpu/iqk/iqk_gemm.h
+index a36b5d7d..9ecc3777 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm.h
++++ b/src/ggml-cpu/iqk/iqk_gemm.h
+@@ -31,9 +31,13 @@ int ggml_cpu_iqk_mode(int type, int64_t ne11);
+ // C[iy*stride_C + ix] = dot(A row ix, B row iy) for ix < Nx, iy < Ny; A rows of type `type` (stride_A bytes),
+ // B rows are Q8_K (stride_B bytes), ne00 % 256 == 0. The work is split over the nth threads by ith.
+ // Returns false (computing nothing) if the type is not handled.
++struct ggml_threadpool;
++
++// tp != NULL: the work is handed out through tp's chunk counter, which must be at nth (set before a barrier);
++// tp == NULL: a fixed share per thread
+ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+                           const void * A, size_t stride_A, const void * B, size_t stride_B,
+-                          float * C, size_t stride_C, int ith, int nth);
++                          float * C, size_t stride_C, int ith, int nth, struct ggml_threadpool * tp);
+ 
+ // test hooks (reached through the CPU backend's get_proc_address): number of mul_mat ops computed by
+ // these kernels per weight type, and an override of the enabled type mask (bit = ggml type)
+diff --git a/src/ggml-cpu/legacy-q8.cpp b/src/ggml-cpu/legacy-q8.cpp
+index 06e1065a..6ebe117d 100644
+--- a/src/ggml-cpu/legacy-q8.cpp
++++ b/src/ggml-cpu/legacy-q8.cpp
+@@ -52,6 +52,24 @@ namespace {
+ constexpr int64_t k_min_rows  = 32;  // activation rows (batch); below this the master path is kept
+ constexpr int     k_chunk     = 64;  // weight rows converted per step (multiple of 4)
+ 
++// Unsloth: weight rows in chunks of up to max_rows (halved, never below 4, until there are 4 chunks per thread),
++// handed out through the threadpool's chunk counter like the tiled path: a thread on a busy or slower core no longer
++// holds the op up by a fixed band. ggml_compute_forward_mul_mat sets the counter to nth before the barrier that
++// precedes the compute call. A chunk starts at a multiple of 4 rows, and every 4-row group is computed the same way
++// whichever thread takes it, so the output is unchanged.
++template <typename F>
++void for_row_chunks(const struct ggml_compute_params * params, int64_t nrows, int64_t max_rows, int ith, int nth, F && f) {
++    int64_t rows = max_rows;
++    while (rows > 4 && (nrows + rows - 1)/rows < 4*(int64_t) nth) {
++        rows /= 2;
++    }
++    const int64_t nchunk = (nrows + rows - 1)/rows;
++    for (int64_t c = ith; c < nchunk; c = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++        const int64_t r0 = c*rows;
++        f(r0, r0 + rows < nrows ? r0 + rows : nrows);
++    }
++}
++
+ uint64_t g_types = 0;
+ bool g_convert_off = false;  // GGML_CPU_LEGACY_CONVERT=0: master path for every legacy type (tiled included)
+ int g_debug = 0;
+@@ -441,17 +459,13 @@ void lqt_prepare(int type, int64_t ne00, int64_t n, const void * act, void * wor
+     }
+ }
+ 
+-void lqt_compute(int type, int64_t ne00, int64_t ne01, int64_t n, const void * w, size_t w_stride, const void * work,
+-                 float * dst, int64_t dst_stride, int ith, int nth) {
++void lqt_compute(const struct ggml_compute_params * params, int type, int64_t ne00, int64_t ne01, int64_t n, const void * w,
++                 size_t w_stride, const void * work, float * dst, int64_t dst_stride, int ith, int nth) {
+     const int nb = (int) (ne00 / QK8_0);
+     const int64_t ng = (n + k_lqt_cols - 1) / k_lqt_cols;
+     const lqt_ablk * A = (const lqt_ablk *) GGML_PAD((uintptr_t) work, 64);
+     const lqt_kernel_t kern = lqt_pick(type);
+ 
+-    const int64_t nband = ne01 / k_lqt_rows;
+-    const int64_t r_begin = k_lqt_rows*(nband*ith/nth);
+-    const int64_t r_end   = k_lqt_rows*(nband*(ith + 1)/nth);
+-
+     const size_t wrow  = (size_t) nb * QK8_0;
+     const size_t q_sz  = GGML_PAD(wrow * k_lqt_chunk, 64);
+     const size_t dm_sz = GGML_PAD((size_t) nb * k_lqt_chunk * sizeof(float), 64);
+@@ -464,8 +478,9 @@ void lqt_compute(int type, int64_t ne00, int64_t ne01, int64_t n, const void * w
+     float   * m = (float *) ((uint8_t *) d + dm_sz);
+     alignas(32) float out[k_lqt_rows * k_lqt_cols];
+ 
+-    for (int64_t r0 = r_begin; r0 < r_end; r0 += k_lqt_chunk) {
+-        const int nr = (int) (r_end - r0 < k_lqt_chunk ? r_end - r0 : k_lqt_chunk);
++    static_assert(k_lqt_rows == 4, "for_row_chunks keeps 4-row groups");
++    for_row_chunks(params, ne01, k_lqt_chunk, ith, nth, [&](int64_t r0, int64_t r1) {
++        const int nr = (int) (r1 - r0);
+         for (int r = 0; r < nr; ++r) {
+             lqt_unpack_row(type, (const uint8_t *) w + (r0 + r)*w_stride, nb, q + r*wrow, d + (size_t) r*nb, m + (size_t) r*nb);
+         }
+@@ -479,7 +494,7 @@ void lqt_compute(int type, int64_t ne00, int64_t ne01, int64_t n, const void * w
+                 }
+             }
+         }
+-    }
++    });
+ }
+ #endif // x86 && __AVX2__
+ 
+@@ -599,7 +614,7 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+             fprintf(stderr, "ggml-cpu legacy q8 gemm: first %s mul_mat (%lld x %lld x %lld, %d threads, tiled)\n",
+                     ggml_type_name((enum ggml_type) type), (long long) ne01, (long long) n, (long long) ne00, nth);
+         }
+-        lqt_compute(type, ne00, ne01, n, w, w_stride, work, dst, dst_stride, ith, nth);
++        lqt_compute(params, type, ne00, ne01, n, w, w_stride, work, dst, dst_stride, ith, nth);
+         return;
+     }
+ #endif
+@@ -613,10 +628,6 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+                 (long long) ne01, (long long) n, (long long) ne00, nth);
+     }
+ 
+-    const int64_t ng = ne01 / 4;
+-    const int64_t r_begin = 4*(ng*ith/nth);
+-    const int64_t r_end   = 4*(ng*(ith + 1)/nth);
+-
+ #if defined(LQ8_ARM)
+     const size_t conv_size = (size_t) (k_chunk/4) * nb * sizeof(block_q8_0x4);
+ #else
+@@ -630,8 +641,8 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+     uint8_t * conv = buf.data();
+     float   * mt   = (float *) (buf.data() + mt_off);
+ 
+-    for (int64_t r0 = r_begin; r0 < r_end; r0 += k_chunk) {
+-        const int nr = (int) (r_end - r0 < k_chunk ? r_end - r0 : k_chunk);
++    for_row_chunks(params, ne01, k_chunk, ith, nth, [&](int64_t r0, int64_t r1) {
++        const int nr = (int) (r1 - r0);
+         int8_t v[4][QK8_0];
+         for (int g = 0; g < nr/4; ++g) {
+             for (int b = 0; b < nb; ++b) {
+@@ -695,8 +706,7 @@ void ggml_cpu_legacy_q8_compute(const struct ggml_compute_params * params, int t
+         GGML_UNUSED(act); GGML_UNUSED(dst); GGML_UNUSED(dst_stride); GGML_UNUSED(s);
+         GGML_ABORT("legacy q8 path without a kernel on this build");  // unreachable: applies() is false here
+ #endif
+-    }
+-    (void) params;
++    });
+ }
+ 
+ } // extern "C"
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 1f0cb908..056da9ce 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -1312,6 +1312,60 @@ class tinyBLAS_RVV {
+ //////////////////////////////////////////////////////////////////////////////////////////
+ // QUANT ZERO MATRIX MULTIPLICATION
+ 
++// Unsloth: the tiles of one quant gemm call handed out in chunks through the threadpool's chunk counter (as the
++// tiled path and tinyBLAS::gemm above do) instead of one fixed range per thread, so a thread on a busy or slower
++// core (an E-core, a noisy VM) no longer holds the whole op up by its share. Every thread sees the same tile grid
++// and a tile is computed the same way whichever thread takes it, so the output is unchanged. A single-threaded
++// call (legacy-q8 passes nth = 1) and a call with fewer than two tiles per thread keep the fixed ranges.
++class sgemm_tiles {
++  public:
++    sgemm_tiles(ggml_threadpool * tp, int ith, int nth, int64_t tiles) : tp(tp), tiles(tiles) {
++        steal = tp != nullptr && nth > 1 && tiles >= 2 * (int64_t) nth;
++        if (!steal) {
++            const int64_t duty = (tiles + nth - 1) / nth;
++            cur = duty * ith;
++            end = cur + duty < tiles ? cur + duty : tiles;
++            return;
++        }
++        const int64_t nchunk_max = 16 * (int64_t) nth;
++        size = (tiles + nchunk_max - 1) / nchunk_max;
++        nchunk = (tiles + size - 1) / size;
++        if (ith == 0) {
++            ggml_threadpool_chunk_set(tp, nth);
++        }
++        ggml_barrier(tp);
++        take(ith);
++    }
++    ~sgemm_tiles() {
++        if (steal) {
++            ggml_barrier(tp);  // nobody reads the counter once the next call resets it
++        }
++    }
++    bool next(int64_t & job) {
++        if (cur >= end) {
++            if (!steal) {
++                return false;
++            }
++            take(ggml_threadpool_chunk_add(tp, 1));
++            if (cur >= end) {
++                return false;
++            }
++        }
++        job = cur++;
++        return true;
++    }
++
++  private:
++    void take(int64_t c) {
++        cur = c < nchunk ? c * size : tiles;
++        end = cur + size < tiles ? cur + size : tiles;
++    }
++    ggml_threadpool * tp;
++    int64_t tiles;
++    bool steal = false;
++    int64_t size = 0, nchunk = 0, cur = 0, end = 0;
++};
++
+ #if defined(__ARM_FEATURE_DOTPROD)
+ // bit 4 of the 16 Q5_0 / Q5_1 codes of one half block (half 0: codes 0..15, half 1: codes 16..31) as 0x10 bytes
+ static inline uint8x16_t q5_high_bits(const uint8_t *qh, int half) {
+@@ -1331,8 +1385,8 @@ class tinyBLAS_Q0_ARM {
+                     const TA *A, int64_t lda,
+                     const block_q8_0 *B, int64_t ldb,
+                     float *C, int64_t ldc,
+-                    int ith, int nth)
+-        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++                    int ith, int nth, ggml_threadpool * tp = nullptr)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), tp(tp) {
+     }
+ 
+     void matmul(int64_t m, int64_t n) {
+@@ -1402,12 +1456,8 @@ class tinyBLAS_Q0_ARM {
+         int64_t ytiles = (m - m0) / RM;
+         int64_t xtiles = (n - n0) / RN;
+         int64_t tiles = xtiles * ytiles;
+-        int64_t duty = (tiles + nth - 1) / nth;
+-        int64_t start = duty * ith;
+-        int64_t end = start + duty;
+-        if (end > tiles)
+-            end = tiles;
+-        for (int64_t job = start; job < end; ++job) {
++        sgemm_tiles tiles_of_call(tp, ith, nth, tiles);
++        for (int64_t job; tiles_of_call.next(job); ) {
+             int64_t ii = m0 + job / xtiles * RM;
+             int64_t jj = n0 + job % xtiles * RN;
+             float32x4_t Cv[RN][RM] = {};
+@@ -1457,6 +1507,7 @@ class tinyBLAS_Q0_ARM {
+     const int64_t ldc;
+     const int ith;
+     const int nth;
++    ggml_threadpool * const tp;
+ };
+ 
+ // Q5_0 x Q8_0 and Q4_1 / Q5_1 x Q8_1: per block the int8 dot of the weight codes with the activations (vdotq, the
+@@ -1472,8 +1523,8 @@ class tinyBLAS_QX_ARM {
+                     const TA *A, int64_t lda,
+                     const TB *B, int64_t ldb,
+                     float *C, int64_t ldc,
+-                    int ith, int nth)
+-        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++                    int ith, int nth, ggml_threadpool * tp = nullptr)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), tp(tp) {
+     }
+ 
+     void matmul(int64_t m, int64_t n) {
+@@ -1513,12 +1564,8 @@ class tinyBLAS_QX_ARM {
+         int64_t ytiles = (m - m0) / RM;
+         int64_t xtiles = (n - n0) / RN;
+         int64_t tiles = xtiles * ytiles;
+-        int64_t duty = (tiles + nth - 1) / nth;
+-        int64_t start = duty * ith;
+-        int64_t end = start + duty;
+-        if (end > tiles)
+-            end = tiles;
+-        for (int64_t job = start; job < end; ++job) {
++        sgemm_tiles tiles_of_call(tp, ith, nth, tiles);
++        for (int64_t job; tiles_of_call.next(job); ) {
+             int64_t ii = m0 + job / xtiles * RM;
+             int64_t jj = n0 + job % xtiles * RN;
+             float32x4_t Cv[RN][RM] = {};
+@@ -1597,6 +1644,7 @@ class tinyBLAS_QX_ARM {
+     const int64_t ldc;
+     const int ith;
+     const int nth;
++    ggml_threadpool * const tp;
+ };
+ #endif // __ARM_FEATURE_DOTPROD
+ 
+@@ -1608,8 +1656,8 @@ class tinyBLAS_Q0_AVX {
+                     const TA *A, int64_t lda,
+                     const TB *B, int64_t ldb,
+                     TC *C, int64_t ldc,
+-                    int ith, int nth)
+-        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++                    int ith, int nth, ggml_threadpool * tp = nullptr)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), tp(tp) {
+         const int8_t kvalues_iq4nl[16] = {
+             -127, -104, -83, -65,
+             -49,  -35,  -22, -10,
+@@ -1777,12 +1825,8 @@ class tinyBLAS_Q0_AVX {
+         int64_t ytiles = (m - m0) / 4;
+         int64_t xtiles = (n - n0) / RN;
+         int64_t tiles = xtiles * ytiles;
+-        int64_t duty = (tiles + nth - 1) / nth;
+-        int64_t start = duty * ith;
+-        int64_t end = start + duty;
+-        if (end > tiles)
+-            end = tiles;
+-        for (int64_t job = start; job < end; ++job) {
++        sgemm_tiles tiles_of_call(tp, ith, nth, tiles);
++        for (int64_t job; tiles_of_call.next(job); ) {
+             int64_t ii = m0 + job / xtiles * 4;
+             int64_t jj = n0 + job % xtiles * RN;
+             __m256 Cv[RN][4] = {};
+@@ -1831,12 +1875,8 @@ class tinyBLAS_Q0_AVX {
+         int64_t ytiles = (m - m0) / RM;
+         int64_t xtiles = (n - n0) / 4;
+         int64_t tiles = xtiles * ytiles;
+-        int64_t duty = (tiles + nth - 1) / nth;
+-        int64_t start = duty * ith;
+-        int64_t end = start + duty;
+-        if (end > tiles)
+-            end = tiles;
+-        for (int64_t job = start; job < end; ++job) {
++        sgemm_tiles tiles_of_call(tp, ith, nth, tiles);
++        for (int64_t job; tiles_of_call.next(job); ) {
+             int64_t ii = m0 + job / xtiles * RM;
+             int64_t jj = n0 + job % xtiles * 4;
+             __m256 Cv[4][RM] = {};
+@@ -1888,12 +1928,8 @@ class tinyBLAS_Q0_AVX {
+         int64_t ytiles = (m - m0) / RM;
+         int64_t xtiles = (n - n0) / RN;
+         int64_t tiles = xtiles * ytiles;
+-        int64_t duty = (tiles + nth - 1) / nth;
+-        int64_t start = duty * ith;
+-        int64_t end = start + duty;
+-        if (end > tiles)
+-            end = tiles;
+-        for (int64_t job = start; job < end; ++job) {
++        sgemm_tiles tiles_of_call(tp, ith, nth, tiles);
++        for (int64_t job; tiles_of_call.next(job); ) {
+             int64_t ii = m0 + job / xtiles * RM;
+             int64_t jj = n0 + job % xtiles * RN;
+             __m256 Cv[RN][RM] = {};
+@@ -2042,6 +2078,7 @@ class tinyBLAS_Q0_AVX {
+     const int64_t ldc;
+     const int ith;
+     const int nth;
++    ggml_threadpool * const tp;
+     __m128i iq4nlt;
+ };
+ #endif // __AVX__
+@@ -2058,8 +2095,8 @@ class tinyBLAS_Q1_AVX {
+                     const TA *A, int64_t lda,
+                     const block_q8_1 *B, int64_t ldb,
+                     float *C, int64_t ldc,
+-                    int ith, int nth)
+-        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++                    int ith, int nth, ggml_threadpool * tp = nullptr)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), tp(tp) {
+     }
+ 
+     void matmul(int64_t m, int64_t n) {
+@@ -2173,12 +2210,8 @@ class tinyBLAS_Q1_AVX {
+         int64_t ytiles = (m - m0) / RM;
+         int64_t xtiles = (n - n0) / RN;
+         int64_t tiles = xtiles * ytiles;
+-        int64_t duty = (tiles + nth - 1) / nth;
+-        int64_t start = duty * ith;
+-        int64_t end = start + duty;
+-        if (end > tiles)
+-            end = tiles;
+-        for (int64_t job = start; job < end; ++job) {
++        sgemm_tiles tiles_of_call(tp, ith, nth, tiles);
++        for (int64_t job; tiles_of_call.next(job); ) {
+             int64_t ii = m0 + job / xtiles * RM;
+             int64_t jj = n0 + job % xtiles * RN;
+             __m256 Cv[RN][RM] = {};
+@@ -2255,6 +2288,7 @@ class tinyBLAS_Q1_AVX {
+     const int64_t ldc;
+     const int ith;
+     const int nth;
++    ggml_threadpool * const tp;
+ };
+ #endif // __AVX2__
+ 
+@@ -4522,7 +4556,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q8_0 *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__ARM_FEATURE_DOTPROD)
+@@ -4530,7 +4564,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q8_0 *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__MMA__)
+@@ -4559,7 +4593,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q4_0 *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__ARM_FEATURE_DOTPROD)
+@@ -4567,7 +4601,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q4_0 *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__MMA__)
+@@ -4596,7 +4630,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q5_0 *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__ARM_FEATURE_DOTPROD)
+@@ -4604,7 +4638,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q5_0 *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #else
+@@ -4620,7 +4654,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q4_1 *)A, lda,
+             (const block_q8_1 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__ARM_FEATURE_DOTPROD)
+@@ -4628,7 +4662,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q4_1 *)A, lda,
+             (const block_q8_1 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #else
+@@ -4644,7 +4678,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q5_1 *)A, lda,
+             (const block_q8_1 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #elif defined(__ARM_FEATURE_DOTPROD)
+@@ -4652,7 +4686,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_q5_1 *)A, lda,
+             (const block_q8_1 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #else
+@@ -4668,7 +4702,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             k, (const block_iq4_nl *)A, lda,
+             (const block_q8_0 *)B, ldb,
+             (float *)C, ldc,
+-            params->ith, params->nth};
++            params->ith, params->nth, params->threadpool};
+         tb.matmul(m, n);
+         return true;
+ #else
