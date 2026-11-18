@@ -89,7 +89,7 @@ namespace WAN {
             // One frame whose causal left pad is all zeros (no cache) meets only the last temporal tap: the
             // other taps multiply the zero frames. That is a 2D conv with w[:, :, kd - 1], kd times fewer
             // FLOPs (first frame of every video chunk 0, every image decode / encode). Backends without
-            // im2col_3d (Metal) otherwise fall back to a much slower direct conv_3d.
+            // im2col_3d otherwise fall back to a much slower direct conv_3d.
             // SD_VAE_FRAME_COLLAPSE=0 keeps the full conv_3d for kernels deeper than one frame.
             static const bool collapse_off = [] {
                 const char* env = getenv("SD_VAE_FRAME_COLLAPSE");

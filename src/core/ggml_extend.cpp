@@ -1,5 +1,6 @@
 #include "core/ggml_extend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -489,6 +490,54 @@ ggml_tensor* ggml_ext_conv_2d(GGMLRunnerContext* runner_ctx,
     return x;
 }
 
+// ggml_conv_3d materialises an [N*OD, OH, OW, IC*KD*KH*KW] im2col buffer: 8 GB for one 3x3x3, 96-channel
+// conv over four 832x480 frames (Wan VAE decode). Above this size the output depth is split into about
+// col_bytes / CONV_3D_IM2COL_SLICE_BYTES slices (at most one per output frame) whose im2col buffers the allocator
+// reuses one after another. Only on Metal, where that buffer competes with the model for unified memory; other
+// backends keep a single im2col.
+static constexpr size_t CONV_3D_IM2COL_SLICE_BYTES = size_t(1) << 30;
+
+static ggml_tensor* conv_3d_im2col_sliced(ggml_context* ctx,
+                                           ggml_backend_t backend,
+                                           ggml_tensor* w,
+                                           ggml_tensor* x,
+                                           int64_t IC,
+                                           int s0,
+                                           int s1,
+                                           int s2,
+                                           int p0,
+                                           int p1,
+                                           int p2,
+                                           int d0,
+                                           int d1,
+                                           int d2) {
+    auto out_size    = [](int64_t in, int64_t k, int s, int p, int d) { return (in + 2 * p - d * (k - 1) - 1) / s + 1; };
+    const int64_t N  = x->ne[3] / IC;
+    const int64_t KD = w->ne[2];
+    const int64_t OW = out_size(x->ne[0], w->ne[0], s0, p0, d0);
+    const int64_t OH = out_size(x->ne[1], w->ne[1], s1, p1, d1);
+    const int64_t OD = out_size(x->ne[2], KD, s2, p2, d2);
+
+    const size_t col_type_size = w->type == GGML_TYPE_BF16 ? sizeof(float) : sizeof(ggml_fp16_t);  // as ggml_conv_3d
+    const size_t col_bytes     = size_t(w->ne[0] * w->ne[1] * KD * IC) * size_t(OW * OH * OD * N) * col_type_size;
+    const int64_t slices       = std::min<int64_t>(OD, int64_t((col_bytes + CONV_3D_IM2COL_SLICE_BYTES - 1) / CONV_3D_IM2COL_SLICE_BYTES));
+    if (slices <= 1 || p2 != 0 || N != 1 || !sd_backend_is(backend, "MTL")) {
+        return ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
+    }
+
+    const int64_t per_slice = (OD + slices - 1) / slices;
+    ggml_tensor* out        = nullptr;
+    for (int64_t od0 = 0; od0 < OD; od0 += per_slice) {
+        const int64_t od_n   = std::min(per_slice, OD - od0);
+        const int64_t frames = (od_n - 1) * s2 + (KD - 1) * d2 + 1;
+        ggml_tensor* slice   = ggml_view_4d(ctx, x, x->ne[0], x->ne[1], frames, x->ne[3],
+                                            x->nb[1], x->nb[2], x->nb[3], size_t(od0 * s2) * x->nb[2]);
+        ggml_tensor* part    = ggml_conv_3d(ctx, w, ggml_cont(ctx, slice), IC, s0, s1, s2, p0, p1, 0, d0, d1, d2);
+        out                  = out == nullptr ? part : ggml_concat(ctx, out, part, 2);
+    }
+    return out;
+}
+
 ggml_tensor* ggml_ext_conv_3d(GGMLRunnerContext* runner_ctx,
                               ggml_tensor* x,
                               ggml_tensor* w,
@@ -537,7 +586,7 @@ ggml_tensor* ggml_ext_conv_3d(GGMLRunnerContext* runner_ctx,
         x          = ggml_cont(ctx, ggml_permute(ctx, x, 0, 1, 3, 2));
         x          = ggml_reshape_4d(ctx, x, im2col->ne[1], im2col->ne[2], OD, OC * N);
     } else {
-        auto convolution = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
+        auto convolution = conv_3d_im2col_sliced(ctx, backend, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
         if (backend != nullptr) {
             // im2col can support large buffers that its reshape/GEMM consumers cannot.
             std::vector<ggml_tensor*> nodes{convolution};
