@@ -925,7 +925,7 @@ jobs:
             runner: windows-2022
             vulkan: "ON"
           # Native arm64 (x64 under emulation is ~5x slower). Two ggml CPU variants picked per host at startup
-          # (ggml-patches/0063): armv8.2_2 (dotprod + fp16, the single build this bundle used to be, so the floor
+          # (ggml-patches/0067): armv8.2_2 (dotprod + fp16, the single build this bundle used to be, so the floor
           # every Windows 11 ARM64 CPU ran) and armv8.6_0 (+ i8mm: Snapdragon X, Cobalt 100).
           - label: win-cpu-arm64
             runner: windows-11-arm
