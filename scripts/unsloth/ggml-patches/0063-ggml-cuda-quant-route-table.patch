@@ -1,0 +1,248 @@
+ggml-cuda: per (architecture, type, rows) table for the dequant + BF16 cuBLAS route; sm75 FP16 prototype
+
+Patch 0016 sent only Q8_0 to dequant + BF16 cuBLAS (sm80 / sm90 / sm100 from 1024 rows, sm120 from 4096) and kept
+every K-quant on MMQ. Measured on sd.cpp renders (FLUX.2 klein 4B, FLUX.3 klein, Z-Image Turbo, Qwen-Image 2.1
+Turbo; steady s/step, 3 interleaved repeats, 512 and 1024 px):
+  A100 (sm80): Q4_K_M / Q5_K_M / Q6_K files 1.90-2.21x faster per step on cuBLAS at 1024 px, 1.67-1.73x at 512 px.
+  RTX PRO 6000 (sm120): Q6_K 1.20x at 1024 px and 1.04-1.12x at 512 px; Q4_K alone 1.015-1.11x and Q5_K alone
+  1.03-1.05x from 4096 rows, both slower below that, so they start at 4096.
+  L4 (sm89): Q6_K 1.04-1.06x at 1024 px; Q4_K / Q5_K tie or lose, Q8_0 loses 5-6%, so only Q6_K moves.
+  LPIPS vs the BF16 / F16 GGUF render of the same seed: mean lower on cuBLAS in most (card, model, type) cells,
+  higher by at most 0.004 (inside the per-seed spread) in the rest.
+The policy moves into src/ggml-cuda/quant-route.h (host-only, checked by scripts/quant_route_table_test.cpp in
+stable-diffusion.cpp). sm86 / sm87 / sm90 / sm100 / sm121 K-quants are unmeasured and keep MMQ; Q8_0 is unchanged
+everywhere.
+
+Env: GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=<rows> still overrides every quantized type (0 = MMQ everywhere);
+GGML_CUDA_QUANT_CUBLAS_TYPES=q4_K,q6_K limits that override to the listed types; GGML_CUDA_QUANT_ROUTE_LOG=1 logs each
+(type, route) the first time it runs. GGML_CUDA_QUANT_CUBLAS_F16=<rows> (off by default) is a Turing prototype:
+dequant to FP16 and cuBLAS with FP16 inputs and FP32 accumulate / output, since sm75 has no BF16 tensor cores
+(T4: 1.05-1.20x per step on FLUX.2 klein 4B and Z-Image Turbo K-quant / Q8_0 files, LPIPS unchanged).
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 118f9d6..6a51e03 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -46,6 +46,7 @@
+ #include "ggml-cuda/pool2d.cuh"
+ #include "ggml-cuda/pool1d.cuh"
+ #include "ggml-cuda/quantize.cuh"
++#include "ggml-cuda/quant-route.h"
+ #include "ggml-cuda/rope.cuh"
+ #include "ggml-cuda/roll.cuh"
+ #include "ggml-cuda/scale.cuh"
+@@ -1808,7 +1809,7 @@ static void ggml_cuda_cublas_f16_epilogue(const half * mm, const ggml_cuda_cubla
+ 
+ template<ggml_type compute_type>
+ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+-                                          const ggml_cuda_cublas_epilogue * epilogue = nullptr) {
++                                          const ggml_cuda_cublas_epilogue * epilogue = nullptr, bool f32_accumulate = false) {
+     using traits = batched_mul_mat_traits<compute_type>;
+     using cuda_t = typename traits::cuda_type;
+ 
+@@ -1911,7 +1912,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        prefer_f32_output = f32_accumulate || cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+@@ -2317,36 +2318,46 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
+ }
+ 
+ // Large-batch matmul with a quantized weight: dequantize the weight to BF16 once and run a cuBLAS
+-// GEMM (FP32 accumulate, FP32 output) instead of MMQ. MMQ quantizes the activations to q8_1 and runs
+-// int8 MMA, which is the right call for LLM prompt sizes, but at diffusion-transformer sizes (10^4
+-// tokens per call) a tensor-core BF16 GEMM is faster on GPUs whose BF16 rate is not far below their
+-// int8 rate, and it is more accurate (activations stay BF16 instead of 8-bit).
+-// GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=<rows>: use the BF16 path when src1 has at least this many rows;
+-// 0 disables it (stock MMQ everywhere); a set value applies to every quantized type. Unset = the default below:
+-// Q8_0 weights only, per architecture; every k-quant and sub-8-bit type keeps MMQ.
++// GEMM (FP32 accumulate, FP32 output) instead of MMQ. The per (architecture, type) row table and the reasons are in
++// quant-route.h.
++// GGML_CUDA_QUANT_CUBLAS_MIN_BATCH=<rows>: use the BF16 path when src1 has at least this many rows, for every
++// quantized type (0 = stock MMQ everywhere); GGML_CUDA_QUANT_CUBLAS_TYPES=q4_K,q6_K limits that override to the
++// listed types (the rest keep the table). GGML_CUDA_QUANT_ROUTE_LOG=1 logs each (type, route) the first time it runs.
+ static int64_t ggml_cuda_quant_cublas_min_batch(int cc, ggml_type type) {
+     static const int64_t env = [] {
+         const char * e = getenv("GGML_CUDA_QUANT_CUBLAS_MIN_BATCH");
+         return e != nullptr ? (int64_t) atoll(e) : (int64_t) -1;
+     }();
+-    if (env >= 0) {
+-        return env;
+-    }
+-    // For Q8_0 the BF16 path is closer to an unquantized render (Z-Image Turbo Q8_0 vs its BF16 weights, B200:
+-    // LPIPS 0.0148 with MMQ, 0.0052 here), since MMQ's q8_1 activations are then the larger error. For 4-bit and
+-    // k-quant weights the weight error dominates and neither path is consistently closer, so they stay on MMQ.
+-    // Ada, consumer Ampere and Orin keep MMQ (their int8 rate is twice their BF16-with-FP32-accumulate rate);
+-    // sm120 gains only from 4096 rows.
+-    if (type != GGML_TYPE_Q8_0) {
+-        return 0;
+-    }
+-    if (cc == GGML_CUDA_CC_AMPERE || (cc >= GGML_CUDA_CC_HOPPER && cc < 1100)) {
+-        return 1024;
++    static const char * env_types = getenv("GGML_CUDA_QUANT_CUBLAS_TYPES");
++    return ggml_cuda_quant_route_min_rows(cc, type, ggml_type_name(type), env, env_types);
++}
++
++// Turing has FP16 but no BF16 tensor cores, so the BF16 route above is refused there. Prototype, off by default:
++// GGML_CUDA_QUANT_CUBLAS_F16=<rows> dequantizes the weight to FP16 and runs cuBLAS with FP16 inputs and FP32
++// accumulation / output (the Volta F16 path) for every quantized type from that many rows on sm75.
++static int64_t ggml_cuda_quant_cublas_f16_min_batch() {
++    static const int64_t env = [] {
++        const char * e = getenv("GGML_CUDA_QUANT_CUBLAS_F16");
++        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 0;
++    }();
++    return env;
++}
++
++static void ggml_cuda_quant_route_log(int cc, ggml_type type, int64_t rows, int64_t min_batch, bool cublas,
++                                      const char * cublas_name = "dequant + BF16 cuBLAS") {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_QUANT_ROUTE_LOG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (!enabled || (int) type < 0 || (int) type >= GGML_TYPE_COUNT) {
++        return;
+     }
+-    if (cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN) {
+-        return 4096;
++    static std::array<std::atomic<bool>, 2 * GGML_TYPE_COUNT> seen{};
++    if (seen[2 * (int) type + (cublas ? 1 : 0)].exchange(true)) {
++        return;
+     }
+-    return 0;
++    GGML_LOG_INFO("ggml_cuda: quant route %s cc %d rows %" PRId64 " (min %" PRId64 ") -> %s\n", ggml_type_name(type), cc,
++                  rows, min_batch, cublas ? cublas_name : "MMQ");
+ }
+ 
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -2409,7 +2420,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     if (ggml_is_quantized(src0->type) && ne11 > MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+             bf16_mma_hardware_available(cc) && ggml_get_to_bf16_cuda(src0->type) != nullptr) {
+         const int64_t min_batch = ggml_cuda_quant_cublas_min_batch(cc, src0->type);
+-        if (min_batch > 0 && ne11*ne12*ne13 >= min_batch) {
++        const bool    use_cublas = min_batch > 0 && ne11*ne12*ne13 >= min_batch;
++        ggml_cuda_quant_route_log(cc, src0->type, ne11*ne12*ne13, min_batch, use_cublas);
++        if (use_cublas) {
+             // GGML_CUDA_QUANT_CUBLAS_TYPE=f32 dequantizes to FP32 instead: slow, for accuracy oracles only.
+             static const bool f32_oracle = [] {
+                 const char * e = getenv("GGML_CUDA_QUANT_CUBLAS_TYPE");
+@@ -2423,6 +2436,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+             return;
+         }
+     }
++    if (ggml_is_quantized(src0->type) && ne11 > MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_NVIDIA(cc) &&
++            cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE && ggml_get_to_fp16_cuda(src0->type) != nullptr) {
++        const int64_t min_batch = ggml_cuda_quant_cublas_f16_min_batch();
++        const bool    use_cublas = min_batch > 0 && ne11*ne12*ne13 >= min_batch;
++        ggml_cuda_quant_route_log(cc, src0->type, ne11*ne12*ne13, min_batch, use_cublas, "dequant + FP16 cuBLAS (FP32 accumulate)");
++        if (use_cublas) {
++            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst, nullptr, /*f32_accumulate =*/ true);
++            return;
++        }
++    }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+diff --git a/src/ggml-cuda/quant-route.h b/src/ggml-cuda/quant-route.h
+new file mode 100644
+index 0000000..2f79504
+--- /dev/null
++++ b/src/ggml-cuda/quant-route.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++// Which large-batch quantized matmuls take dequant + BF16 cuBLAS instead of MMQ, per (architecture, weight type).
++// Host-only and free of CUDA headers so the policy can be checked with a plain C++ compiler
++// (scripts/quant_route_table_test.cpp in stable-diffusion.cpp).
++//
++// MMQ quantizes the activations to q8_1 and runs int8 MMA: the right call at LLM prompt sizes. At diffusion
++// transformer sizes (10^3-10^4 rows per call) a BF16 tensor-core GEMM on the dequantized weight wins where the BF16
++// rate is not far below the int8 rate, and it keeps the activations in BF16.
++//
++// Measured per type on stable-diffusion.cpp renders (FLUX.2 klein 4B, FLUX.3 klein, Z-Image Turbo, Qwen-Image 2.1
++// Turbo; 512 / 768 / 1024 px; steady s/step, 3 interleaved repeats; LPIPS vs the BF16 / F16 GGUF render):
++//   sm80 (A100-40GB):     every K-quant file 1.9-2.2x faster per step on cuBLAS at 1024 px, 1.7-1.8x at 512 px
++//                         (1024-1536 rows); LPIPS vs BF16 equal or lower.
++//   sm120 (RTX PRO 6000): Q6_K 1.20-1.22x at 1024 px and 1.10-1.18x at 1024-2800 rows; Q4_K alone 1.015-1.11x
++//                         and Q5_K alone 1.03-1.05x at >= 4096 rows, both slower below that; Q8_0 within +-2.5%,
++//                         kept at 4096 as patch 0016.
++//   sm89 (L4):            Q6_K 1.04-1.06x at 1024 px; Q4_K / Q5_K alone tie or lose up to 3%, Q8_0 loses 5-6%.
++//   sm75 (T4): no BF16 tensor cores, MMQ. sm86, sm87, sm90, sm100, sm121: not measured for K-quants.
++// Rows = src1 rows (ne11 * ne12 * ne13). A type missing from the table keeps MMQ.
++
++#include "ggml.h"
++
++#include <cstdint>
++
++struct ggml_cuda_quant_route_rule {
++    int       cc_min;    // ggml-cuda compute capability (100 * major + 10 * minor), inclusive
++    int       cc_max;    // exclusive
++    ggml_type type;
++    int64_t   min_rows;  // use dequant + BF16 cuBLAS from this many src1 rows; 0 = MMQ
++};
++
++static constexpr ggml_cuda_quant_route_rule ggml_cuda_quant_route_table[] = {
++    // A100 (sm80 only: consumer Ampere / Orin int8 is twice their BF16-with-FP32-accumulate rate)
++    {  800,  810, GGML_TYPE_Q8_0, 1024 },
++    {  800,  810, GGML_TYPE_Q4_K, 1024 },
++    {  800,  810, GGML_TYPE_Q5_K, 1024 },
++    {  800,  810, GGML_TYPE_Q6_K, 1024 },
++    // Ada (sm89, measured on an L4): Q6_K only; Q4_K / Q5_K / Q8_0 tie or lose on cuBLAS there
++    {  890,  900, GGML_TYPE_Q6_K, 4096 },
++    // Hopper and datacenter Blackwell (sm90 / sm100 / sm103): Q8_0 only, as patch 0016
++    {  900, 1100, GGML_TYPE_Q8_0, 1024 },
++    // Blackwell workstation / consumer: Q8_0 on sm120 and sm121 as patch 0016; the K-quants on sm120 only
++    // (measured on an RTX PRO 6000; GB10 / sm121 has a fraction of the memory bandwidth the dequant pass needs).
++    { 1200, 1300, GGML_TYPE_Q8_0, 4096 },
++    { 1200, 1210, GGML_TYPE_Q4_K, 4096 },
++    { 1200, 1210, GGML_TYPE_Q5_K, 4096 },
++    { 1200, 1210, GGML_TYPE_Q6_K, 1024 },
++};
++
++// Default rows from which (cc, type) leaves MMQ for dequant + BF16 cuBLAS; 0 keeps MMQ.
++static inline int64_t ggml_cuda_quant_route_default_min_rows(int cc, ggml_type type) {
++    for (const ggml_cuda_quant_route_rule & r : ggml_cuda_quant_route_table) {
++        if (cc >= r.cc_min && cc < r.cc_max && r.type == type) {
++            return r.min_rows;
++        }
++    }
++    return 0;
++}
++
++// Resolve the policy with the environment overrides applied:
++//   env_min_batch  GGML_CUDA_QUANT_CUBLAS_MIN_BATCH (-1 = unset): rows for every quantized type, 0 = MMQ everywhere
++//   env_types      GGML_CUDA_QUANT_CUBLAS_TYPES (nullptr = unset): comma list of type names (ggml_type_name, e.g.
++//                  "q4_K,q6_K") the MIN_BATCH override applies to; other types keep the table default
++// type_name is ggml_type_name(type), passed in so this header does not need the ggml library.
++static inline int64_t ggml_cuda_quant_route_min_rows(int cc, ggml_type type, const char * type_name,
++                                                     int64_t env_min_batch, const char * env_types) {
++    if (env_min_batch < 0) {
++        return ggml_cuda_quant_route_default_min_rows(cc, type);
++    }
++    if (env_types == nullptr || type_name == nullptr) {
++        return env_min_batch;
++    }
++    // exact, case-sensitive match of one comma-separated entry
++    const char * p = env_types;
++    while (*p != '\0') {
++        const char * e = p;
++        while (*e != '\0' && *e != ',') {
++            e++;
++        }
++        const char * n = type_name;
++        const char * q = p;
++        while (q < e && *n != '\0' && *q == *n) {
++            q++;
++            n++;
++        }
++        if (q == e && *n == '\0' && e > p) {
++            return env_min_batch;
++        }
++        p = *e == ',' ? e + 1 : e;
++    }
++    return ggml_cuda_quant_route_default_min_rows(cc, type);
++}
