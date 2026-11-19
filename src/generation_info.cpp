@@ -287,6 +287,7 @@ void free_sd_image_generation_result(sd_image_generation_result_t* result) {
     for (int i = 0; i < result->count; ++i) {
         free(result->items[i].image.data);
         free(result->items[i].generation_info);
+        free(result->items[i].latent);
     }
     free(result->items);
     free(result);

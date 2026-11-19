@@ -1377,6 +1377,14 @@ HTTP-only output fields:
 | --- | --- |
 | `output_format` | `string` |
 | `output_compression` | `integer` |
+| `output_latent` | `boolean` |
+
+`output_latent: true` skips the VAE decode: each result item carries the final denoised latent instead of
+image bytes, for clients that run the VAE themselves. The latent is in the diffusion model's latent space
+(before the VAE's scale, shift or normalization), as `latent.b64` (base64 of little-endian float32 values),
+`latent.dtype` (`"float32"`) and `latent.shape` (outermost dimension first, `[N, C, H, W]`). Servers that
+support it list `features_by_mode.img_gen.output_latent: true`. It is rejected for layered, AnimateDiff and
+pixel-space models, and when ADetailer is configured.
 
 ### Optional Field Handling
 
@@ -1417,6 +1425,15 @@ Example completed job:
     ]
   },
   "error": null
+}
+```
+
+With `output_latent: true`, each image item holds the latent instead of `b64_json`:
+
+```json
+{
+  "index": 0,
+  "latent": {"b64": "AAAAPwAAgD8...", "dtype": "float32", "shape": [1, 128, 64, 64]}
 }
 ```
 

@@ -211,6 +211,7 @@ static json make_img_gen_features_json() {
         {"cancel_queued", true},
         {"cancel_generating", true},
         {"preview", true},
+        {"output_latent", true},
     };
 }
 
@@ -463,6 +464,17 @@ static bool parse_img_gen_request(const json& body,
     }
     request.preview_mode     = body.value("preview", std::string("none"));
     request.preview_interval = body.value("preview_interval", 1);
+    if (body.contains("output_latent")) {
+        if (!body["output_latent"].is_boolean()) {
+            error_message = "output_latent must be a boolean";
+            return false;
+        }
+        request.output_latent = body["output_latent"].get<bool>();
+    }
+    if (request.output_latent && request.adetailer_enabled && !runtime.default_gen_params->ad_model_path.empty()) {
+        error_message = "output_latent cannot be combined with ADetailer";
+        return false;
+    }
     // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
     if (!request.gen_params.resolve_and_validate(IMG_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid generation parameters";
