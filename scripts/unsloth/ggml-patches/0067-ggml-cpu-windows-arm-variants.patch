@@ -1,0 +1,58 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index fbe27635..2fb6b988 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -545,6 +545,13 @@ if (GGML_CPU_ALL_VARIANTS)
+             ggml_add_cpu_backend_variant(android_armv9.0_1    DOTPROD MATMUL_INT8 FP16_VECTOR_ARITHMETIC SVE2)
+             ggml_add_cpu_backend_variant(android_armv9.2_1    DOTPROD MATMUL_INT8 FP16_VECTOR_ARITHMETIC SVE SME)
+             ggml_add_cpu_backend_variant(android_armv9.2_2    DOTPROD MATMUL_INT8 FP16_VECTOR_ARITHMETIC SVE SVE2 SME)
++        elseif (CMAKE_SYSTEM_NAME MATCHES "Windows")
++            # Unsloth: Windows on Arm (clang, MSVC ABI). The floor is the armv8.2-a + dotprod + fp16 set the single static
++            # build shipped (cpu-feats.cpp does not let it score 0 on Windows), plus NEON + i8mm for the i8mm repack
++            # kernels (Snapdragon X, Cobalt 100). No SVE variants: Windows reports no SVE vector length, and 128-bit SVE
++            # ran slower than NEON (ggml-patches/0020).
++            ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
++            ggml_add_cpu_backend_variant(armv8.6_0    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
+         elseif (APPLE)
+             ggml_add_cpu_backend_variant(apple_m1             DOTPROD)
+             ggml_add_cpu_backend_variant(apple_m2_m3          DOTPROD MATMUL_INT8)
+diff --git a/src/ggml-cpu/arch/arm/cpu-feats.cpp b/src/ggml-cpu/arch/arm/cpu-feats.cpp
+index fb876884..239ca042 100644
+--- a/src/ggml-cpu/arch/arm/cpu-feats.cpp
++++ b/src/ggml-cpu/arch/arm/cpu-feats.cpp
+@@ -1,8 +1,9 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-feats.h"
+ 
+-#if defined(__linux__) && defined(GGML_USE_SVE)
+ #include <stdlib.h>
++
++#if defined(__linux__) && defined(GGML_USE_SVE)
+ #include <sys/prctl.h>
+ #endif
+ 
+@@ -10,8 +11,23 @@
+ 
+ static int ggml_backend_cpu_aarch64_score() {
+     int score = 1;
+-    const ggml_feats_arch64_runtime_t af = ggml_feats_get_arch64_runtime();
++    ggml_feats_arch64_runtime_t af = ggml_feats_get_arch64_runtime();
+     GGML_UNUSED(af);
++#if defined(_WIN32)
++    // Unsloth: the Windows arm64 bundle used to be one static armv8.2-a + dotprod + fp16 build, so its floor variant
++    // (armv8.2_2) must keep loading wherever that build ran. The FP16 and I8MM feature ids (67, 66) are recent and
++    // IsProcessorFeaturePresent returns FALSE for an id the running Windows does not know, so dotprod / fp16 are not
++    // allowed to veto a variant here; i8mm still has to be reported for armv8.6_0 (else the floor runs, as before).
++    af.has_dotprod = true;
++    af.has_fp16    = true;
++#endif
++    {
++        // Unsloth: GGML_CPU_ARM_NO_I8MM=1 scores the i8mm variants 0, i.e. picks the variant a CPU without i8mm gets
++        const char * no_i8mm = getenv("GGML_CPU_ARM_NO_I8MM");
++        if (no_i8mm != NULL && no_i8mm[0] == '1') {
++            af.has_i8mm = false;
++        }
++    }
+ 
+ #ifdef GGML_USE_DOTPROD
+     if (!af.has_dotprod) { return 0; }
