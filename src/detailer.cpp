@@ -979,6 +979,7 @@ bool adetail_image(adetailer_ctx_t* context,
         generation.negative_prompt     = negative_prompt.c_str();
         generation.init_image          = local_image;
         generation.mask_image          = local_mask;
+        generation.output_latent       = false;  // the detailer composites pixels
         generation.width               = params.inpaint_width;
         generation.height              = params.inpaint_height;
         generation.strength            = params.denoising_strength;

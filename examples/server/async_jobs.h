@@ -52,6 +52,8 @@ struct AsyncGenerationJob {
     ImgGenJobRequest img_gen;
     VidGenJobRequest vid_gen;
     std::vector<std::string> result_images_b64;
+    // With img_gen.output_latent, result_images_b64 holds float32 latents of these shapes.
+    std::vector<std::vector<int64_t>> result_latent_shapes;
     json result_generation_info;
     std::string result_media_b64;
     // Uncompressed results (avi_raw) are kept as bytes and served by GET /sdcpp/v1/jobs/{id}/media, not base64.

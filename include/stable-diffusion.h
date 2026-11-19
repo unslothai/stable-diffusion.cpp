@@ -276,6 +276,13 @@ typedef struct {
     sd_image_t image;
     // Owned UTF-8 JSON using the sdcpp.generation/v1 schema.
     char* generation_info;
+    // Set only when sd_img_gen_params_t.output_latent was requested; image.data is then NULL.
+    // The final denoised latent in the diffusion model's latent space (before the VAE's
+    // scale, shift or normalization), float32, row-major over latent_shape with the outermost
+    // dimension first: [N, C, H, W] for image latents.
+    float* latent;
+    int latent_dims;
+    int64_t latent_shape[5];
 } sd_image_result_t;
 
 typedef struct {
@@ -460,6 +467,9 @@ typedef struct {
     bool circular_y;
     sd_image_preprocess_params_t image_preprocess;
     enum sd_control_type_t control_type;
+    // Skip the VAE decode and return each final latent in sd_image_result_t.latent, for callers
+    // that decode it themselves. Not available for layered, AnimateDiff or pixel-space models.
+    bool output_latent;
 } sd_img_gen_params_t;
 
 typedef struct {

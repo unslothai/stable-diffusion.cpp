@@ -938,13 +938,49 @@ namespace sd::pipeline {
         return {};
     }
 
+    // The final latent is the whole result only where one latent decodes to one image.
+    static bool image_latent_output_supported(const StableDiffusionGGML* sd) {
+        return !(sd_version_is_pid(sd->version) || sd_version_is_minit2i(sd->version) ||
+                 sd->version == VERSION_IRIS || sd->version == VERSION_QWEN_IMAGE_LAYERED ||
+                 sd->version == VERSION_P_H3_IMAGE || sd->animatediff_num_frames > 1);
+    }
+
+    static sd_image_t* latent_output_placeholders(const GenerationRequest& request,
+                                                  std::vector<sd::Tensor<float>>& final_latents,
+                                                  std::vector<sd::Tensor<float>>* latents_out,
+                                                  int* num_images_out) {
+        if (final_latents.empty() || latents_out == nullptr) {
+            LOG_ERROR(final_latents.empty() ? "no latent images to return" : "output_latent needs a latent destination");
+            return nullptr;
+        }
+        const int count     = static_cast<int>(final_latents.size());
+        sd_image_t* results = (sd_image_t*)calloc(count, sizeof(sd_image_t));
+        if (results == nullptr) {
+            return nullptr;
+        }
+        for (int i = 0; i < count; i++) {
+            results[i].width   = static_cast<uint32_t>(request.width);
+            results[i].height  = static_cast<uint32_t>(request.height);
+            results[i].channel = 3;
+        }
+        *latents_out = std::move(final_latents);
+        if (num_images_out != nullptr) {
+            *num_images_out = count;
+        }
+        LOG_INFO("returning %d latents without the VAE decode", count);
+        return results;
+    }
+
     bool generate_image(StableDiffusionGGML* sd,
                         const sd_img_gen_params_t* sd_img_gen_params,
                         sd_image_t** images_out,
                         int* num_images_out,
-                        std::vector<nlohmann::json>* infos_out) {
+                        std::vector<nlohmann::json>* infos_out,
+                        std::vector<sd::Tensor<float>>* latents_out) {
         if (infos_out)
             infos_out->clear();
+        if (latents_out)
+            latents_out->clear();
         if (images_out != nullptr) {
             *images_out = nullptr;
         }
@@ -958,6 +994,10 @@ namespace sd::pipeline {
         if (!sd_version_supports_image_generation(sd->version)) {
             LOG_ERROR("%s cannot be run with generate_image(); use generate_video() or --mode vid_gen in the CLI",
                       sd_version_name(sd->version));
+            return false;
+        }
+        if (sd_img_gen_params->output_latent && !image_latent_output_supported(sd)) {
+            LOG_ERROR("output_latent is not available for %s", sd_version_name(sd->version));
             return false;
         }
 
@@ -1227,8 +1267,11 @@ namespace sd::pipeline {
             final_latents = std::move(hires_final_latents);
         }
 
-        int num_images = 0;
-        auto result    = decode_image_outputs(sd, request, final_latents, &num_images);
+        int num_images         = 0;
+        const int latent_count = static_cast<int>(final_latents.size());
+        auto result            = sd_img_gen_params->output_latent
+                                     ? latent_output_placeholders(request, final_latents, latents_out, &num_images)
+                                     : decode_image_outputs(sd, request, final_latents, &num_images);
         if (result == nullptr) {
             return false;
         }
@@ -1237,7 +1280,7 @@ namespace sd::pipeline {
             try {
                 infos_out->assign(num_images, info);
                 // Layers and frames decoded from the same latent share its seed.
-                const int images_per_latent = num_images / static_cast<int>(final_latents.size());
+                const int images_per_latent = num_images / latent_count;
                 for (int i = 0; i < num_images; ++i) {
                     (*infos_out)[i]["seed"] = std::to_string(request.seed_for_batch(i / images_per_latent));
                 }

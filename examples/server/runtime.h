@@ -88,9 +88,13 @@ struct ImgGenJobRequest {
     int preview_interval      = 1;
     bool adetailer_enabled    = true;
     std::vector<ServerADetailerPass> adetailer_passes;
+    // Return the final latents instead of decoded images (the client runs the VAE).
+    bool output_latent = false;
 
     sd_img_gen_params_t to_sd_img_gen_params_t() {
-        return gen_params.to_sd_img_gen_params_t();
+        sd_img_gen_params_t params = gen_params.to_sd_img_gen_params_t();
+        params.output_latent       = output_latent;
+        return params;
     }
 };
 

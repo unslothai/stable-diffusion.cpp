@@ -59,11 +59,14 @@ namespace sd::pipeline {
     };
 
     // Callers hold ExecutionScope; AnimateDiff reuses the image path within the same scope.
+    // With sd_img_gen_params->output_latent, latents_out receives the final latents and the
+    // returned images are pixel-less placeholders (data NULL), one per latent.
     bool generate_image(StableDiffusionGGML* sd,
                         const sd_img_gen_params_t* sd_img_gen_params,
                         sd_image_t** images_out,
                         int* num_images_out,
-                        std::vector<nlohmann::json>* infos_out = nullptr);
+                        std::vector<nlohmann::json>* infos_out      = nullptr,
+                        std::vector<sd::Tensor<float>>* latents_out = nullptr);
 
     bool generate_video(StableDiffusionGGML* sd,
                         const sd_vid_gen_params_t* sd_vid_gen_params,
