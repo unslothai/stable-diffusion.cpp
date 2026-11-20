@@ -60,7 +60,8 @@ runs:
         # By owner rather than by full name: every unslothai repo that
         # publishes Windows bundles must fail closed here, and a fork under
         # any other owner cannot read the secrets to begin with.
-        $canonical = ($env:GITHUB_REPOSITORY_OWNER -eq 'unslothai')
+        # 'unsloth' is the same org once it is renamed from unslothai.
+        $canonical = ($env:GITHUB_REPOSITORY_OWNER -in @('unslothai', 'unsloth'))
         if ($haveSecrets) {
           Add-Content -Path $env:GITHUB_OUTPUT -Value 'signed=true'
           Write-Host 'Azure Trusted Signing credentials present; signing.'

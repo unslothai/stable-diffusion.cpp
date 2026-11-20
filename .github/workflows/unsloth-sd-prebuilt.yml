@@ -145,10 +145,10 @@ jobs:
              scripts/unsloth/pr-set.json >/dev/null \
             || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
           PRS='[]'
-          URL_RE='^https://github\.com/unslothai/stable-diffusion\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
+          URL_RE='^https://github\.com/(unslothai|unsloth)/stable-diffusion\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
           while read -r url REQUIRED; do
-            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/unslothai/stable-diffusion.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
-            NUM="${BASH_REMATCH[1]}"; SHA="${BASH_REMATCH[2]}"
+            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/{unslothai,unsloth}/stable-diffusion.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
+            NUM="${BASH_REMATCH[2]}"; SHA="${BASH_REMATCH[3]}"
             PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}")" \
               || { echo "refusing #${NUM}: could not fetch PR metadata (nonexistent number in '$url', or a transient API failure); fix the pin or retry" >&2; exit 1; }
             STATE="$(jq -r '.state' <<<"$PR_JSON")"
