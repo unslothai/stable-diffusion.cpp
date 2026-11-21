@@ -1,0 +1,439 @@
+ggml-cpu: 16-row interleaved AVX512-VNNI GEMM for Q8_0 / Q4_0 / IQ4_NL weights at batch >= 32, adapted from
+ik_llama.cpp's Q8_0_R16 kernels (#2764, #2807; MIT).
+On builds with AVX512F + BW + VL + VNNI (the cascadelake / icelake / zen4 / sapphirerapids CPU variants) a mul_mat with
+Q8_0, Q4_0 or IQ4_NL weights, at least 32 activation rows and a multiple of 16 weight rows now runs here instead of
+the 8-column legacy tiled GEMM (legacy-q8.cpp, ymm VPDPBUSD) or tinyBLAS. Each thread converts 32 weight rows at a
+time into 16-row interleaved blocks (the integer values + 128 as unsigned bytes, the fp16 block scales widened to f32)
+in a per-thread buffer, and one zmm VPDPBUSD multiplies 4 bytes of 16 weight rows with one activation code word. The
+activation scales and code sums (which cancel the +128) are computed once per mul_mat into the work buffer.
+The integer product of every 32-block is the one vec_dot forms and the float sum over blocks runs in the same order
+as the legacy tiled GEMM, so renders match the legacy path bit for bit. Other types, other CPU variants and smaller
+batches are unchanged. GGML_CPU_Q80_R16=0 turns it off, or a comma list of type names limits it.
+Colab L4 VM CPU (Xeon @ 2.20 GHz, Cascade Lake, 6 cores): Q8_0 / Q4_0 / IQ4_NL mul_mat 1.4-1.7x; Z-Image Turbo Q8_0
+512 px 4 steps sampling 86.96 -> 62.42 s (1.39x), FLUX.2 klein 4B Q4_0 68.22 -> 47.21 s (1.44x), Q4_K / Q6_K unchanged.
+Renders are pixel-identical with GGML_CPU_Q80_R16=0 (max abs 0). Checked out of tree against a double-precision
+reference for the three types (batch tails, thread splits inside a unit, a broadcast batch dimension, both fallbacks).
+
+diff --git a/src/ggml-cpu/CMakeLists.txt b/src/ggml-cpu/CMakeLists.txt
+index 57e5024..44d580f 100644
+--- a/src/ggml-cpu/CMakeLists.txt
++++ b/src/ggml-cpu/CMakeLists.txt
+@@ -48,6 +48,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/iqk/iqk_gemm.cpp
+         ggml-cpu/legacy-q8.cpp
+         ggml-cpu/legacy-q8.h
++        ggml-cpu/q80-r16.cpp
++        ggml-cpu/q80-r16.h
+         ggml-cpu/iqk/iqk_gemm.h
+         ggml-cpu/iqk/iqk_common.h
+         ggml-cpu/iqk/iqk_gemm_kquants.cpp
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index ddf6361..aaf1d01 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -17,6 +17,7 @@
+ #include "tiled/tiled.h"
+ #include "iqk/iqk_gemm.h"
+ #include "legacy-q8.h"
++#include "q80-r16.h"
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+@@ -1657,6 +1658,29 @@ UseGgmlGemm1:;
+ 
+     ggml_barrier(params->threadpool);
+ 
++    // Q8_0 / Q4_0 / IQ4_NL weights at batch >= 32 on AVX512-VNNI builds: 16-row interleaved VPDPBUSD GEMM (q80-r16.h), ahead of the
++    // 8-column legacy tiled GEMM (legacy-q8.h) and tinyBLAS
++    if (!params->use_ref && src1->type == GGML_TYPE_F32 && vec_dot_type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_F32 &&
++        ggml_cpu_q80r16_applies(src0->type, ne00, ne01, ne11)) {
++        const int64_t r2q = ne12 / ne02;
++        const int64_t r3q = ne13 / ne03;
++        const size_t  row_size = ggml_row_size(vec_dot_type, ne10);
++        char *        work = (char *) params->wdata + GGML_PAD(row_size*ne11*ne12*ne13, 64) + ggml_tiled_wdata_size(params->nth, dst);
++        ggml_cpu_q80r16_prepare(ne00, ne11, ne12*ne13, params->wdata, row_size, work, ith, nth);
++        ggml_barrier(params->threadpool);
++        for (int64_t i13 = 0; i13 < ne13; i13++) {
++            for (int64_t i12 = 0; i12 < ne12; i12++) {
++                ggml_cpu_q80r16_mul_mat(src0->type, ne01, ne11, ne00,
++                                        (const char *) src0->data + i12/r2q*nb02 + i13/r3q*nb03, nb01,
++                                        (const char *) params->wdata + (i12*ne11 + i13*ne12*ne11)*row_size, row_size,
++                                        work, i12 + i13*ne12,
++                                        (float *) ((char *) dst->data + i12*nb2 + i13*nb3), nb1/sizeof(float),
++                                        ith, nth);
++            }
++        }
++        return;
++    }
++
+     // Q5_0 / Q4_1 / Q5_1 at batch >= 32: weight rows converted to Q8_0 a chunk at a time, Q8_0 GEMM (legacy-q8.h)
+     if (!params->use_ref && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne02 == 1 && ne03 == 1 &&
+         ggml_is_contiguous(dst) && ggml_cpu_legacy_q8_applies(src0->type, ne00, ne01, ne11*ne12*ne13)) {
+@@ -3221,6 +3245,10 @@ struct ggml_cplan ggml_graph_plan(
+                             if (s1->type == GGML_TYPE_F32 && ggml_cpu_legacy_q8_applies(s0->type, s0->ne[0], s0->ne[1], n)) {
+                                 cur += ggml_cpu_legacy_q8_wsize(s0->type, s0->ne[0], n);
+                             }
++                            // activation table of the AVX512-VNNI Q8_0 / Q4_0 / IQ4_NL path (see q80-r16.h); same offset
++                            if (s1->type == GGML_TYPE_F32 && ggml_cpu_q80r16_applies(s0->type, s0->ne[0], s0->ne[1], s1->ne[1])) {
++                                cur += ggml_cpu_q80r16_wsize(s0->ne[0], s1->ne[1], s1->ne[2]*s1->ne[3]);
++                            }
+                         }
+                     } break;
+                 case GGML_OP_MUL_MAT_ID:
+diff --git a/src/ggml-cpu/q80-r16.cpp b/src/ggml-cpu/q80-r16.cpp
+new file mode 100644
+index 0000000..2f41d42
+--- /dev/null
++++ b/src/ggml-cpu/q80-r16.cpp
+@@ -0,0 +1,306 @@
++//
++// Copyright (C) 2024-2025 Iwan Kawrakow
++// MIT license
++// SPDX-License-Identifier: MIT
++//
++// The Q8_0_R16 block layout and the VPDPBUSD inner loop are adapted from ik_llama.cpp
++// (https://github.com/ikawrakow/ik_llama.cpp) ggml/src/iqk/iqk_gemm_legacy_quants.cpp (mul_mat_q8_0_r16_q8_2,
++// iqk_convert_q80_q80_r16; #2764, #2807) and the work split from iqk_mul_mat.cpp (split_units_and_columns). The
++// activations here are the upstream Q8_0 rows ggml already quantized src1 into, not ik's Q8_2_X4.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++
++#include "q80-r16.h"
++
++#include "ggml.h"
++#define GGML_COMMON_DECL_CPP
++#include "ggml-common.h"
++#include "ggml-cpu-impl.h"
++#include "simd-mappings.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512VL__)
++#define GGML_Q80_R16_IMPL 1
++#include <immintrin.h>
++#endif
++
++namespace {
++
++std::atomic<int64_t> g_q80r16_count{0};
++
++#ifdef GGML_Q80_R16_IMPL
++
++constexpr int k_min_ny  = 32; // ik_llama.cpp switches Q8_0 to Q8_0_R16 from 32 activation rows
++constexpr int k_rows    = 16; // weight rows per interleaved block
++constexpr int k_x_units = 2;  // 16-row units converted at a time (ik's k_x_step = 32 rows)
++constexpr int k_y_blk   = 8;  // activation rows per kernel call
++
++struct block_q8_0_r16 {
++    float  d[k_rows];
++    int8_t qs[k_rows * QK8_0]; // 4-byte group j of row k at byte 4*(16*j + k), offset by +128 (stored as int8 ^ 0x80)
++};
++static_assert(sizeof(block_q8_0_r16) == 16 * sizeof(float) + 16 * QK8_0, "wrong q8_0_r16 block size");
++
++// GGML_CPU_Q80_R16: unset / 1 = Q8_0, Q4_0 and IQ4_NL; 0 = off; else a comma list of ggml type names
++bool q80r16_types_enabled(int type) {
++    static const uint64_t mask = [] {
++        const uint64_t all = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_IQ4_NL);
++        const char * e = getenv("GGML_CPU_Q80_R16");
++        if (e == nullptr || strcmp(e, "1") == 0 || strcmp(e, "all") == 0) {
++            return all;
++        }
++        if (strcmp(e, "0") == 0 || strcmp(e, "none") == 0) {
++            return (uint64_t) 0;
++        }
++        uint64_t sel = 0;
++        char buf[256];
++        snprintf(buf, sizeof(buf), "%s", e);
++        for (char * tok = strtok(buf, ", "); tok != nullptr; tok = strtok(nullptr, ", ")) {
++            for (int t = 0; t < GGML_TYPE_COUNT && t < 64; ++t) {
++                const char * name = ggml_type_name((enum ggml_type) t);
++                if (name != nullptr && strcmp(name, tok) == 0) {
++                    sel |= 1ull << t;
++                }
++            }
++        }
++        return sel & all;
++    }();
++    return type >= 0 && type < 64 && ((mask >> type) & 1);
++}
++
++// one weight block -> its 32 integer values + 128 as unsigned bytes (the products with the activation codes are the
++// ones vec_dot forms: Q8_0 as stored, Q4_0 nibble - 8, IQ4_NL the kvalues_iq4nl entry; all with the block scale d)
++inline __m256i unpack_block(int type, const char * blk) {
++    if (type == GGML_TYPE_Q8_0) {
++        return _mm256_xor_si256(_mm256_loadu_si256((const __m256i *) ((const block_q8_0 *) blk)->qs), _mm256_set1_epi8(-128));
++    }
++    const __m128i q   = _mm_loadu_si128((const __m128i *) ((const block_q4_0 *) blk)->qs); // same layout for IQ4_NL
++    const __m128i m4  = _mm_set1_epi8(0x0f);
++    const __m256i nib = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m4), _mm_and_si128(q, m4));
++    if (type == GGML_TYPE_Q4_0) {
++        return _mm256_add_epi8(nib, _mm256_set1_epi8(120));
++    }
++    // IQ4_NL: kvalues_iq4nl + 128
++    const __m256i lut = _mm256_setr_epi8(1, 24, 45, 63, 79, 93, 106, 118, (char) 129, (char) 141, (char) 153, (char) 166,
++                                         (char) 181, (char) 197, (char) 217, (char) 241, 1, 24, 45, 63, 79, 93, 106, 118,
++                                         (char) 129, (char) 141, (char) 153, (char) 166, (char) 181, (char) 197, (char) 217,
++                                         (char) 241);
++    return _mm256_shuffle_epi8(lut, nib);
++}
++
++// 16 consecutive weight rows (bx bytes apart, nb blocks each) -> nb interleaved blocks
++void convert_r16(int type, int nb, const char * vx, size_t bx, block_q8_0_r16 * y) {
++    const size_t bs = ggml_type_size((enum ggml_type) type);
++    for (int ib = 0; ib < nb; ++ib) {
++        alignas(64) uint32_t rows[k_rows][8];
++        for (int k = 0; k < k_rows; ++k) {
++            const char * blk = vx + k * bx + ib * bs;
++            ggml_fp16_t d;
++            memcpy(&d, blk, sizeof(d)); // d is the first member of block_q8_0 / block_q4_0 / block_iq4_nl
++            y[ib].d[k] = GGML_CPU_FP16_TO_FP32(d);
++            _mm256_store_si256((__m256i *) rows[k], unpack_block(type, blk));
++        }
++        uint32_t * qs = (uint32_t *) y[ib].qs;
++        for (int j = 0; j < 8; ++j) {
++            for (int k = 0; k < k_rows; ++k) {
++                qs[16 * j + k] = rows[k][j];
++            }
++        }
++    }
++}
++
++// per activation row and block: the f32 scale and -128 * (sum of the 32 quants), which cancels the +128 weight offset
++struct q80r16_dm {
++    float   d;
++    int32_t m;
++};
++
++// one activation row: entry ib at dm[ib * k_y_blk] (the table interleaves the 8 rows of an activation block)
++void prepare_y(int nb, const char * yrow, q80r16_dm * dm) {
++    const block_q8_0 * y = (const block_q8_0 *) yrow;
++    const __m256i sign = _mm256_set1_epi8(-128);
++    for (int ib = 0; ib < nb; ++ib) {
++        // sum of signed bytes = sum of (q ^ 0x80) as unsigned - 32*128
++        const __m256i u = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *) y[ib].qs), sign);
++        const __m256i s = _mm256_sad_epu8(u, _mm256_setzero_si256());
++        const int32_t sum = (int32_t) (_mm256_extract_epi64(s, 0) + _mm256_extract_epi64(s, 1) + _mm256_extract_epi64(s, 2) +
++                                       _mm256_extract_epi64(s, 3)) - 32 * 128;
++        dm[(size_t) ib * k_y_blk].d = GGML_CPU_FP16_TO_FP32(y[ib].d);
++        dm[(size_t) ib * k_y_blk].m = -128 * sum;
++    }
++}
++
++template <int ny>
++void q80r16_kernel(int nb, const block_q8_0_r16 * x, int nunits, const char * const * yc, const q80r16_dm * tab,
++                   float * C, size_t stride_C) {
++    for (int u = 0; u < nunits; ++u) {
++        const block_q8_0_r16 * xb = x + (size_t) u * nb;
++        const q80r16_dm *      tb = tab;
++        __m512 acc[ny];
++        for (int iy = 0; iy < ny; ++iy) {
++            acc[iy] = _mm512_setzero_ps();
++        }
++        for (int ib = 0; ib < nb; ++ib) {
++            __m512i sumi[ny];
++            for (int iy = 0; iy < ny; ++iy) {
++                sumi[iy] = _mm512_set1_epi32(tb[iy].m);
++            }
++            const size_t yq = (size_t) ib * sizeof(block_q8_0) + offsetof(block_q8_0, qs);
++            for (int j = 0; j < 8; ++j) {
++                const __m512i qx = _mm512_loadu_si512((const __m512i *) xb->qs + j);
++                for (int iy = 0; iy < ny; ++iy) {
++                    int32_t q4;
++                    memcpy(&q4, yc[iy] + yq + 4 * j, sizeof(q4));
++                    sumi[iy] = _mm512_dpbusd_epi32(sumi[iy], qx, _mm512_set1_epi32(q4));
++                }
++            }
++            const __m512 dx = _mm512_loadu_ps(xb->d);
++            for (int iy = 0; iy < ny; ++iy) {
++                acc[iy] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sumi[iy]), _mm512_mul_ps(dx, _mm512_set1_ps(tb[iy].d)), acc[iy]);
++            }
++            ++xb;
++            tb += k_y_blk;
++        }
++        for (int iy = 0; iy < ny; ++iy) {
++            _mm512_storeu_ps(C + iy * stride_C + u * k_rows, acc[iy]);
++        }
++    }
++}
++
++typedef void (*q80r16_kernel_t)(int, const block_q8_0_r16 *, int, const char * const *, const q80r16_dm *, float *, size_t);
++const q80r16_kernel_t k_kernels[k_y_blk] = {
++    q80r16_kernel<1>, q80r16_kernel<2>, q80r16_kernel<3>, q80r16_kernel<4>,
++    q80r16_kernel<5>, q80r16_kernel<6>, q80r16_kernel<7>, q80r16_kernel<8>,
++};
++
++// converted x rows [ix, ix + nunits*16) times activation rows [y0, y1) (y0 a multiple of 8); tab holds the
++// activation blocks from row ybase on, nb * 8 entries per block of 8 rows
++void q80r16_run(int nb, const block_q8_0_r16 * x, int nunits, int64_t y0, int64_t y1, const char * B, size_t stride_B,
++                const q80r16_dm * tab, int64_t ybase, float * C, size_t stride_C) {
++    for (int64_t iy = y0; iy < y1; iy += k_y_blk) {
++        const int ny = (int) std::min<int64_t>(k_y_blk, y1 - iy);
++        const char * yc[k_y_blk];
++        for (int k = 0; k < ny; ++k) {
++            yc[k] = B + (size_t) (iy + k) * stride_B;
++        }
++        k_kernels[ny - 1](nb, x, nunits, yc, tab + (size_t) ((iy - ybase) / k_y_blk) * nb * k_y_blk, C + (size_t) iy * stride_C, stride_C);
++    }
++}
++
++#endif // GGML_Q80_R16_IMPL
++
++} // namespace
++
++extern "C" {
++
++bool ggml_cpu_q80r16_applies(int type, int64_t ne00, int64_t ne01, int64_t ne11) {
++#ifdef GGML_Q80_R16_IMPL
++    return (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ4_NL) && q80r16_types_enabled(type) && ne11 >= k_min_ny && ne01 % k_rows == 0 && ne00 % QK8_0 == 0 &&
++           ne00 / QK8_0 <= INT32_MAX;
++#else
++    (void) type; (void) ne00; (void) ne01; (void) ne11;
++    return false;
++#endif
++}
++
++size_t ggml_cpu_q80r16_wsize(int64_t ne00, int64_t ne11, int64_t nmat) {
++#ifdef GGML_Q80_R16_IMPL
++    const int64_t nb = ne00 / QK8_0;
++    return (size_t) nmat * ((ne11 + k_y_blk - 1) / k_y_blk) * k_y_blk * nb * sizeof(q80r16_dm) + 64;
++#else
++    (void) ne00; (void) ne11; (void) nmat;
++    return 0;
++#endif
++}
++
++void ggml_cpu_q80r16_prepare(int64_t ne00, int64_t ne11, int64_t nmat, const void * B, size_t stride_B, void * work,
++                             int ith, int nth) {
++#ifdef GGML_Q80_R16_IMPL
++    const int64_t nb   = ne00 / QK8_0;
++    const int64_t nyb  = (ne11 + k_y_blk - 1) / k_y_blk;
++    q80r16_dm *   tab  = (q80r16_dm *) GGML_PAD((uintptr_t) work, 64);
++    const int64_t rows = nmat * ne11;
++    for (int64_t r = rows * ith / nth; r < rows * (ith + 1) / nth; ++r) {
++        const int64_t m = r / ne11, iy = r % ne11;
++        prepare_y((int) nb, (const char *) B + (size_t) r * stride_B,
++                  tab + ((size_t) (m * nyb + iy / k_y_blk) * nb) * k_y_blk + iy % k_y_blk);
++    }
++#else
++    (void) ne00; (void) ne11; (void) nmat; (void) B; (void) stride_B; (void) work; (void) ith; (void) nth;
++#endif
++}
++
++void ggml_cpu_q80r16_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00, const void * A, size_t stride_A, const void * B,
++                             size_t stride_B, const void * work, int64_t imat, float * C, size_t stride_C, int ith, int nth) {
++#ifdef GGML_Q80_R16_IMPL
++    const int nb = (int) (ne00 / QK8_0);
++    if (ith == 0 && imat == 0) {
++        g_q80r16_count.fetch_add(1, std::memory_order_relaxed);
++    }
++    // work units: (16-row weight unit, 8-row activation block) pairs, a contiguous range per thread, as
++    // ik_llama.cpp's split_units_and_columns: whole units take every activation row with one conversion
++    const int64_t nunit = Nx / k_rows;
++    const int64_t nyb   = (Ny + k_y_blk - 1) / k_y_blk;
++    const int64_t nwork = nunit * nyb;
++    const int64_t w_beg = nwork * ith / nth;
++    const int64_t w_end = nwork * (ith + 1) / nth;
++    if (w_beg >= w_end) {
++        return;
++    }
++    // activation scales and sums of this matrix (ggml_cpu_q80r16_prepare)
++    const q80r16_dm * tab = (const q80r16_dm *) GGML_PAD((uintptr_t) work, 64) + (size_t) imat * nyb * k_y_blk * nb;
++    thread_local std::vector<block_q8_0_r16> xr;
++    xr.resize((size_t) k_x_units * nb);
++
++    for (int64_t w = w_beg; w < w_end;) {
++        const int64_t u = w / nyb;
++        const int64_t b = w - u * nyb;
++        if (b == 0 && w + nyb <= w_end) {
++            const int n = (int) std::min<int64_t>(k_x_units, (w_end - w) / nyb);
++            for (int k = 0; k < n; ++k) {
++                convert_r16(type, nb, (const char *) A + (size_t) (u + k) * k_rows * stride_A, stride_A, xr.data() + (size_t) k * nb);
++            }
++            q80r16_run(nb, xr.data(), n, 0, Ny, (const char *) B, stride_B, tab, 0, C + u * k_rows, stride_C);
++            w += (int64_t) n * nyb;
++        } else {
++            const int64_t b1 = std::min<int64_t>(nyb, b + (w_end - w));
++            convert_r16(type, nb, (const char *) A + (size_t) u * k_rows * stride_A, stride_A, xr.data());
++            q80r16_run(nb, xr.data(), 1, b * k_y_blk, std::min<int64_t>(Ny, b1 * k_y_blk), (const char *) B, stride_B,
++                       tab, 0, C + u * k_rows, stride_C);
++            w += b1 - b;
++        }
++    }
++#else
++    (void) type; (void) Nx; (void) Ny; (void) ne00; (void) A; (void) stride_A; (void) B; (void) stride_B; (void) work;
++    (void) imat; (void) C; (void) stride_C; (void) ith; (void) nth;
++    GGML_ABORT("ggml_cpu_q80r16_mul_mat: not built for this CPU variant");
++#endif
++}
++
++int64_t ggml_cpu_q80r16_count(void) {
++    return g_q80r16_count.load(std::memory_order_relaxed);
++}
++
++} // extern "C"
+diff --git a/src/ggml-cpu/q80-r16.h b/src/ggml-cpu/q80-r16.h
+new file mode 100644
+index 0000000..fb09330
+--- /dev/null
++++ b/src/ggml-cpu/q80-r16.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Q8_0 / Q4_0 / IQ4_NL weights times Q8_0 activations at batch sizes >= 32 on AVX512-VNNI builds (ik_llama.cpp's Q8_0_R16 GEMM,
++// #2764 / #2807): each thread converts 32 weight rows at a time into 16-row interleaved blocks (integer values offset
++// to unsigned, the fp16 block scales widened to f32) in a per-thread buffer and multiplies them with VPDPBUSD, 16 rows
++// per instruction. The integer products per 32-block are the same as in the vec_dot kernel; only the float
++// accumulation order differs. Nothing is kept resident. GGML_CPU_Q80_R16=0 turns it off (the 8-column legacy tiled GEMM in
++// legacy-q8.h), or a comma list of ggml type names limits it to those types.
++
++// true when the path takes a mul_mat with these shapes (same answer on every thread; false on builds without
++// AVX512-VNNI)
++bool ggml_cpu_q80r16_applies(int type, int64_t ne00, int64_t ne01, int64_t ne11);
++
++// extra wdata bytes (after the quantized src1 rows) for the activation table of nmat matrices of ne11 rows
++size_t ggml_cpu_q80r16_wsize(int64_t ne00, int64_t ne11, int64_t nmat);
++
++// every thread, then a barrier: per activation row and 32-block the f32 scale and the code sum into work
++void ggml_cpu_q80r16_prepare(int64_t ne00, int64_t ne11, int64_t nmat, const void * B, size_t stride_B, void * work,
++                             int ith, int nth);
++
++// C[iy*stride_C + ix] = dot(A row ix, B row iy) for ix < Nx, iy < Ny; A rows of `type` (stride_A bytes), B rows Q8_0
++// (stride_B bytes) of matrix imat of the prepared table. The work is split over the nth threads by ith.
++void ggml_cpu_q80r16_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00, const void * A, size_t stride_A, const void * B,
++                             size_t stride_B, const void * work, int64_t imat, float * C, size_t stride_C, int ith, int nth);
++
++// test hook: number of mul_mat calls (per thread 0) this path computed
++int64_t ggml_cpu_q80r16_count(void);
++
++#ifdef __cplusplus
++}
++#endif
