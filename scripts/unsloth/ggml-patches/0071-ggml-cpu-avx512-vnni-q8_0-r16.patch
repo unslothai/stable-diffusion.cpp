@@ -82,10 +82,10 @@ index ddf6361..aaf1d01 100644
                  case GGML_OP_MUL_MAT_ID:
 diff --git a/src/ggml-cpu/q80-r16.cpp b/src/ggml-cpu/q80-r16.cpp
 new file mode 100644
-index 0000000..2f41d42
+index 0000000..cb1277b
 --- /dev/null
 +++ b/src/ggml-cpu/q80-r16.cpp
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,302 @@
 +//
 +// Copyright (C) 2024-2025 Iwan Kawrakow
 +// MIT license
@@ -134,16 +134,14 @@ index 0000000..2f41d42
 +#include <immintrin.h>
 +#endif
 +
-+namespace {
-+
-+std::atomic<int64_t> g_q80r16_count{0};
++static std::atomic<int64_t> g_q80r16_count{0};
 +
 +#ifdef GGML_Q80_R16_IMPL
 +
-+constexpr int k_min_ny  = 32; // ik_llama.cpp switches Q8_0 to Q8_0_R16 from 32 activation rows
-+constexpr int k_rows    = 16; // weight rows per interleaved block
-+constexpr int k_x_units = 2;  // 16-row units converted at a time (ik's k_x_step = 32 rows)
-+constexpr int k_y_blk   = 8;  // activation rows per kernel call
++static constexpr int k_min_ny  = 32; // ik_llama.cpp switches Q8_0 to Q8_0_R16 from 32 activation rows
++static constexpr int k_rows    = 16; // weight rows per interleaved block
++static constexpr int k_x_units = 2;  // 16-row units converted at a time (ik's k_x_step = 32 rows)
++static constexpr int k_y_blk   = 8;  // activation rows per kernel call
 +
 +struct block_q8_0_r16 {
 +    float  d[k_rows];
@@ -152,7 +150,7 @@ index 0000000..2f41d42
 +static_assert(sizeof(block_q8_0_r16) == 16 * sizeof(float) + 16 * QK8_0, "wrong q8_0_r16 block size");
 +
 +// GGML_CPU_Q80_R16: unset / 1 = Q8_0, Q4_0 and IQ4_NL; 0 = off; else a comma list of ggml type names
-+bool q80r16_types_enabled(int type) {
++static bool q80r16_types_enabled(int type) {
 +    static const uint64_t mask = [] {
 +        const uint64_t all = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_IQ4_NL);
 +        const char * e = getenv("GGML_CPU_Q80_R16");
@@ -180,7 +178,7 @@ index 0000000..2f41d42
 +
 +// one weight block -> its 32 integer values + 128 as unsigned bytes (the products with the activation codes are the
 +// ones vec_dot forms: Q8_0 as stored, Q4_0 nibble - 8, IQ4_NL the kvalues_iq4nl entry; all with the block scale d)
-+inline __m256i unpack_block(int type, const char * blk) {
++static inline __m256i unpack_block(int type, const char * blk) {
 +    if (type == GGML_TYPE_Q8_0) {
 +        return _mm256_xor_si256(_mm256_loadu_si256((const __m256i *) ((const block_q8_0 *) blk)->qs), _mm256_set1_epi8(-128));
 +    }
@@ -199,7 +197,7 @@ index 0000000..2f41d42
 +}
 +
 +// 16 consecutive weight rows (bx bytes apart, nb blocks each) -> nb interleaved blocks
-+void convert_r16(int type, int nb, const char * vx, size_t bx, block_q8_0_r16 * y) {
++static void convert_r16(int type, int nb, const char * vx, size_t bx, block_q8_0_r16 * y) {
 +    const size_t bs = ggml_type_size((enum ggml_type) type);
 +    for (int ib = 0; ib < nb; ++ib) {
 +        alignas(64) uint32_t rows[k_rows][8];
@@ -226,7 +224,7 @@ index 0000000..2f41d42
 +};
 +
 +// one activation row: entry ib at dm[ib * k_y_blk] (the table interleaves the 8 rows of an activation block)
-+void prepare_y(int nb, const char * yrow, q80r16_dm * dm) {
++static void prepare_y(int nb, const char * yrow, q80r16_dm * dm) {
 +    const block_q8_0 * y = (const block_q8_0 *) yrow;
 +    const __m256i sign = _mm256_set1_epi8(-128);
 +    for (int ib = 0; ib < nb; ++ib) {
@@ -241,8 +239,8 @@ index 0000000..2f41d42
 +}
 +
 +template <int ny>
-+void q80r16_kernel(int nb, const block_q8_0_r16 * x, int nunits, const char * const * yc, const q80r16_dm * tab,
-+                   float * C, size_t stride_C) {
++static void q80r16_kernel(int nb, const block_q8_0_r16 * x, int nunits, const char * const * yc, const q80r16_dm * tab,
++                          float * C, size_t stride_C) {
 +    for (int u = 0; u < nunits; ++u) {
 +        const block_q8_0_r16 * xb = x + (size_t) u * nb;
 +        const q80r16_dm *      tb = tab;
@@ -278,15 +276,15 @@ index 0000000..2f41d42
 +}
 +
 +typedef void (*q80r16_kernel_t)(int, const block_q8_0_r16 *, int, const char * const *, const q80r16_dm *, float *, size_t);
-+const q80r16_kernel_t k_kernels[k_y_blk] = {
++static const q80r16_kernel_t k_kernels[k_y_blk] = {
 +    q80r16_kernel<1>, q80r16_kernel<2>, q80r16_kernel<3>, q80r16_kernel<4>,
 +    q80r16_kernel<5>, q80r16_kernel<6>, q80r16_kernel<7>, q80r16_kernel<8>,
 +};
 +
 +// converted x rows [ix, ix + nunits*16) times activation rows [y0, y1) (y0 a multiple of 8); tab holds the
 +// activation blocks from row ybase on, nb * 8 entries per block of 8 rows
-+void q80r16_run(int nb, const block_q8_0_r16 * x, int nunits, int64_t y0, int64_t y1, const char * B, size_t stride_B,
-+                const q80r16_dm * tab, int64_t ybase, float * C, size_t stride_C) {
++static void q80r16_run(int nb, const block_q8_0_r16 * x, int nunits, int64_t y0, int64_t y1, const char * B, size_t stride_B,
++                       const q80r16_dm * tab, int64_t ybase, float * C, size_t stride_C) {
 +    for (int64_t iy = y0; iy < y1; iy += k_y_blk) {
 +        const int ny = (int) std::min<int64_t>(k_y_blk, y1 - iy);
 +        const char * yc[k_y_blk];
@@ -298,8 +296,6 @@ index 0000000..2f41d42
 +}
 +
 +#endif // GGML_Q80_R16_IMPL
-+
-+} // namespace
 +
 +extern "C" {
 +
@@ -394,11 +390,12 @@ index 0000000..2f41d42
 +} // extern "C"
 diff --git a/src/ggml-cpu/q80-r16.h b/src/ggml-cpu/q80-r16.h
 new file mode 100644
-index 0000000..fb09330
+index 0000000..4e7002a
 --- /dev/null
 +++ b/src/ggml-cpu/q80-r16.h
-@@ -0,0 +1,39 @@
-+#pragma once
+@@ -0,0 +1,42 @@
++#ifndef __SD_GGML_SRC_GGML_CPU_Q80_R16_H__
++#define __SD_GGML_SRC_GGML_CPU_Q80_R16_H__
 +
 +#include <stdbool.h>
 +#include <stddef.h>
@@ -437,3 +434,5 @@ index 0000000..fb09330
 +#ifdef __cplusplus
 +}
 +#endif
++
++#endif // __SD_GGML_SRC_GGML_CPU_Q80_R16_H__
