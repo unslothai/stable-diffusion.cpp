@@ -6,8 +6,10 @@ proprietary driver 26.10.1+") and da3416d80 (#30280, "vulkan: RDNA3/4 Large-Tile
   them) is split 3 ways along K, so the second wave is not two thirds empty. Other architectures are unchanged.
 Upstream reports +12 to 32% on the affected shapes; neither path runs on NVIDIA, Intel or Apple Vulkan devices.
 
+- On the proprietary driver f32 and bf16 A matrices keep the medium tile: on gfx1151 (driver 2.0.416) the large tile
+  ran f32 4096x512x14336 2.14x and bf16 1.61x slower, while f16 and the quantized types gained up to 1.4x.
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index f318720..2c3f336 100644
+index f318720..7c84857 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -1693,6 +1693,17 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
@@ -37,16 +39,20 @@ index f318720..2c3f336 100644
              // This is intentionally using tx_m values, slight performance increase
              l_warptile = { 256, 128, 128, 16, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
              l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
-@@ -4866,7 +4877,7 @@ vk_device ggml_vk_get_device(size_t idx) {
+@@ -4866,7 +4877,11 @@ vk_device ggml_vk_get_device(size_t idx) {
              switch (device->vendor_id) {
  #ifndef GGML_VULKAN_RUN_TESTS
              case VK_VENDOR_ID_AMD:
 -                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary;
-+                device->mul_mat_l[i]    = device->coopmat_support && ggml_vk_amd_large_tile_supported(device);
++                // On the proprietary driver the large coopmat tile regresses f32 / bf16 A matrices (gfx1151, driver
++                // 2.0.416: 4096x512x14336 2.14x / 1.61x slower), so those keep the medium tile.
++                device->mul_mat_l[i]    = device->coopmat_support && ggml_vk_amd_large_tile_supported(device) &&
++                                          !(device->driver_id == vk::DriverId::eAmdProprietary &&
++                                            (i == GGML_TYPE_F32 || i == GGML_TYPE_BF16));
                  device->mul_mat_m[i]    = true;
                  device->mul_mat_s[i]    = true;
                  device->mul_mat_id_l[i] = false;
-@@ -5994,6 +6005,11 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
+@@ -5994,6 +6009,11 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
                  split_k = ctx->device->shader_core_count / (m_tiles * n_tiles);
              } else if (m_tiles * n_tiles <= ctx->device->shader_core_count * 2 / 3) {
                  split_k = 3;
