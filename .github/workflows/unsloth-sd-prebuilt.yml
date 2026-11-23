@@ -1149,7 +1149,15 @@ jobs:
             if ($mode -eq 'no_i8mm') { $env:GGML_CPU_ARM_NO_I8MM = '1' } else { Remove-Item Env:GGML_CPU_ARM_NO_I8MM -ErrorAction SilentlyContinue }
             Push-Location $empty
             $out = (& $cli.FullName -m (Join-Path $empty 'none.gguf') -p x -v 2>&1 | Out-String)
+            $code = $LASTEXITCODE
             Pop-Location
+            # A clean start stops at the missing model (exit 1, new_sd_ctx_t failed). The load line is logged before
+            # the variant registers, so a crash in the picked DLL (0xC000001D illegal instruction) would still match.
+            if ($code -ne 1 -or $out -notmatch 'new_sd_ctx_t failed') {
+              Write-Host $out
+              Write-Host "::error::sd-cli ($mode) exited $code before reaching the missing-model error"
+              exit 1
+            }
             $m = [regex]::Match($out, 'loaded CPU backend from .*ggml-cpu-([A-Za-z0-9._]+)\.dll')
             $picks[$mode] = if ($m.Success) { $m.Groups[1].Value } else { '' }
           }
@@ -1158,7 +1166,7 @@ jobs:
           Write-Host "i8mm reported: $i8mm; picked: $($picks['auto']) (want $want), with GGML_CPU_ARM_NO_I8MM=1: $($picks['no_i8mm'])"
           if ($picks['auto'] -ne $want) { Write-Host "::error::picked CPU variant '$($picks['auto'])', want $want"; exit 1 }
           if ($picks['no_i8mm'] -ne 'armv8.2_2') { Write-Host "::error::without i8mm the pick is '$($picks['no_i8mm'])', want armv8.2_2"; exit 1 }
-          # sd-cli exits 1 at the missing model, which would otherwise become the step's exit code.
+          # sd-cli exits 1 at the missing model (checked above), which would otherwise become the step's exit code.
           exit 0
 
       - name: Upload bundle
