@@ -1,0 +1,19 @@
+Metal tensor-API flash attention (Apple M5 and newer): run kernel_flash_attn_ext_tensor with 4 simdgroups per threadgroup
+instead of 8. With 8 simdgroups sharing a 32-query block, each owned 4 query rows and the MPP matmuls split the tile too
+finely. On M5 Pro, H=30, S=4096, D=128 (Z-Image) goes from 8.8 to 13.4 TFLOPS, D=64 from 8.0 to 12.5, DK=192 by ~45%,
+D=256 by 5-10% and D=512 by 5-20%; DK=576/DV=512 is unchanged. Queries per threadgroup, the KV chunk, shared memory, the
+block map, the pad buffer and the small-batch threshold are unchanged. GPUs without the tensor API are not affected.
+
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index 4ffb5a77..0924f527 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -132,7 +132,7 @@
+ #define OP_FLASH_ATTN_EXT_TENSOR_NQPSG       32
+ #define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
+ #define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
+-#define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
++#define OP_FLASH_ATTN_EXT_TENSOR_NSG         4 // 8 simdgroups (fewer rows each) ran up to 1.5x slower on M5
+ 
+ #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
+ #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
