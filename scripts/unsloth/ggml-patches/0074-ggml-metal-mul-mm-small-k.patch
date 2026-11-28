@@ -1,0 +1,71 @@
+diff --git a/src/ggml-metal/ggml-metal-common.cpp b/src/ggml-metal/ggml-metal-common.cpp
+index 70fd551e..cfa22cac 100644
+--- a/src/ggml-metal/ggml-metal-common.cpp
++++ b/src/ggml-metal/ggml-metal-common.cpp
+@@ -36,9 +36,15 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
+     const int64_t ne00 = op->src[0]->ne[0];
+     const int64_t ne11 = op->src[1]->ne[1];
+ 
++    // 32 <= K < 64 only where a kernel_mul_mm_<src0>_<src1> exists: a BF16 src1 has one for a BF16 src0 only,
++    // and mul_mv covers the other BF16 src1 cases (e.g. an F32 im2col times BF16 conv weights)
++    const ggml_type t0 = op->src[0]->type;
++    const ggml_type t1 = op->src[1]->type;
++    const bool mm_small_k = t1 != GGML_TYPE_BF16 || t0 == GGML_TYPE_BF16;
++
+     return !ggml_is_transposed(op->src[0]) &&
+            !ggml_is_transposed(op->src[1]) &&
+-           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
++           has_simdgroup_mm && ne11 > 8 && (ne00 >= 64 || (ne00 >= 32 && mm_small_k));
+ }
+ 
+ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
+diff --git a/src/ggml-metal/kernels/mul_mm.metal b/src/ggml-metal/kernels/mul_mm.metal
+index dfa5102c..60c63766 100644
+--- a/src/ggml-metal/kernels/mul_mm.metal
++++ b/src/ggml-metal/kernels/mul_mm.metal
+@@ -954,6 +954,7 @@ template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_m
+ template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
++template [[host_name("kernel_mul_mm_bf16_bf16")]]   kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, bfloat, bfloat2x4>;
+ #endif
+ template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  float, float2x4>;
+ template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  float, float2x4>;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ce7446db..61ba3b46 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10873,6 +10873,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+ 
++    // small K at batch > 8, e.g. LoRA B matrices with K = rank
++    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
++        for (int64_t k : {16, 32, 48}) {
++            for (int64_t n : {9, 33, 128}) {
++                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 100, n, k, {1, 1}, {1, 1}));
++            }
++        }
++    }
++    // BF16 src1 at 32 <= K < 64: an F32 im2col times BF16 conv weights (K = IC*KH*KW, e.g. 4*3*3 = 36), and BF16 x BF16
++    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
++        for (int64_t k : {32, 36, 48}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_BF16, 512, 64, k, {1, 1}, {1, 1}));
++        }
++    }
++
+ #if 0
+     // > 4GB A matrix. Too slow to be enabled by default.
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
+@@ -12269,6 +12284,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
+     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
+ 
++    // LoRA at prefill: B is [rank, n_out], so K = rank
++    for (int64_t k : {16, 32, 48, 64}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 2048, 512, k, {1, 1}, {1, 1}));
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

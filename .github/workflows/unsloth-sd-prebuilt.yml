@@ -236,7 +236,9 @@ jobs:
           COMMIT="$(git rev-parse HEAD)"
           SRC_ARTIFACT="sd-source-${TAG}"
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tar --exclude-vcs --exclude=.github -czf "${RUNNER_TEMP}/sd-source-${TAG}.tar.gz" .
+            # --dereference: the Windows legs extract with Git Bash tar, which cannot create a symlink whose
+            # target comes later in the archive (ggml/.pi/SYSTEM.md -> gg/SYSTEM.md), so store files instead.
+            tar --dereference --exclude-vcs --exclude=.github -czf "${RUNNER_TEMP}/sd-source-${TAG}.tar.gz" .
             echo "stamped source for ${TAG} (${COMMIT})"
           else
             echo "release ${TAG} already published; skipping source prep"

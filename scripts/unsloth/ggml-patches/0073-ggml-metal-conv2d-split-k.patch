@@ -1,0 +1,543 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index 76a8951..7478f15 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -2292,6 +2292,7 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
+         case GGML_OP_CUMSUM:
+         case GGML_OP_ARGSORT:
+         case GGML_OP_TOP_K:
++        case GGML_OP_CONV_2D:
+             return true;
+         default:
+             return false;
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 287d211..56d6c0a 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -2500,6 +2500,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm(ggml_
+     char base[256];
+     char name[256];
+ 
++    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
++
++    if (has_tensor) {
++        // nr0 output positions per threadgroup, nr1 output channels, same tiles as kernel_mul_mm
++        snprintf(base, 256, "kernel_conv_2d_mm_tensor_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
++        snprintf(name, 256, "%s", base);
++
++        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++        if (!res.pipeline) {
++            res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++        }
++
++        res.nr0  = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
++        res.nr1  = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
++        res.nsg  = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
++        res.smem = res.nr0 * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
++
++        return res;
++    }
++
+     const int nr0 = op->src[0]->ne[3] <= 32 ? 32 : 64;
+     const int nr1 = 2048/nr0;
+ 
+@@ -2513,13 +2533,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm(ggml_
+ 
+     res.nr0 = nr0;
+     res.nr1 = nr1;
+-    res.nsg = 4;
++    res.nsg = N_SG_CONV_2D;
+ 
+     res.smem = nr0*nr1*sizeof(float);
+ 
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm_reduce(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_CONV_2D);
++    GGML_UNUSED(op);
++
++    const char * name = "kernel_conv_2d_mm_reduce";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw(ggml_metal_library_t lib, const ggml_tensor * op, bool tiled) {
+     assert(op->op == GGML_OP_CONV_2D_DW);
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index f9d3d36..5cb3273 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -169,6 +169,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_snake             (ggml_metal_library_t lib, enum ggml_type type);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm_reduce (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw        (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tiled);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_3d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index 4ffb5a7..4bc8159 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -16,6 +16,8 @@
+ 
+ #define N_MM_NPART_AMAX 256
+ 
++#define N_SG_CONV_2D 4
++
+ // kernel parameters for mat-vec threadgroups
+ //
+ // N_R0: number of src0 rows to process per simdgroup
+@@ -733,8 +735,14 @@ typedef struct {
+     int32_t  p1;
+     int32_t  d0;
+     int32_t  d1;
++    int32_t  nk;    // reduction length per split
+ } ggml_metal_kargs_conv_2d;
+ 
++typedef struct {
++    int32_t  ne;     // output elements
++    int32_t  nsplit;
++} ggml_metal_kargs_conv_2d_reduce;
++
+ typedef struct {
+     uint64_t nb00;  // kernel strides
+     uint64_t nb01;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index b5193a3..b216a38 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4740,6 +4740,33 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++// number of reduction splits of the conv_2d matmul kernels
++// A small output with a long reduction leaves the GPU idle, so the reduction is split until there are about 1M partial sums.
++static int ggml_metal_op_conv_2d_nsplit(const ggml_tensor * op, int32_t * nk) {
++    const int64_t K      = op->src[0]->ne[0]*op->src[0]->ne[1]*op->src[0]->ne[2];
++    const int64_t nsteps = (K + 31)/32;
++    const int64_t ne     = ggml_nelements(op);
++
++    // at least 3 reduction steps of 32 per split, at most 32 splits
++    const int64_t nsplit = std::max<int64_t>(1, std::min<int64_t>({ (1024*1024 + ne - 1)/ne, nsteps/3, 32 }));
++    const int64_t steps  = (nsteps + nsplit - 1)/nsplit;
++
++    if (nk) {
++        *nk = (int32_t) (steps*32);
++    }
++
++    return (int) ((nsteps + steps - 1)/steps);
++}
++
++size_t ggml_metal_op_conv_2d_extra_tmp(const ggml_tensor * op) {
++    assert(op->op == GGML_OP_CONV_2D);
++
++    const int nsplit = ggml_metal_op_conv_2d_nsplit(op, nullptr);
++
++    // partial sums of the reduction splits
++    return nsplit > 1 ? nsplit*ggml_nelements(op)*sizeof(float) : 0;
++}
++
+ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+@@ -4793,11 +4820,17 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
+         /*.p1   =*/ p1,
+         /*.d0   =*/ d0,
+         /*.d1   =*/ d1,
++        /*.nk   =*/ 0,
+     };
+ 
+     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+ 
+-    if (props_dev->has_simdgroup_mm) {
++    // the matmul kernels walk the patches with 32-bit byte offsets inside an image
++    // larger images, possibly a strided view, take the generic kernel
++    const uint64_t max_off = (ne12 - 1)*nb12 + (ne11 - 1)*nb11 + (ne10 - 1)*nb10 + sizeof(float);
++    const bool     fits_32 = max_off <= UINT32_MAX;
++
++    if (props_dev->has_simdgroup_mm && fits_32) {
+         auto pipeline = ggml_metal_library_get_pipeline_conv_2d_mm(lib, op);
+ 
+         const int nr0 = pipeline.nr0;
+@@ -4807,15 +4840,48 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
+         const int64_t NP = ne3*ne1*ne0;
+         const int64_t OC = ne03;
+ 
++        const int nsplit = ggml_metal_op_conv_2d_nsplit(op, &args.nk);
++
++        ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
++        ggml_metal_buffer_id bid_tmp = bid_dst;
++        bid_tmp.offs += ggml_nbytes(op);
++
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++        ggml_metal_encoder_set_buffer  (enc, nsplit > 1 ? bid_tmp : bid_dst,       3);
+ 
+         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, (NP + nr1 - 1)/nr1, (OC + nr0 - 1)/nr0, 1, 32, nsg, 1);
++        if (props_dev->has_tensor) {
++            // per image: nr0 positions times nr1 channels per threadgroup
++            const int64_t OHW = ne1*ne0;
++            ggml_metal_encoder_dispatch_threadgroups(enc, (OC + nr1 - 1)/nr1, (OHW + nr0 - 1)/nr0, ne3*nsplit, 32, nsg, 1);
++        } else {
++            ggml_metal_encoder_dispatch_threadgroups(enc, (NP + nr1 - 1)/nr1, (OC + nr0 - 1)/nr0, nsplit, 32, nsg, 1);
++        }
++
++        if (nsplit > 1) {
++            GGML_ASSERT(ggml_is_contiguous(op));
++
++            // sync the 2 kernels
++            ggml_metal_op_concurrency_reset(ctx);
++
++            ggml_metal_kargs_conv_2d_reduce args0 = {
++                /*.ne     =*/ (int32_t) ggml_nelements(op),
++                /*.nsplit =*/ nsplit,
++            };
++
++            auto pipeline0 = ggml_metal_library_get_pipeline_conv_2d_mm_reduce(lib, op);
++
++            ggml_metal_encoder_set_pipeline(enc, pipeline0);
++            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
++            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
++            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, (args0.ne + 255)/256, 1, 1, 256, 1, 1);
++        }
+ 
+         return 1;
+     }
+diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
+index 583d115..ed15767 100644
+--- a/src/ggml-metal/ggml-metal-ops.h
++++ b/src/ggml-metal/ggml-metal-ops.h
+@@ -47,6 +47,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
+ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
+ size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
+ 
++size_t ggml_metal_op_conv_2d_extra_tmp(const struct ggml_tensor * op);
++
+ int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);
+diff --git a/src/ggml-metal/ggml-metal.cpp b/src/ggml-metal/ggml-metal.cpp
+index 9b23538..3a1520a 100644
+--- a/src/ggml-metal/ggml-metal.cpp
++++ b/src/ggml-metal/ggml-metal.cpp
+@@ -245,6 +245,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
+             {
+                 res = 2*sizeof(int32_t)*ggml_nelements(tensor->src[0]);
+             } break;
++        case GGML_OP_CONV_2D:
++            {
++                res += ggml_metal_op_conv_2d_extra_tmp(tensor);
++            } break;
+         default:
+             break;
+     }
+diff --git a/src/ggml-metal/kernels/conv.metal b/src/ggml-metal/kernels/conv.metal
+index 76a2a57..dfdfc14 100644
+--- a/src/ggml-metal/kernels/conv.metal
++++ b/src/ggml-metal/kernels/conv.metal
+@@ -334,7 +334,7 @@ kernel void kernel_conv_2d_mm(
+         ushort  tiitg[[thread_index_in_threadgroup]],
+         ushort  tiisg[[thread_index_in_simdgroup]],
+         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+-    constexpr short NSG = 4;
++    constexpr short NSG = N_SG_CONV_2D;
+     constexpr short NTH = 32*NSG;
+     constexpr short NK  = 32;
+     constexpr short NKB = NK/8;
+@@ -349,6 +349,10 @@ kernel void kernel_conv_2d_mm(
+     const int K  = args.IC*args.KH*args.KW;
+     const int NP = args.N*args.OH*args.OW;
+ 
++    // this threadgroup reduces [k_begin, k_end), the splits are summed by kernel_conv_2d_mm_reduce
++    const int k_begin = tgpig.z*args.nk;
++    const int k_end   = min(K, k_begin + args.nk);
++
+     const int r0 = tgpig.y*NR0;
+     const int r1 = tgpig.x*NR1;
+ 
+@@ -357,8 +361,14 @@ kernel void kernel_conv_2d_mm(
+     const short lb_n = 8*sgitg + tiisg%8;
+     const short lb_k = 8*(tiisg/8);
+ 
++    // the patches are walked with 32-bit byte offsets inside the image, the host checks that an image fits
++    const uint nb10 = args.nb10;
++    const uint nb11 = args.nb11;
++    const uint nb12 = args.nb12;
++
+     int  ix0[NPL];
+     int  iy0[NPL];
++    uint off0[NPL];
+     bool ip_ok[NPL];
+ 
+     device const char * srcb[NPL];
+@@ -373,6 +383,8 @@ kernel void kernel_conv_2d_mm(
+         ix0[t] = iow*args.s0 - args.p0;
+         iy0[t] = ioh*args.s1 - args.p1;
+ 
++        off0[t] = iy0[t]*nb11 + ix0[t]*nb10;
++
+         ip_ok[t] = ip < NP;
+ 
+         srcb[t] = src + in*args.nb13;
+@@ -386,7 +398,7 @@ kernel void kernel_conv_2d_mm(
+         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+     }
+ 
+-    for (int k0 = 0; k0 < K; k0 += NK) {
++    for (int k0 = k_begin; k0 < k_end; k0 += NK) {
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+         {
+@@ -398,7 +410,7 @@ kernel void kernel_conv_2d_mm(
+                 const int   oc  = r0 + row;
+ 
+                 half v = 0;
+-                if (kk < K && oc < args.OC) {
++                if (kk < k_end && oc < args.OC) {
+                     v = *((device const TK *)(weights + oc*args.nb03) + kk);
+                 }
+ 
+@@ -413,7 +425,11 @@ kernel void kernel_conv_2d_mm(
+ 
+             int kw = kk % args.KW;
+             int kh = (kk / args.KW) % args.KH;
+-            int ic = kk / (args.KW*args.KH);
++            int dx = kw*args.d0;
++            int dy = kh*args.d1;
++
++            // byte offset of the reduction index kk, relative to the patch origin
++            uint offk = (kk / (args.KW*args.KH))*nb12 + dy*nb11 + dx*nb10;
+ 
+             FOR_UNROLL (short i = 0; i < 8; i++) {
+                 const short k = lb_k + i;
+@@ -421,12 +437,12 @@ kernel void kernel_conv_2d_mm(
+                 FOR_UNROLL (short t = 0; t < NPL; t++) {
+                     const short n = 32*t + lb_n;
+ 
+-                    const int ix = ix0[t] + kw*args.d0;
+-                    const int iy = iy0[t] + kh*args.d1;
++                    const int ix = ix0[t] + dx;
++                    const int iy = iy0[t] + dy;
+ 
+                     half v = 0;
+-                    if (ip_ok[t] && kk < K && ix >= 0 && ix < args.IW && iy >= 0 && iy < args.IH) {
+-                        v = *(device const float *)(srcb[t] + ic*args.nb12 + iy*args.nb11 + ix*args.nb10);
++                    if (ip_ok[t] && kk < k_end && (uint) ix < (uint) args.IW && (uint) iy < (uint) args.IH) {
++                        v = *(device const float *)(srcb[t] + (off0[t] + offk));
+                     }
+ 
+                     const short ib = NKB*(n/8) + k/8;
+@@ -435,11 +451,17 @@ kernel void kernel_conv_2d_mm(
+                 }
+ 
+                 kk++;
++                dx   += args.d0;
++                offk += args.d0*nb10;
+                 if (++kw == args.KW) {
+-                    kw = 0;
++                    kw    = 0;
++                    dx    = 0;
++                    dy   += args.d1;
++                    offk += args.d1*nb11 - args.KW*args.d0*nb10;
+                     if (++kh == args.KH) {
+-                        kh = 0;
+-                        ic++;
++                        kh    = 0;
++                        dy    = 0;
++                        offk += nb12 - args.KH*args.d1*nb11;
+                     }
+                 }
+             }
+@@ -447,7 +469,7 @@ kernel void kernel_conv_2d_mm(
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-        const short nkb = min((K - k0 + 7)/8, (int) NKB);
++        const short nkb = min((k_end - k0 + 7)/8, (int) NKB);
+ 
+         for (short ik = 0; ik < nkb; ik++) {
+             FOR_UNROLL (short i = 0; i < 4; i++) {
+@@ -485,7 +507,8 @@ kernel void kernel_conv_2d_mm(
+     const int oh = (p / args.OW) % args.OH;
+     const int n  = p / (args.OW*args.OH);
+ 
+-    device char * dstp = dst + n*args.nb3 + oh*args.nb1 + ow*args.nb0;
++    // with several splits, dst is the partial sum buffer, one contiguous output per split
++    device char * dstp = dst + (uint64_t) tgpig.z*args.N*args.nb3 + n*args.nb3 + oh*args.nb1 + ow*args.nb0;
+ 
+     for (short j = 0; j < NR0*NR1/NTH; j++) {
+         const short row = tiitg/NR1 + (NTH/NR1)*j;
+@@ -497,6 +520,158 @@ kernel void kernel_conv_2d_mm(
+     }
+ }
+ 
++#ifdef GGML_METAL_HAS_TENSOR
++// conv_2d as a matmul on the tensor cores, like kernel_mul_mm
++// The patches of NRA output positions are gathered into threadgroup memory, the kernel rows are read from device memory.
++// One threadgroup computes NRA positions of one image times NRB output channels, over the reduction range of its split.
++template <typename TK>
++kernel void kernel_conv_2d_mm_tensor(
++        constant ggml_metal_kargs_conv_2d & args,
++        device const char * weights,
++        device const char * src,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        uint3   tgpg[[threadgroups_per_grid]],
++        ushort  tiitg[[thread_index_in_threadgroup]]) {
++    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X; // output channels
++    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y; // output positions
++    constexpr int NK  = N_MM_NK_TOTAL;
++    constexpr int NTH = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
++
++    // each thread gathers NK/(NTH/NRA) consecutive reduction indices of one position
++    constexpr int KPT = NK/(NTH/NRA);
++
++    const int K   = args.IC*args.KH*args.KW;
++    const int OHW = args.OH*args.OW;
++
++    const int nsplit = tgpg.z/args.N;
++    const int img    = tgpig.z/nsplit;
++    const int split  = tgpig.z%nsplit;
++
++    const int k_begin = split*args.nk;
++    const int k_end   = min(K, k_begin + args.nk);
++
++    const int ra = tgpig.y*NRA;
++    const int rb = tgpig.x*NRB;
++
++    threadgroup half * sa = (threadgroup half *) shmem;
++
++    // the position this thread gathers
++    const int  row = tiitg%NRA;
++    const int  kc  = (tiitg/NRA)*KPT;
++    const int  p   = ra + row;
++    const bool pok = p < OHW;
++    const int  ix0 = (p%args.OW)*args.s0 - args.p0;
++    const int  iy0 = (p/args.OW)*args.s1 - args.p1;
++
++    device const char * srcb = src + img*args.nb13;
++
++    // the patch is walked with 32-bit byte offsets inside the image, the host checks that an image fits
++    const uint nb10 = args.nb10;
++    const uint nb11 = args.nb11;
++    const uint nb12 = args.nb12;
++
++    const uint off0 = iy0*nb11 + ix0*nb10;
++
++    device TK * ptrB = (device TK *) weights;
++    const int strideB = args.nb03/sizeof(TK);
++
++    mpp::tensor_ops::matmul2d<
++        mpp::tensor_ops::matmul2d_descriptor(
++            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
++            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
++        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
++
++    auto tB0 = tensor(ptrB, dextents<int32_t, 2>(K, args.OC), array<int, 2>({1, strideB}));
++    auto tA0 = tensor(sa,   dextents<int32_t, 2>(NK, NRA));
++    auto cT  = mm.get_destination_cooperative_tensor<decltype(tB0), decltype(tA0), float>();
++
++    for (int k0 = k_begin; k0 < k_end; k0 += NK) {
++        // the reduction indices past k_end are beyond the extent given to the matmul, they are not gathered
++        if (k0 + kc < k_end) {
++            // gather KPT patch values of this position, walking the reduction index incrementally
++            int kk = k0 + kc;
++            int kw = kk % args.KW;
++            int kh = (kk / args.KW) % args.KH;
++            int dx = kw*args.d0;
++            int dy = kh*args.d1;
++
++            // byte offset of the reduction index kk, relative to the patch origin
++            uint offk = (kk / (args.KW*args.KH))*nb12 + dy*nb11 + dx*nb10;
++
++            FOR_UNROLL (short i = 0; i < KPT; i++) {
++                const int ix = ix0 + dx;
++                const int iy = iy0 + dy;
++
++                half v = 0;
++                if (pok && kk < k_end && (uint) ix < (uint) args.IW && (uint) iy < (uint) args.IH) {
++                    v = *(device const float *)(srcb + (off0 + offk));
++                }
++                sa[row*NK + kc + i] = v;
++
++                kk++;
++                dx   += args.d0;
++                offk += args.d0*nb10;
++                if (++kw == args.KW) {
++                    kw    = 0;
++                    dx    = 0;
++                    dy   += args.d1;
++                    offk += args.d1*nb11 - args.KW*args.d0*nb10;
++                    if (++kh == args.KH) {
++                        kh    = 0;
++                        dy    = 0;
++                        offk += nb12 - args.KH*args.d1*nb11;
++                    }
++                }
++            }
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        // clamp the reduction extent so neither operand is read past the end of the split
++        const int kExt = min(NK, k_end - k0);
++
++        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, NK}));
++        auto tBv = tensor(ptrB + k0 + rb*strideB, dextents<int32_t, 2>(kExt, args.OC - rb), array<int, 2>({1, strideB}));
++
++        mm.run(tBv, tAv, cT);
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    // dst holds [OHW, OC] per image, with several splits it is the partial sum buffer, one contiguous output per split
++    const int tileM = min(NRA, OHW - ra);
++    const int tileN = min(NRB, args.OC - rb);
++
++    device float * dstTile = (device float *) (dst + (uint64_t) split*args.N*args.nb3 + img*args.nb3) + (uint64_t) rb*OHW + ra;
++
++    auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, OHW}));
++    cT.store(tD);
++}
++
++typedef decltype(kernel_conv_2d_mm_tensor<float>) kernel_conv_2d_mm_tensor_t;
++
++template [[host_name("kernel_conv_2d_mm_tensor_f32_f32")]] kernel kernel_conv_2d_mm_tensor_t kernel_conv_2d_mm_tensor<float>;
++template [[host_name("kernel_conv_2d_mm_tensor_f16_f32")]] kernel kernel_conv_2d_mm_tensor_t kernel_conv_2d_mm_tensor<half>;
++#endif
++
++kernel void kernel_conv_2d_mm_reduce(
++        constant ggml_metal_kargs_conv_2d_reduce & args,
++        device const float * tmp,
++        device       float * dst,
++        uint tpig[[thread_position_in_grid]]) {
++    if ((int) tpig >= args.ne) {
++        return;
++    }
++
++    float sum = 0.0f;
++    for (int s = 0; s < args.nsplit; ++s) {
++        sum += tmp[(uint64_t) s*args.ne + tpig];
++    }
++    dst[tpig] = sum;
++}
++
+ typedef decltype(kernel_conv_2d_mm<float, 64, 32>) kernel_conv_2d_mm_t;
+ 
+ template [[host_name("kernel_conv_2d_mm_f32_f32_64x32")]] kernel kernel_conv_2d_mm_t kernel_conv_2d_mm<float, 64, 32>;
