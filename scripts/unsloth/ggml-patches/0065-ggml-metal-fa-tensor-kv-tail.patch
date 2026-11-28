@@ -1,0 +1,270 @@
+Metal tensor-API flash attention (Apple M5 and newer): the tensor kernel required a KV length that is a multiple of 64
+and otherwise fell back to the half8x8 simdgroup kernel at about half the throughput, which DiTs with text tokens
+appended to image tokens (Z-Image: 4096 + 32) always hit. The partial last KV chunk is now copied into the existing
+pad buffer by kernel_flash_attn_ext_pad and read from there; columns past the KV length are set to -MAXHALF after
+softcap, as in the half8x8 kernel. GPUs without the tensor API and KV lengths that are a multiple of 64 run the same pipelines as before.
+Includes test-backend-ops cases with KV lengths 65 and 1000 large enough to select the tensor kernel.
+
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 2c7972b0..ae0e4310 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1857,7 +1857,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
+         bool has_mask,
+         bool has_sinks,
+         bool has_bias,
+-        bool has_scap) {
++        bool has_scap,
++        bool has_kvpad) {
+     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+ 
+     char base[256];
+@@ -1869,7 +1870,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
+     const char * type = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
+ 
+     snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d", type, dk, dv);
+-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d", base, has_mask, has_sinks, has_bias, has_scap);
++    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d%s", base, has_mask, has_sinks, has_bias, has_scap, has_kvpad ? "_kvpad=1" : "");
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+@@ -1879,6 +1880,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
+         ggml_metal_cv_set_bool(cv, has_sinks, FC_FLASH_ATTN_EXT_TENSOR + 1);
+         ggml_metal_cv_set_bool(cv, has_bias,  FC_FLASH_ATTN_EXT_TENSOR + 2);
+         ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT_TENSOR + 3);
++        ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT_TENSOR + 4);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 4012b9d5..139cc21f 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -202,7 +202,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
+         bool has_mask,
+         bool has_sinks,
+         bool has_bias,
+-        bool has_scap);
++        bool has_scap,
++        bool has_kvpad);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
+         ggml_metal_library_t lib,
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index d668af2c..9324285c 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3165,7 +3165,8 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
+         return false;
+     }
+ 
+-    return op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_TENSOR_NCPSG == 0;
++    // a partial last KV chunk is read from the pad buffer (kernel_flash_attn_ext_pad)
++    return true;
+ }
+ 
+ // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise
+@@ -3611,6 +3612,52 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+         const int ncpsg = OP_FLASH_ATTN_EXT_TENSOR_NCPSG; // cache values per threadgroup
+         const int nsg   = OP_FLASH_ATTN_EXT_TENSOR_NSG;
+ 
++        // the pad buffer reserves OP_FLASH_ATTN_EXT_NCPSG rows (ggml_metal_op_flash_attn_ext_extra_pad)
++        static_assert(OP_FLASH_ATTN_EXT_TENSOR_NCPSG <= OP_FLASH_ATTN_EXT_NCPSG, "tensor FA chunk exceeds the pad buffer");
++
++        bool need_sync = false;
++
++        const bool has_kvpad = ne11 % ncpsg != 0;
++
++        if (has_kvpad) {
++            assert(ggml_metal_op_flash_attn_ext_extra_pad(op) != 0);
++
++            ggml_metal_kargs_flash_attn_ext_pad args0 = {
++                /*.ne11    =*/ne11,
++                /*.ne_12_2 =*/ne12,
++                /*.ne_12_3 =*/ne13,
++                /*.nb11    =*/nb11_attn,
++                /*.nb12    =*/nb12_attn,
++                /*.nb13    =*/nb13_attn,
++                /*.nb21    =*/nb21_attn,
++                /*.nb22    =*/nb22_attn,
++                /*.nb23    =*/nb23_attn,
++                /*.ne31    =*/ne31,
++                /*.ne32    =*/ne32,
++                /*.ne33    =*/ne33,
++                /*.nb31    =*/nb31,
++                /*.nb32    =*/nb32,
++                /*.nb33    =*/nb33,
++            };
++
++            // K and V only: the kernel reads the mask in place and excludes the pad rows itself
++            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, false, ncpsg);
++
++            ggml_metal_encoder_set_pipeline(enc, pipeline0);
++            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
++            ggml_metal_encoder_set_buffer  (enc, bid_k,    1);
++            ggml_metal_encoder_set_buffer  (enc, bid_v,    2);
++            ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
++            ggml_metal_encoder_set_buffer  (enc, bid_pad,  4);
++
++            assert(ne12 == ne22);
++            assert(ne13 == ne23);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, ncpsg, ne12, ne13, 32, 1, 1);
++
++            need_sync = true;
++        }
++
+         if (has_mask) {
+             assert(ggml_metal_op_flash_attn_ext_extra_blk(op) != 0);
+ 
+@@ -3637,6 +3684,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne32*ne33, 32, 1, 1);
+ 
++            need_sync = true;
++        }
++
++        if (need_sync) {
+             ggml_metal_op_concurrency_reset(ctx);
+         }
+ 
+@@ -3681,7 +3732,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+         // shared memory layout: queries (16-bit), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
+         const size_t smem = GGML_PAD(nqptg*ne00*sizeof(ggml_fp16_t) + nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) + nqptg*sizeof(float) + sizeof(int32_t), 16);
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap);
++        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad);
+ 
+         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+@@ -3693,8 +3744,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
+         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+-        ggml_metal_encoder_set_buffer  (enc, bid_blk,  6);
+-        ggml_metal_encoder_set_buffer  (enc, bid_dst,  7);
++        ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
++        ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
++        ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
+ 
+         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+diff --git a/src/ggml-metal/kernels/fa_tensor.metal b/src/ggml-metal/kernels/fa_tensor.metal
+index 4a9ed30e..43a522a7 100644
+--- a/src/ggml-metal/kernels/fa_tensor.metal
++++ b/src/ggml-metal/kernels/fa_tensor.metal
+@@ -6,6 +6,7 @@ constant bool FC_flash_attn_ext_tensor_has_mask  [[function_constant(FC_FLASH_AT
+ constant bool FC_flash_attn_ext_tensor_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 1)]];
+ constant bool FC_flash_attn_ext_tensor_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 2)]];
+ constant bool FC_flash_attn_ext_tensor_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 3)]];
++constant bool FC_flash_attn_ext_tensor_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 4)]];
+ 
+ // ref: https://arxiv.org/pdf/2307.08691.pdf
+ template<
+@@ -23,6 +24,7 @@ kernel void kernel_flash_attn_ext_tensor(
+         device const char * v,
+         device const char * mask,
+         device const char * sinks,
++        device const char * pad,
+         device const char * blk,
+         device       char * dst,
+         threadgroup  char * shmem [[threadgroup(0)]],
+@@ -52,13 +54,15 @@ kernel void kernel_flash_attn_ext_tensor(
+ 
+     q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+ 
+-    {
+-        const int ikv2 = iq2/(args.ne02/args.ne_12_2);
+-        const int ikv3 = iq3/(args.ne03/args.ne_12_3);
++    const int ikv2 = iq2/(args.ne02/args.ne_12_2);
++    const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+ 
+-        k += ikv2*args.nb12 + ikv3*args.nb13;
+-        v += ikv2*args.nb22 + ikv3*args.nb23;
+-    }
++    k += ikv2*args.nb12 + ikv3*args.nb13;
++    v += ikv2*args.nb22 + ikv3*args.nb23;
++
++    // partial last KV chunk, copied by kernel_flash_attn_ext_pad as [K | V] with C rows per KV head
++    device const char * k_pad = pad + (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
++    device const char * v_pad = pad + args.nb11*C*args.ne_12_2*args.ne_12_3 + (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+ 
+     // with softcap the scale is small (scale/softcap), so it is applied to the scores to keep the precision of Q
+     const float qscale = FC_flash_attn_ext_tensor_has_scap ? 1.0f : args.scale;
+@@ -142,8 +146,10 @@ kernel void kernel_flash_attn_ext_tensor(
+ 
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    // the host guarantees ne11 % C == 0
++    // without has_kvpad the host guarantees ne11 % C == 0
+     for (int ic0 = 0, ic = 0; ic < args.ne11; ++ic0, ic += C) {
++        const bool tail = FC_flash_attn_ext_tensor_has_kvpad && ic + C > args.ne11;
++
+         char blk_cur = 1;
+ 
+         if (FC_flash_attn_ext_tensor_has_mask) {
+@@ -156,7 +162,9 @@ kernel void kernel_flash_attn_ext_tensor(
+ 
+         // Q*K^T
+         {
+-            auto tk = tensor((device T *) (k + (uint64_t) ic*args.nb11), dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk}));
++            device const char * kc = tail ? k_pad : k + (uint64_t) ic*args.nb11;
++
++            auto tk = tensor((device T *) kc, dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk}));
+ 
+             mm_qk.run(tq, tk, ts);
+         }
+@@ -181,7 +189,18 @@ kernel void kernel_flash_attn_ext_tensor(
+ 
+             if (FC_flash_attn_ext_tensor_has_mask && blk_cur != 2 && iq1 + j < args.ne31) {
+                 FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+-                    s[ii] += slope*(float) pm[jj][ic + ii*NW + tiisg];
++                    if (!tail || ic + ii*NW + tiisg < args.ne11) {
++                        s[ii] += slope*(float) pm[jj][ic + ii*NW + tiisg];
++                    }
++                }
++            }
++
++            // exclude the pad rows after softcap, which would map -MAXHALF to a finite score
++            if (tail) {
++                FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
++                    if (ic + ii*NW + tiisg >= args.ne11) {
++                        s[ii] = -MAXHALF;
++                    }
+                 }
+             }
+ 
+@@ -235,7 +254,9 @@ kernel void kernel_flash_attn_ext_tensor(
+         }
+ 
+         {
+-            auto tv = tensor((device T *) (v + (uint64_t) ic*args.nb21), dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv}));
++            device const char * vc = tail ? v_pad : v + (uint64_t) ic*args.nb21;
++
++            auto tv = tensor((device T *) vc, dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv}));
+ 
+             mm_pv.run(tp, tv, co);
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 0f990e05..3dc4c093 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11714,6 +11714,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // KV length not a multiple of 64, with enough heads and queries for the Metal tensor-API kernel
++    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
++        for (bool mask : {true, false}) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1000, 128, mask, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
++        }
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1000, 128, true,  true,  0,    0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1000, 128, true,  false, 8.0f, 0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 65,   128, false, false, 0,    1.0f,  GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 1000, 128, true,  false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 1000, 128, false, false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++
+     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
