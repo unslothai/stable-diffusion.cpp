@@ -19,13 +19,16 @@ name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan)
 #                   best effort like the CUDA legs).
 #   build-linux-cuda / build-windows-cuda -- x64, CUDA 12.8 and 13.3, best effort
 #                   (continue-on-error); the CUDA runtime is not bundled, see build-linux-cuda.
+#                   One bundle per GPU family (older / newer) plus the portable union, per
+#                   CUDA line, as unslothai/llama.cpp does; the manifest records each one's SMs.
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
 #                   draft->publish. If any CPU/Apple/Vulkan leg fails, assemble
 #                   is skipped and nothing is published (the Studio needs the full
 #                   asset set). The CUDA legs are exempt: each ships when it built and is
 #                   absent when it did not, so it can never hold back the fallbacks.
 #
-# Asset names match the Studio installer's resolve_release_asset.
+# Asset names match the Studio installer's resolve_release_asset. The per-family CUDA bundles use
+# llama.cpp's sd-<tag>-<platform>-x64-<profile> names, which only a manifest-aware Studio selects.
 #
 # We build THIS repository's tree, not a tarball fetched from anywhere else. Our own fixes are
 # commits here, so there is nothing to re-apply at build time and nothing to keep in step with a
@@ -440,7 +443,7 @@ jobs:
   # by the sd-*-bin-* pattern, so this asset appears when it built and is simply absent when it
   # did not; the coverage gate requires CPU/Apple/Vulkan assets but leaves CUDA optional.
   build-linux-cuda:
-    name: Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}
+    name: linux-x64-${{ matrix.profile }}
     needs: resolve
     continue-on-error: true
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
@@ -448,14 +451,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Per-GPU-family bundles, the scheme of unslothai/llama.cpp's unsloth-prebuilt.yml: per CUDA line
+        # an "older" (Volta/Turing..Ada) and a "newer" (Ampere-consumer..Blackwell) bundle overlapping
+        # on 86/89, plus the "portable" union that keeps the pre-split asset name, so a Studio that
+        # predates the split (it picks by name) and any host the split does not cover still install it.
+        # The arch lists and ranks are llama.cpp's x64 rows; its cuda12-legacy (50/61 PTX) row is not
+        # carried, since these bundles never covered Maxwell/Pascal.
+        #
+        # SASS vs PTX: "-real" is SASS only. Each profile carries SASS for every listed arch and PTX
+        # for one (its newest arch that has generic PTX), so a newer card than the list JITs from that
+        # PTX instead of failing. ggml rewrites 120 to 120a, and 120a PTX only loads on 12.0 itself,
+        # so the Blackwell profiles carry their PTX on 100 (compute_100 JITs on 10.x, 12.x and later).
+        # llama.cpp passes the arch numbers bare (SASS + PTX for every arch); dropping the redundant
+        # PTX is what makes each bundle smaller than its share of the old fat one.
+        #
+        # asset: the file name after "sd-<tag>-". Split assets use llama.cpp's
+        # <platform>-<arch>-<profile> name; Linux ships them as .tar.gz (as llama.cpp does), which also
+        # keeps them invisible to the pre-split Studio resolver, which only takes .zip and would
+        # otherwise pick whichever "linux" + "cuda12" zip GitHub lists first.
         include:
-          - line: cuda12
-            cuda: "12.8.0"
-            archs: "70;75;80;86;89;90;100;120"
+          - {line: cuda12, cuda: "12.8.0", profile: cuda12-older,    klass: older,    rank: 10, asset: linux-x64-cuda12-older, ext: tar.gz,
+             archs: "70-real;75-real;80-real;86-real;89"}
+          - {line: cuda12, cuda: "12.8.0", profile: cuda12-newer,    klass: newer,    rank: 20, asset: linux-x64-cuda12-newer, ext: tar.gz,
+             archs: "86-real;89-real;90-real;100;120-real"}
+          - {line: cuda12, cuda: "12.8.0", profile: cuda12-portable, klass: portable, rank: 30, asset: bin-Linux-Ubuntu-22.04-x86_64-cuda12, ext: zip,
+             archs: "70-real;75-real;80-real;86-real;89-real;90-real;100;120-real"}
           # CUDA 13 dropped Volta.
-          - line: cuda13
-            cuda: "13.3"
-            archs: "75;80;86;89;90;100;120"
+          - {line: cuda13, cuda: "13.3",   profile: cuda13-older,    klass: older,    rank: 40, asset: linux-x64-cuda13-older, ext: tar.gz,
+             archs: "75-real;80-real;86-real;89"}
+          - {line: cuda13, cuda: "13.3",   profile: cuda13-newer,    klass: newer,    rank: 50, asset: linux-x64-cuda13-newer, ext: tar.gz,
+             archs: "86-real;89-real;90-real;100;120-real"}
+          - {line: cuda13, cuda: "13.3",   profile: cuda13-portable, klass: portable, rank: 60, asset: bin-Linux-Ubuntu-22.04-x86_64-cuda13, ext: zip,
+             archs: "75-real;80-real;86-real;89-real;90-real;100;120-real"}
     # The ccache key tracks both, since both change the objects.
     env:
       CUDA_VERSION: ${{ matrix.cuda }}
@@ -658,7 +685,19 @@ jobs:
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ needs.resolve.outputs.tag }}
-          LABEL: Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}
+          LABEL: linux-x64-${{ matrix.profile }}
+          # Recorded in the bundle's UNSLOTH_PREBUILT_INFO.json, which assemble_metadata.py turns into
+          # the manifest's per-asset SM coverage.
+          ASSET_STEM: sd-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}
+          ARCHIVE_FORMAT: ${{ matrix.ext }}
+          PROFILE: ${{ matrix.profile }}
+          RUNTIME_LINE: ${{ matrix.line }}
+          COVERAGE_CLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          ARCHS: ${{ matrix.archs }}
+          TOOLKIT: ${{ matrix.cuda }}
+          PLATFORM_OS: linux
+          PLATFORM_ARCH: x64
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ runner.temp }}/LICENSE
@@ -677,8 +716,8 @@ jobs:
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}
-          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-Linux-Ubuntu-22.04-x86_64-${{ matrix.line }}.zip
+          name: sd-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}.${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 7
 
@@ -709,7 +748,7 @@ jobs:
   # on PATH never win), and cudart64 / cublas64 / cublasLt64 come from the host exactly as they do
   # for unslothai/llama.cpp's Windows CUDA build. No cuDNN attention path: the ggml kernels serve.
   build-windows-cuda:
-    name: win-${{ matrix.line }}-x64
+    name: windows-x64-${{ matrix.profile }}
     needs: resolve
     continue-on-error: true
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
@@ -719,13 +758,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Same profile table as build-linux-cuda. Every Windows asset is a .zip; the split ones are named
+        # <platform>-<arch>-<profile> without the "bin-win" the pre-split Studio resolver keys on.
         include:
-          - line: cuda12
-            cuda: "12.8.0"
-            archs: "70;75;80;86;89;90;100;120"
-          - line: cuda13
-            cuda: "13.3"
-            archs: "75;80;86;89;90;100;120"
+          - {line: cuda12, cuda: "12.8.0", profile: cuda12-older,    klass: older,    rank: 10, asset: windows-x64-cuda12-older,
+             archs: "70-real;75-real;80-real;86-real;89"}
+          - {line: cuda12, cuda: "12.8.0", profile: cuda12-newer,    klass: newer,    rank: 20, asset: windows-x64-cuda12-newer,
+             archs: "86-real;89-real;90-real;100;120-real"}
+          - {line: cuda12, cuda: "12.8.0", profile: cuda12-portable, klass: portable, rank: 30, asset: bin-win-cuda12-x64,
+             archs: "70-real;75-real;80-real;86-real;89-real;90-real;100;120-real"}
+          - {line: cuda13, cuda: "13.3",   profile: cuda13-older,    klass: older,    rank: 40, asset: windows-x64-cuda13-older,
+             archs: "75-real;80-real;86-real;89"}
+          - {line: cuda13, cuda: "13.3",   profile: cuda13-newer,    klass: newer,    rank: 50, asset: windows-x64-cuda13-newer,
+             archs: "86-real;89-real;90-real;100;120-real"}
+          - {line: cuda13, cuda: "13.3",   profile: cuda13-portable, klass: portable, rank: 60, asset: bin-win-cuda13-x64,
+             archs: "75-real;80-real;86-real;89-real;90-real;100;120-real"}
     defaults:
       run:
         shell: pwsh
@@ -873,7 +920,19 @@ jobs:
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ needs.resolve.outputs.tag }}
-          LABEL: win-${{ matrix.line }}-x64
+          LABEL: windows-x64-${{ matrix.profile }}
+          # Recorded in the bundle's UNSLOTH_PREBUILT_INFO.json, which assemble_metadata.py turns into
+          # the manifest's per-asset SM coverage.
+          ASSET_STEM: sd-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}
+          ARCHIVE_FORMAT: zip
+          PROFILE: ${{ matrix.profile }}
+          RUNTIME_LINE: ${{ matrix.line }}
+          COVERAGE_CLASS: ${{ matrix.klass }}
+          RANK: ${{ matrix.rank }}
+          ARCHS: ${{ matrix.archs }}
+          TOOLKIT: ${{ matrix.cuda }}
+          PLATFORM_OS: windows
+          PLATFORM_ARCH: x64
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
@@ -895,8 +954,8 @@ jobs:
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: sd-${{ needs.resolve.outputs.tag }}-bin-win-${{ matrix.line }}-x64
-          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-${{ matrix.line }}-x64.zip
+          name: sd-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -1174,34 +1233,35 @@ jobs:
           pattern: sd-*-bin-*
           merge-multiple: true
 
+      # The per-GPU-family CUDA bundles (sd-<tag>-linux-x64-cuda12-older and the like). A separate
+      # pattern, not sd-*: that would also pull the sd-source-<tag> artifact into the release.
+      - name: Download split CUDA bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: dist
+          pattern: sd-*-x64-cuda1*-*
+          merge-multiple: true
+        # Like the CUDA legs themselves: a miss leaves the portable CUDA bundles, which Studio falls back to.
+        continue-on-error: true
+
       - name: Fingerprint gate (every bundle carries the Unsloth mark)
         run: |
           set -euo pipefail
           MARK='Compiled by the Unsloth team'
           shopt -s nullglob
           tmp="$(mktemp -d)"; fail=0; checked=0
-          for z in dist/sd-*-bin-*.zip; do
+          for z in dist/sd-*-bin-*.zip dist/sd-*-x64-cuda1*-*.zip dist/sd-*-x64-cuda1*-*.tar.gz; do
             rm -rf "$tmp/x"; mkdir -p "$tmp/x"
-            unzip -qo "$z" -d "$tmp/x"
+            case "$z" in
+              *.tar.gz) tar -xzf "$z" -C "$tmp/x" ;;
+              *) unzip -qo "$z" -d "$tmp/x" ;;
+            esac
             if grep -arq "$MARK" "$tmp/x"; then checked=$((checked+1)); else echo "ERROR: $(basename "$z") missing fingerprint" >&2; fail=1; fi
           done
           rm -rf "$tmp"
           [ "$checked" -gt 0 ] || { echo "ERROR: no bundles to verify" >&2; exit 1; }
           [ "$fail" = 0 ] || exit 1
           echo "fingerprint verified in $checked bundles"
-
-      - name: Generate manifest + sha256 index
-        run: |
-          set -eux
-          python3 tooling/scripts/unsloth/assemble_metadata.py \
-            --tag '${{ needs.resolve.outputs.tag }}' \
-            --upstream-tag '${{ needs.resolve.outputs.upstream_tag }}' \
-            --patches '${{ needs.resolve.outputs.pins }}' \
-            --source-repo "$GITHUB_REPOSITORY" \
-            --commit '${{ needs.resolve.outputs.commit }}' \
-            --dist dist --out dist \
-            --publish-repo "$GITHUB_REPOSITORY"
-          ls -la dist
 
       # Vulkan is required: the pinned upstream fallback lacks our H3 fixes.
       # Blocking publication on a Vulkan failure prevents promoting an incomplete fix.
@@ -1222,6 +1282,35 @@ jobs:
             [ -s "dist/$f" ] || { echo "ERROR: missing $f" >&2; fail=1; }
           done
           [ "$fail" = 0 ] || { echo "ERROR: refusing to publish a partial release" >&2; exit 1; }
+          # CUDA is optional, but a per-family bundle must not ship without its portable sibling (same
+          # OS and CUDA line): that is what a host the families do not cover, and every Studio that
+          # predates the split, installs. Drop the orphan rather than fail the release.
+          shopt -s nullglob
+          for f in dist/sd-"${TAG}"-linux-x64-cuda1*-*.tar.gz dist/sd-"${TAG}"-windows-x64-cuda1*-*.zip; do
+            b="$(basename "$f")"
+            line="$(echo "$b" | sed -nE 's/.*-x64-(cuda1[0-9])-.*/\1/p')"
+            case "$b" in
+              *-linux-*) portable="sd-${TAG}-bin-Linux-Ubuntu-22.04-x86_64-${line}.zip" ;;
+              *) portable="sd-${TAG}-bin-win-${line}-x64.zip" ;;
+            esac
+            if [ ! -s "dist/$portable" ]; then
+              echo "::warning::dropping $b: its portable fallback $portable did not build"
+              rm -f "$f"
+            fi
+          done
+
+      - name: Generate manifest + sha256 index
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/assemble_metadata.py \
+            --tag '${{ needs.resolve.outputs.tag }}' \
+            --upstream-tag '${{ needs.resolve.outputs.upstream_tag }}' \
+            --patches '${{ needs.resolve.outputs.pins }}' \
+            --source-repo "$GITHUB_REPOSITORY" \
+            --commit '${{ needs.resolve.outputs.commit }}' \
+            --dist dist --out dist \
+            --publish-repo "$GITHUB_REPOSITORY"
+          ls -la dist
 
       # Only on a run that did NOT succeed, matching llama.cpp. Uploading this
       # unconditionally duplicated every bundle in the run -- measured at 1.34 GiB
@@ -1255,7 +1344,7 @@ jobs:
           AHEAD='${{ needs.resolve.outputs.ahead }}'
           COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux/Windows CUDA 12 and 13 and a native Windows arm64 CPU build when those builds succeed. The CUDA bundles carry no CUDA runtime: Studio supplies the one its llama.cpp build already uses."
+          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux/Windows CUDA 12 and 13 and a native Windows arm64 CPU build when those builds succeed. Each CUDA line ships per-GPU-family bundles (\`older\`: sm_70/75-89, \`newer\`: sm_86-120) beside the portable bundle that covers all of them; \`sd-prebuilt-manifest.json\` lists the SMs each one covers. The CUDA bundles carry no CUDA runtime: Studio supplies the one its llama.cpp build already uses."
           PINS='${{ needs.resolve.outputs.pins }}'
           if [ "${AHEAD:-0}" -gt 0 ]; then
             NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
