@@ -236,6 +236,7 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     job.status       = AsyncJobStatus::Cancelled;
     job.completed_at = unix_timestamp_now_ms();
     job.result_images_b64.clear();
+    job.result_latent_shapes.clear();
     job.result_generation_info = nullptr;
     job.result_media_b64.clear();
     job.result_media_mime_type.clear();
@@ -304,6 +305,12 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
         } else {
             json images = json::array();
             for (size_t i = 0; i < job.result_images_b64.size(); ++i) {
+                if (job.img_gen.output_latent) {
+                    images.push_back({{"index", i},
+                                      {"latent", {{"b64", job.result_images_b64[i]}, {"dtype", "float32"}, {"shape", job.result_latent_shapes.at(i)}}},
+                                      {"generation_info", job.result_generation_info.at(i)}});
+                    continue;
+                }
                 images.push_back({{"index", i}, {"b64_json", job.result_images_b64[i]}, {"generation_info", job.result_generation_info.at(i)}});
             }
             result["result"] = {
@@ -342,6 +349,39 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     return result;
 }
 
+// Base64 float32 latents for an output_latent job; frees the result.
+static bool collect_latent_outputs(const ServerRuntime& runtime,
+                                   AsyncGenerationJob& job,
+                                   sd_image_generation_result_t* generated,
+                                   std::vector<std::string>& output_latents,
+                                   json& output_info,
+                                   std::string& error_message) {
+    std::unique_ptr<sd_image_generation_result_t, decltype(&free_sd_image_generation_result)> owner(generated, &free_sd_image_generation_result);
+    job.result_latent_shapes.clear();
+    if (generated == nullptr || generated->count <= 0) {
+        error_message = "generate_image returned no latents";
+        return false;
+    }
+    for (int i = 0; i < generated->count; ++i) {
+        const sd_image_result_t& item = generated->items[i];
+        if (item.latent == nullptr || item.latent_dims <= 0) {
+            error_message = "generate_image returned an image without its latent";
+            return false;
+        }
+        std::vector<int64_t> shape(item.latent_shape, item.latent_shape + item.latent_dims);
+        int64_t numel = 1;
+        for (int64_t extent : shape) {
+            numel *= extent;
+        }
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(item.latent);
+        output_latents.push_back(base64_encode(std::vector<uint8_t>(bytes, bytes + numel * sizeof(float))));
+        output_info.push_back(json::parse(generation_info_with_relative_lora_paths(item.generation_info ? item.generation_info : "",
+                                                                                   runtime.ctx_params->lora_model_dir)));
+        job.result_latent_shapes.push_back(std::move(shape));
+    }
+    return true;
+}
+
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::vector<std::string>& output_images,
@@ -361,6 +401,13 @@ bool execute_img_gen_job(ServerRuntime& runtime,
         JobCallbacksGuard callbacks(runtime.sd_ctx, job);
         sd_image_generation_result_t* generated = nullptr;
         generate_image(runtime.sd_ctx, &params, &generated);
+        if (job.img_gen.output_latent) {
+            if (job.cancel_requested.load()) {
+                free_sd_image_generation_result(generated);
+                return false;
+            }
+            return collect_latent_outputs(runtime, job, generated, output_images, output_info, error_message);
+        }
         results.adopt(generated, runtime.ctx_params->lora_model_dir);
         if (job.cancel_requested.load()) {
             return false;
@@ -572,6 +619,7 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->error_code    = "generation_failed";
                 job->error_message = error_message.empty() ? "unknown generation error" : error_message;
                 job->result_images_b64.clear();
+                job->result_latent_shapes.clear();
                 job->result_generation_info = nullptr;
                 job->result_media_b64.clear();
                 job->result_media_bytes.reset();

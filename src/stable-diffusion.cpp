@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 #include "core/ggml_extend.h"
 #include "core/util.h"
@@ -834,8 +835,9 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     sd_image_t* images = nullptr;
     int count          = 0;
     std::vector<nlohmann::json> infos;
+    std::vector<sd::Tensor<float>> latents;
     try {
-        if (!sd::pipeline::generate_image(sd_ctx->sd, params, &images, &count, &infos)) {
+        if (!sd::pipeline::generate_image(sd_ctx->sd, params, &images, &count, &infos, &latents)) {
             free_sd_images(images, count);
             return false;
         }
@@ -844,7 +846,36 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
         free_sd_images(images, count);
         return false;
     }
-    return sd::make_image_generation_result(images, count, infos, result_out);
+    if (!sd::make_image_generation_result(images, count, infos, result_out)) {
+        return false;
+    }
+    if (!params->output_latent) {
+        return true;
+    }
+    sd_image_generation_result_t* result = *result_out;
+    bool ok                              = latents.size() == static_cast<size_t>(result->count);
+    for (int i = 0; ok && i < result->count; ++i) {
+        const sd::Tensor<float>& latent = latents[i];
+        const int dims                  = static_cast<int>(latent.dim());
+        float* data                     = dims > 0 && dims <= 5 ? (float*)malloc(latent.numel() * sizeof(float)) : nullptr;
+        if (data == nullptr) {
+            ok = false;
+            break;
+        }
+        memcpy(data, latent.data(), latent.numel() * sizeof(float));
+        result->items[i].latent      = data;
+        result->items[i].latent_dims = dims;
+        // sd::Tensor lists the fastest-varying dimension first; the result lists the outermost first.
+        for (int d = 0; d < dims; ++d) {
+            result->items[i].latent_shape[d] = latent.shape()[dims - 1 - d];
+        }
+    }
+    if (!ok) {
+        LOG_ERROR("could not return the %zu generated latents", latents.size());
+        free_sd_image_generation_result(result);
+        *result_out = nullptr;
+    }
+    return ok;
 }
 
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
